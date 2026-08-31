@@ -1,0 +1,47 @@
+{
+  "name": "self-review",
+  "version": "0.4.1",
+  "description": "Review every code change before the turn ends: fresh-context reviewer agents, a verified finding standard, honest convergence, and a measured token budget — enforced by a Stop hook, graph-aware when you have a code graph, zero-cost when you don't.",
+  "author": { "name": "Houssem Djeghri", "url": "https://github.com/HoussemDjeghri" },
+  "homepage": "https://github.com/HoussemDjeghri/self-review",
+  "license": "MIT",
+  "keywords": ["code-review", "self-review", "agents", "hooks", "quality", "tokens"],
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/self-review-gate.mjs\"",
+            "timeout": 20,
+            "statusMessage": "self-review gate: checking this turn for unreviewed changes…"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/tree-guard.mjs\"",
+            "timeout": 10,
+            "statusMessage": "tree guard: checking a reviewer's command for tree writes…"
+          }
+        ]
+      },
+      {
+        "matcher": "ListAgents|TaskOutput",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/poll-guard.mjs\"",
+            "timeout": 10,
+            "statusMessage": "poll guard: checking for repeated status checks…"
+          }
+        ]
+      }
+    ]
+  }
+}
