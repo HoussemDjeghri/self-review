@@ -88,7 +88,7 @@ enforcing:
 Restart your sessions so the hooks register. Requires Node ≥ 18 (CI runs 20 on
 Linux and macOS) and bash; no daemon, no service of its own — the hooks and
 scripts read your transcript, your files and `git`, and that is the whole of it
-(`plugin/hooks/no-network.test.mjs` fails the build if a shipped hook or script ever
+(`hooks/no-network.test.mjs` fails the build if a shipped hook or script ever
 calls `fetch`, imports a network module, or shells out to `curl`). The reviewers are
 ordinary Claude Code subagents, so they reach the network exactly as your
 session does: their tool grants include `WebFetch` and `WebSearch`, for the
@@ -108,13 +108,13 @@ uninstalling.
    `/tmp`, the session scratchpad, and Claude's own state directories
    (`~/.claude/projects`, `plans`, `todos`, `sessions`, …) — but not the rest of
    `~/.claude`, so editing your own hooks or skills is reviewed like any code.
-2. **Scope.** `plugin/scripts/scope.sh` prints the changed-file list, the diff, and
+2. **Scope.** `scripts/scope.sh` prints the changed-file list, the diff, and
    every untracked file as a full addition (a plain `git diff` shows a new file
    as nothing at all). Works outside git too.
-3. **Impact and tier.** `plugin/scripts/impact.mjs` searches the tree for what still
+3. **Impact and tier.** `scripts/impact.mjs` searches the tree for what still
    references the symbols the diff moved — broken references first, then tests,
    callers, docs and config — with `code-review-graph` marking edge-confirmed
-   callers when a repo has built one. `plugin/scripts/tier.mjs` then classifies the
+   callers when a repo has built one. `scripts/tier.mjs` then classifies the
    paths, counts the lines, fires the risk markers (auth, payments, migrations,
    destructive ops, infra, contract breaks) and writes the round's plan: trivial
    changes get one reviewer, standard ones three or four, large or risky ones up
@@ -124,10 +124,10 @@ uninstalling.
    verifier agent ruling on the findings; at the smaller tiers the author
    verifies against the file, and a verifier is spawned when the dismissals
    start piling up.
-4. **Memory.** `plugin/scripts/findings.mjs prior` pulls the handful of findings past
+4. **Memory.** `scripts/findings.mjs prior` pulls the handful of findings past
    reviews of this repository recorded against the files this change touches —
    ten lines, ranked by proximity, never the running review's own — and
-   `plugin/scripts/brief.mjs` renders each finder's brief from the plan: its angles
+   `scripts/brief.mjs` renders each finder's brief from the plan: its angles
    verbatim, the intent, the impact at that row's depth, the prior lines and the
    dismissed ledger, held to a token budget.
 5. **Round.** All finders of a round launch in one message, each with a
@@ -182,7 +182,7 @@ logged by the gate, the script form by itself — and that log records
 
 ## Configuration
 
-Defaults ship in `plugin/config/defaults.json`; override per user in
+Defaults ship in `config/defaults.json`; override per user in
 `~/.claude/self-review/config.json` (or `$SELF_REVIEW_CONFIG`). Objects merge,
 arrays replace — so you can shorten an exemption list, not only extend it.
 
@@ -219,7 +219,7 @@ machine reviewing it. Your own config keeps the full regex.
 An override whose type does not match the default is ignored with a warning on
 stderr (visible under `--debug`), and an override file that is unreadable or is
 not an object is ignored whole, leaving the shipped defaults in force. If the
-shipped `plugin/config/defaults.json` is itself missing or corrupt, the gate falls back
+shipped `config/defaults.json` is itself missing or corrupt, the gate falls back
 to gating *every* file: a broken install costs you a review, never skips one.
 `gate.maxReminders` is the escape hatch — after that many blocks in a row the
 gate releases the turn with a notice rather than trapping the session. To turn
@@ -233,10 +233,9 @@ salvage scripts, the cost cutters (`brief.mjs` builds a round's briefs,
 review cost), the context pair (`impact.mjs` computes the blast radius,
 `tier.mjs` turns it into a tier and an angle plan), per-repo memory
 (`findings.mjs` records every verdict and feeds the matching ones back into the
-next review's briefs), config with a per-repo layer, and 625 tests
-([`./test.sh`](https://github.com/HoussemDjeghri/self-review-dev), in the development repository).
+next review's briefs), config with a per-repo layer, and its own test suite.
 
-Not yet — the roadmap in [`docs/DESIGN.md`](https://github.com/HoussemDjeghri/self-review-dev/blob/main/docs/DESIGN.md) §6: the eval corpus
+Not yet: the eval corpus
 and runner, and the measured numbers that come from them.
 
 **On `code-review-graph`:** the impact script uses it only when the repository
@@ -254,17 +253,6 @@ one machine's sessions and from the eval corpus (§4.7) rather than from the
 project's own development, because a single session's figures published as
 typical would be exactly the kind of unverified claim this plugin exists to
 catch. It also reports, per round, how much the angles overlapped — the share of one finder's candidates that another finder of the same round also filed — because merging two angles to save an agent is a change that has to be measured over several reviews first. Run it on your own sessions: `node scripts/audit.mjs`.
-
-## This repository
-
-This is the published plugin: its root is what Claude Code installs, and nothing
-else is here. Development happens in [`self-review-dev`](https://github.com/HoussemDjeghri/self-review-dev) — the test
-suite, the eval corpus, the design notes and the release tooling — and every
-commit here is built from that repository's `plugin/` by `tools/mirror.mjs`,
-so send issues and pull requests there rather than to this tree.
-
-The design and its rationale live in [`docs/DESIGN.md`](https://github.com/HoussemDjeghri/self-review-dev/blob/main/docs/DESIGN.md);
-build status in [`docs/STATUS.md`](https://github.com/HoussemDjeghri/self-review-dev/blob/main/docs/STATUS.md).
 
 ## License
 
