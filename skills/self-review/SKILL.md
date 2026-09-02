@@ -287,7 +287,12 @@ evidence standard, the output format, and the sonnet · high default), and
 **no Bash at all**. Spawn what the row says: substituting the finder there hands
 a shell to the one angle whose whole design is that it does not have one. If a
 type is missing, use `general-purpose` and paste the contents of that agent file
-(`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief. Write the briefs with one call rather than by hand — assembling them costs 4–6
+(`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief. **Never do
+that for `self-review-applier`**: the Stop gate arms on that exact agent type, so
+a substitute is invisible to it *and* carries `Bash` — the gate stops seeing the
+edits and the one writing agent stops being the one that cannot reach a shell,
+which is both halves of that design gone in a single substitution. If the applier
+type is missing, stop and say so. Write the briefs with one call rather than by hand — assembling them costs 4–6
 calls per round and gets a section wrong sooner or later:
 
 `round.sh` wrote them; the Agent-call table it printed is the round's plan.

@@ -21,8 +21,12 @@
  *     async subagent's edits are invisible here (its launch result carries no
  *     stats, and its completion carries only its report) — the reviewer
  *     agents are read-only by instruction (their prompt forbids writes; they keep
- *     Bash to run tests), so this gap only matters for a
- *     background agent told to edit, whose author must scope its work itself.
+ *     Bash to run tests), so the gap would matter for any background agent
+ *     told to edit.
+ *   - The LAUNCH of a self-review-applier — the one agent type whose dispatch
+ *     implies it was told to edit. The launch stands in for the edit evidence
+ *     an async result does not carry; the applier section further down says why
+ *     arming on the launch alone is the point rather than a compromise.
  *   Paths under tmp, the session scratchpad, and Claude's own runtime state
  *   (~/.claude/projects, plans, todos, …) are ignored: scratch is not work.
  *   Prose, config and data files (.md, .json, .yaml, .txt, images, …) are
@@ -146,6 +150,16 @@ const TASK_REF_RE = /<(?:task-id|tool-use-id)>([^<]+)<\//g;
 // reviewed itself. One finder is the floor on purpose, because tier S *is* one
 // finder with an all-angles brief.
 const REVIEWER_TYPES = /(?:^|:)self-review-(?:finder|cold-grader)$/;
+// The one agent type whose LAUNCH implies it was told to edit. That implication
+// is what the arm substitutes for the edit evidence async agent results do not
+// carry, so it holds by construction for exactly this type and no other: the
+// plugin authors the applier's definition (write tools, no Bash) and the skill
+// authors its launch. It is hardcoded rather than configured on purpose —
+// arrays replace on config merge, so a user overriding a neighbouring list
+// could silently empty this one and disarm the gate; and a name convention
+// (`*-applier`) would arm on another plugin's agent this one knows nothing
+// about, which is a block bought with a guess.
+const APPLIER_TYPE = /(?:^|:)self-review-applier$/;
 // The outcome token inside a script-form marker's output line. The record is
 // `outcome=… rounds=…`, so the first whitespace-delimited word after the `=` is
 // the whole value.
@@ -437,7 +451,15 @@ function bashWriteTargets(command, cwd) {
     else if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; }
   }
   if (!acc.writes) return null;
-  if (acc.unknown) return [...new Set(acc.targets.filter((p) => !isScratchPath(p)))]; // an unknowable write gates; name what is known
+  // An unknowable write gates, and the known targets are only the NAMES it is
+  // reported under — so they are filtered the same way every other path in this
+  // file is. Filtering them by scratch alone was the narrower rule, and it let a
+  // prose-only turn block: one command that both wrote a doc through a heredoc
+  // and ran an interpreter whose target could not be resolved named the .md as
+  // the change. When nothing non-exempt is left to name, an empty list is the
+  // honest answer and collectChanges falls through to the git evidence, which
+  // decides on what the turn actually wrote rather than on what was parseable.
+  if (acc.unknown) return [...new Set(acc.targets.filter((p) => !isExempt(p)))];
   if (acc.targets.length > 0 && acc.targets.every(isExempt)) return null;
   return [...new Set(acc.targets.filter((p) => !isExempt(p)))];
 }
@@ -705,11 +727,16 @@ function scanAgents(entries, results) {
     const own = events.filter((e) => e.index > at && keys.has(e.key));
     const last = own[own.length - 1];
     const done = own.length > 0 && !last.resume;
+    // A resume is a fresh dispatch of work, so the record has to move FORWARD
+    // on one. Without this, `doneAt` reverting to -1 walks an applier's anchor
+    // backward, behind a marker already written — see applierAnchor.
+    const resumes = own.filter((e) => e.resume);
     const interjections = humanAt.filter((i) => i > at).length;
     agents.push({
       type: typeOf.get(agentId) ?? "",
       launchedAt: at,
       doneAt: done ? last.index : -1,
+      resumedAt: resumes.length ? resumes[resumes.length - 1].index : -1,
       // The age-out belongs to PENDING only. A qualifying reviewer has by
       // definition completed, so it cannot be the crashed agent the limit
       // exists to release — ageing one out would refuse a slow but real
@@ -746,6 +773,12 @@ function scanAgents(entries, results) {
 // duplicate review of the same scope.
 function reviewerState(agents, changeAt, markerAt) {
   const reviewers = agents.filter((a) => REVIEWER_TYPES.test(a.type));
+  // An applier still running cannot have been read by anyone, whatever the
+  // finders did: its edits are not a fixed set yet, so no completion can be
+  // "after the last change". Checked before "ok" because a finder that
+  // completed after the last MAIN-CHAIN change would otherwise satisfy the
+  // condition while the tree is still moving.
+  if (appliersIn(agents).some((a) => a.pending)) return "applying";
   if (reviewers.some((a) => a.doneAt > changeAt && a.doneAt < markerAt)) return "ok";
   // Still running is not missing. Blocking here would tell the model to spawn a
   // second finder over the same scope, or to poll — and ending the turn is how
@@ -758,6 +791,51 @@ function reviewerState(agents, changeAt, markerAt) {
   // Completed before the last change: the edit behind it was read by nobody.
   return reviewers.some((a) => a.doneAt !== -1 && a.doneAt < changeAt) ? "stale" : "none";
 }
+
+// ---------- the applier arms the gate (F10b) ----------
+//
+// An async Agent result is spawn metadata: `toolUseResult.toolStats`, the only
+// edit evidence the transcript carries for an agent, is on SYNCHRONOUS results
+// only — a real review session made 16 main-chain launches, all async, and none
+// carried it. So an applier subagent's edits are invisible to `collectChanges`,
+// and the review requirement would disappear exactly when something other than
+// the main session is doing the writing.
+//
+// The launch itself is the evidence, and it is the right kind: an `Agent` call
+// names its `subagent_type` in the MAIN CHAIN, which is harness-written, raw,
+// and cannot be silently absent. A file the gate writes and later reads was
+// tried first and cut — it was authored by the agent under check, absent
+// exactly when it mattered, and unbounded.
+//
+// ARMING IS UNCONDITIONAL. Requiring proof that the applier edited something is
+// the hole restated, and the feared cost of arming on a no-op is mispriced:
+// what an arm demands is a MARKER, not a review round, and the applier only
+// ever launches inside a loop whose every exit path already writes one. An
+// applier that edited nothing, or only prose, arms anyway — knowing what it
+// touched would mean reading its self-report, which is the manifest shape this
+// plugin has already refused twice.
+//
+// THE ANCHOR IS COMPLETION, NOT LAUNCH. Edits land any time up to completion,
+// so a finder that finished between launch and completion read a tree that was
+// still moving under it — it would satisfy the letter of "a reviewer completed
+// after the last change" while the change was still happening. Completion is
+// the earliest index at which the applier's edits are a fixed set. An applier
+// that never completed anchors at its launch and stays armed; that is not a
+// deadlock, because a `--not-converged` marker discharges it honestly.
+//
+// AND IT IS MONOTONIC, because this is the only index in the gate that could
+// otherwise move BACKWARD. A SendMessage that resumes the applier sets `done`
+// false, so `doneAt` reverts to -1 and a launch-or-completion anchor drops back
+// to the launch — behind a marker written while the applier was in flight. That
+// flips `markerAtW > changeAtW` from false to true and turns a block into a
+// silent pass, and it is the accidental-disarm shape: resuming the agent is the
+// first thing a model debugging the block reaches for. Reproduced live — adding
+// one SendMessage to a blocking fixture released it, the same fixture without
+// the resume still blocked. The max also states the honest thing: a resume is a
+// fresh dispatch of edit work, so it needs a marker after it, not before it.
+const applierAnchor = (a) => Math.max(a.launchedAt, a.resumedAt ?? -1, a.doneAt);
+// Whole-window indices, like every other agent record.
+const appliersIn = (agents) => agents.filter((a) => APPLIER_TYPE.test(a.type));
 
 // This branch needs a bound of its OWN. `countReminders` counts feedback since
 // the last marker, which works for the generic block because a blocked model has
@@ -780,12 +858,12 @@ function unreviewedReason(state, changes, lastChangeAt, cwd) {
     ? [`A reviewer did complete, but only AFTER the marker was written — nothing had read the result when you claimed it. Do not launch another one: it has already reported.`,
       `Read its report, act on it, and then re-mark, in a message of its own:`]
     : state === "stale"
-      ? [`A reviewer did complete, but you changed ${latest} after it finished — that change has been read by nobody but you.`,
+      ? [`A reviewer did complete, but this landed after it finished: ${latest} — read by nobody but you.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`]
       : [`No reviewer agent ran in this window — a verifier alone does not count, because verifying findings you generated yourself is reviewing your own work.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`];
   return [
-    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder or self-review-cold-grader) completed after your last file change and before the marker.`,
+    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder or self-review-cold-grader) completed between the last change — your own edit, or an applier finishing — and the marker.`,
     middle,
     `${action} ${MARKER_BODY}`,
     `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts. If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
@@ -804,25 +882,78 @@ function evaluate(entries, cwd) {
   // "this turn wrote it" in writesSince().
   const since = Date.parse(entries[boundary]?.timestamp ?? turn[0]?.timestamp ?? "");
   const changes = collectChanges(turn, cwd, since);
-  if (changes.length === 0) return null;
 
   // Keyed by tool_use id, so a window-wide map serves both the turn-scoped
   // marker lookup and the window-wide pending scan below.
   const results = toolResultsById(entries);
-  const { at: markerAt, fileMarker, outcome, rejected } = lastMarker(turn, results, cwd);
-  const lastChangeAt = Math.max(...changes.map((c) => c.index));
-
   // Agents are scanned over the whole window, not just this turn: a reviewer
   // launched before a human interjection is still running, and turn-scoping made
   // exactly those finders invisible (a live false block). Age-out inside
   // scanAgents keeps a crashed agent from holding the gate open forever.
   const agents = scanAgents(entries, results);
+  // An applier's writes land whenever they land, and this gate deliberately
+  // releases a turn while a subagent runs so the human can type — so the turn
+  // is the wrong frame for it, and the whole window is the right one. Nothing
+  // to review and no applier ever launched is today's silent pass.
+  const appliers = appliersIn(agents);
+  if (changes.length === 0 && appliers.length === 0) return null;
 
-  if (markerAt > lastChangeAt) {
-    // ONE INDEX FRAME. markerAt and lastChangeAt are turn-relative; agent
-    // records carry whole-window indices. A silent mismatch here admits or
-    // refuses wrongly with no error, so the conversion is explicit.
-    const toWindow = (i) => i + boundary + 1;
+  // BOTH FRAMES, together, because getting them apart is what went wrong here,
+  // and the frame each field takes is decided by WHAT GATES IT.
+  //
+  // `outcome` and `fileMarker` are read over the WHOLE WINDOW, because the only
+  // place they are consumed is inside `markerAtW > changeAtW` — a window-scoped
+  // test, so by construction they cannot be stale when read.
+  //
+  // `markerAt` and `rejected` stay TURN-SCOPED, for opposite reasons. `markerAt`
+  // is an index into `turn`, which is all countReminders can use. `rejected` has
+  // no gate at all: the fallback branch acts on it unconditionally, without
+  // comparing it to `changeAtW` or to anything else. Turn scope was its only
+  // bound, and window-scoping it alongside the other two was a REGRESSION caught
+  // in round 2 — a rejected marker attempt in one turn then answered the next
+  // turn's block, for a turn that wrote no marker, telling the model to fix a
+  // record it had not written and never naming the file it had just changed.
+  // Proven against the 932c109 binary: old names `src/b.ts`, new reported "1
+  // problem(s) with the record". A field with no gate does not get the frame of
+  // the fields that have one. Reading the outcome at turn scope under a window-scoped
+  // test was a silent pass: an applier keeps the gate armed across a human
+  // prompt, the new turn holds no marker of its own, `outcome` read null, the
+  // ternary below defaulted to "ok", and reviewerState — the check that refuses
+  // a converged claim with no reviewer behind it — was never called. Reproduced
+  // live: identical facts block in the same turn and pass silently one human
+  // prompt later. logFileMarker is safe at window scope because it already
+  // dedupes on the marker id anywhere in the log.
+  const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
+  const { at: markerAtW, fileMarker, outcome } = lastMarker(entries, results, cwd);
+  const lastChangeAt = changes.length ? Math.max(...changes.map((c) => c.index)) : -1;
+  // ONE INDEX FRAME, declared before it is used twice below. markerAt and
+  // lastChangeAt are turn-relative; agent records carry whole-window indices.
+  const toWindow = (i) => i + boundary + 1;
+  // The latest thing needing a marker behind it, in window indices: the last
+  // main-chain change, or the applier's completion, whichever is later.
+  const changeAtW = Math.max(
+    changes.length ? toWindow(lastChangeAt) : -1,
+    ...appliers.map(applierAnchor),
+  );
+  // One frame for everything that becomes prose, so a message cannot describe
+  // the wrong entry: file changes converted up, appliers already there.
+  const inFrame = [
+    ...changes.map((c) => ({ ...c, index: toWindow(c.index) })),
+    // No agent type on the record: nothing reads one, and round 1 removed the
+    // only thing that did. Carrying it anyway is a field a later edit could
+    // innocently print, reopening the leak with no test to catch it.
+    ...appliers.map((a) => ({ index: applierAnchor(a), kind: "applier" })),
+  ];
+  // What still has no marker behind it — what the generic block is about, where
+  // naming an applier that was already reviewed and marked would be wrong.
+  // The REFUSAL message must not use this list. It runs only when the marker is
+  // ahead of every change, so this filter drops EVERY applier by construction —
+  // including the one at changeAtW, which is the one that message has to name.
+  // It read "you changed  after it finished" in exactly the scenario the applier
+  // arming exists to catch.
+  const described = inFrame.filter((c) => c.kind !== "applier" || c.index > markerAtW);
+
+  if (markerAtW > changeAtW) {
     // Only an affirmative `converged` is gated: the other two outcomes are
     // honest claims that need no reader, and an outcome that could not be read
     // is never refused on a guess.
@@ -838,14 +969,27 @@ function evaluate(entries, cwd) {
     // one layer out: the refusal is bounded by MAX_REMINDERS below, so a
     // phrasing change costs two turns and a visible notice rather than a
     // deadlock — a bound is cheaper than a hole.
+    // Both bounds in window indices — see the frame note above. The lower one
+    // is the applier-aware change point, so `converged` after an applier needs
+    // a finder that completed after the APPLIER finished, not merely after the
+    // lead's own last edit.
     const state = outcome === "converged"
-      ? reviewerState(agents, toWindow(lastChangeAt), toWindow(markerAt))
+      ? reviewerState(agents, changeAtW, markerAtW)
       : "ok";
     // A reviewer still working is not a missing one, and this loop waits by
     // ending turns: release, exactly as the pending branch below does.
     if (state === "running") {
       return {
         systemMessage: `self-review gate: a converged marker landed while a reviewer is still running — turn released so its report can arrive; re-mark after it lands and the gate re-checks at the next stop`,
+      };
+    }
+    // Same release, different cause: the applier is still writing, so there is
+    // nothing stable to have reviewed yet. Releasing rather than blocking is
+    // the loop's own way of waiting — the completion wakes the model, and the
+    // next Stop sees a finished applier and asks for the re-mark.
+    if (state === "applying") {
+      return {
+        systemMessage: `self-review gate: a converged marker landed while the applier is still running — turn released so its edits can finish; review them and re-mark after it reports`,
       };
     }
     if (state !== "ok") {
@@ -857,7 +1001,7 @@ function evaluate(entries, cwd) {
       }
       return {
         decision: "block",
-        reason: unreviewedReason(state, changes, lastChangeAt, cwd),
+        reason: unreviewedReason(state, inFrame, changeAtW, cwd),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
       };
     }
@@ -878,7 +1022,7 @@ function evaluate(entries, cwd) {
       systemMessage: `self-review gate: released without a convergence marker after ${reminders} reminders — the review may be incomplete. (SELF_REVIEW_GATE=off disables the gate.)`,
     };
   }
-  const beside = markerAt !== -1 && markerAt === lastChangeAt
+  const beside = markerAtW !== -1 && markerAtW === changeAtW
     ? "\nThe marker did run, but in the same message as a change — the gate orders by transcript entry, so give it a message of its own and run it again."
     : "";
   // A rejected marker gets its own reason. Repeating the generic reminder for a
@@ -894,8 +1038,8 @@ function evaluate(entries, cwd) {
   }
   return {
     decision: "block",
-    reason: blockReason(changes, reminders, cwd) + beside,
-    systemMessage: `self-review gate: ${describeChanges(changes, cwd)} — running the review loop before the turn ends`,
+    reason: blockReason(described, reminders, cwd) + beside,
+    systemMessage: `self-review gate: ${describeChanges(described, cwd)} — running the review loop before the turn ends`,
   };
 }
 
@@ -908,6 +1052,7 @@ function describeChanges(changes, cwd) {
   const files = [...new Set(changes.flatMap((c) => c.kind === "file" ? [c.file] : c.kind === "bash" ? c.files : []).map((f) => shortPath(f, cwd)))];
   const bash = changes.filter((c) => c.kind === "bash");
   const agents = changes.filter((c) => c.kind === "agent").length;
+  const appliers = changes.filter((c) => c.kind === "applier");
   const parts = [];
   if (files.length) parts.push(`${files.slice(0, 6).join(", ")}${files.length > 6 ? ` (+${files.length - 6} more)` : ""}`);
   // Named when the artifact could be resolved; when it could not, the reason
@@ -921,6 +1066,18 @@ function describeChanges(changes, cwd) {
     parts.push(`${bash.length} shell command(s) that write files${caveat ? ` (${caveat})` : ""}`);
   }
   if (agents) parts.push(`${agents} subagent(s) that edited files`);
+  // Named by what it IS, not by what it wrote: the launch is the evidence, and
+  // asking the applier what it touched would be the self-report this gate does
+  // not accept. "may have edited" is the honest wording — an applier that
+  // changed nothing arms exactly the same, and saying otherwise would be a
+  // claim the gate cannot support.
+  // The COUNT only, exactly as the synchronous-agent line above does. The type
+  // is model-authored text: echoing it verbatim let a crafted subagent_type
+  // print the gate's own refusal sentence into the reason, which the gate then
+  // counts as one of ITS reminders — MAX_REMINDERS reached, next bogus marker
+  // released — and let a 20,000-character type produce a 21,653-character
+  // block. Reproduced live, both halves.
+  if (appliers.length) parts.push(`${appliers.length} applier subagent(s) that may have edited files`);
   return parts.join(" · ");
 }
 

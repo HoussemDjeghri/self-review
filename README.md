@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-191919">
+  <img alt="version 0.6.0" src="https://img.shields.io/badge/version-0.6.0-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -104,7 +104,12 @@ uninstalling.
 
 1. **The gate arms.** Any `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, any shell
    command that writes a file (redirects, `sed -i`, `cp`, `tee`, `git apply`, …)
-   on a non-exempt path marks the turn as changed. Scratch paths never count:
+   on a non-exempt path marks the turn as changed. The gate will also arm on the
+   launch of a `self-review-applier` — the one agent type whose dispatch means it
+   was told to edit, since an async subagent's result carries no record of what
+   it wrote — but that agent does not ship yet, so nothing dispatches one today;
+   the rule is in place first so the applier's first use is not the uncovered
+   window. Scratch paths never count:
    `/tmp`, the session scratchpad, and Claude's own state directories
    (`~/.claude/projects`, `plans`, `todos`, `sessions`, …) — but not the rest of
    `~/.claude`, so editing your own hooks or skills is reviewed like any code.

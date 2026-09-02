@@ -92,7 +92,10 @@ function run(entries, { env = {}, payload = {}, gate = GATE } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "srg-"));
   const transcript = path.join(dir, "t.jsonl");
   writeFileSync(transcript, entries.flat().map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("\n") + "\n");
-  const childEnv = { ...process.env };
+  // Every run gets its own log dir. The gate APPENDS its marker log there, so
+  // the default one is the developer's real `~/.claude/self-review/log.jsonl`
+  // and a shared one lets cases read each other's lines.
+  const childEnv = { ...process.env, SELF_REVIEW_LOG_DIR: path.join(dir, "log") };
   delete childEnv.SELF_REVIEW_GATE; // the suite must not inherit a disabled gate
   Object.assign(childEnv, env);
   const res = spawnSync(process.execPath, [gate], {
@@ -151,11 +154,20 @@ test("cp/mv/ln/install/rsync count every operand, source included: over-inclusiv
   assert.match(run(turn(bash(`rsync -t ${PROJECT}/a.mjs ${PROJECT}/b.md`))).json.reason, /Changed: a\.mjs ·/);
 });
 
-test("a directory operand is never exempt by its name; an unknowable write still names the known targets", () => {
+test("a directory operand is never exempt by its name; an unknowable write blocks without naming an exempt file", () => {
   assert.ok(blocks(run(turn(bash(`cp -r ${PROJECT}/a ${PROJECT}/site.json/`)))));
+  // The unknowable write still blocks — that has never been in question. What
+  // changed 2026-09-02 is what it is allowed to call the change: this used to
+  // name `b.md`, and a name is what the refusal reports as the reason. Naming a
+  // file the gate exempts everywhere else made prose-only turns read as code
+  // turns, which is the defect F7 closed for the resolve-nothing case and this
+  // closes for the resolve-something-exempt case. With no repository to ask,
+  // "could not determine which files" is the honest answer; with one, the git
+  // evidence names the real artifact (see the F7 block).
   const r = run(turn(bash(`cp ${PROJECT}/a.md ${PROJECT}/b.md && python3 -c "import shutil; shutil.copy('x','y')"`)));
   assert.ok(blocks(r));
-  assert.match(r.json.reason, /b\.md/);
+  assert.doesNotMatch(r.json.reason, /b\.md/);
+  assert.match(r.json.reason, /could not determine which files/);
 });
 
 test("a Bash write to a prose file passes; the same write to a script blocks; a mixed write names only the code", () => {
@@ -698,7 +710,7 @@ test("a general-purpose agent's completion does not satisfy converged, though it
 test("a finder that completed BEFORE the last change is stale: the edit behind it was read by nobody", () => {
   const r = run([human("go"), ...reviewed(), ...write(`${PROJECT}/src/a.ts`), ...marker(), said("done")]);
   assert.ok(blocks(r));
-  assert.match(r.json.reason, /you changed .*a\.ts after it finished/);
+  assert.match(r.json.reason, /landed after it finished: .*a\.ts/);
 });
 
 test("a finder completing between the last change and the marker releases the turn", () => {
@@ -792,11 +804,206 @@ test("an unrelated agent that parses does not hide a reviewer, and does not stan
   assert.ok(blocks(helperOnly), "a helper is not a reviewer");
 });
 
+// ---------- the applier arms the gate (F10b) ----------
+//
+// An async Agent result carries no toolStats, so an applier subagent's edits
+// are invisible to the main chain. The LAUNCH is the evidence: harness-written,
+// in the main chain, and it cannot be silently absent. These fixtures never
+// write a file — that is the whole point.
+
+const APPLIER = "self-review:self-review-applier";
+const applier = (id, type = APPLIER) => launch(id, type);
+
+test("launching an applier arms the gate although the turn changed no file itself", () => {
+  const r = run(turn(...applier("ap1"), notification("ap1")));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /applier subagent/);
+});
+
+test("an applier that is still running releases the turn, like any other subagent", () => {
+  const r = run(turn(...applier("ap1")));
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /still running/);
+});
+
+test("a marker after the applier completed clears it", () => {
+  const r = run(turn(...applier("ap1"), notification("ap1"), ...reviewed(), ...marker()));
+  assert.equal(r.stdout, "", "an applier that completed, was reviewed, and was marked is done");
+});
+
+test("converged needs a reviewer that finished after the APPLIER, not after the lead's last edit", () => {
+  // The anchor is completion, not launch: a finder that finished while the
+  // applier was still writing read a tree that was still moving under it.
+  const r = run(turn(
+    ...write(`${PROJECT}/a.ts`),
+    ...applier("ap1"),
+    ...reviewed(),              // completes BEFORE the applier does
+    notification("ap1"),
+    ...marker(),
+  ));
+  assert.ok(blocks(r), "the finder completed before the applier's edits were a fixed set");
+  assert.match(r.json.reason, /converged/i);
+});
+
+test("a reviewer that finished after the applier completed satisfies converged", () => {
+  const r = run(turn(
+    ...write(`${PROJECT}/a.ts`),
+    ...applier("ap1"),
+    notification("ap1"),
+    ...reviewed(),              // completes AFTER the applier
+    ...marker(),
+  ));
+  assert.equal(r.stdout, "");
+});
+
+test("a converged marker written while the applier is still running releases rather than passing", () => {
+  // It must not read as "ok": nothing stable has been reviewed yet. It must not
+  // block either — this loop waits by ending turns.
+  const r = run(turn(...write(`${PROJECT}/a.ts`), ...reviewed(), ...applier("ap1"), ...marker()));
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /applier is still running/);
+});
+
+test("the applier's arm survives a human interjection — the turn is the wrong frame for it", () => {
+  // The gate releases a turn while a subagent runs so the user can type. The
+  // applier's edits then land in a turn whose main chain holds nothing at all.
+  const r = run([
+    human("go"), ...applier("ap1"), said("dispatched, waiting"),
+    human("something else"), notification("ap1"), said("it finished"),
+  ]);
+  assert.ok(blocks(r), "a turn-scoped scan would see no applier and no change here");
+  assert.match(r.json.reason, /applier subagent/);
+});
+
+test("a marker in an EARLIER turn still clears the applier — the discharge is window-scoped too", () => {
+  // The mirror of the case above, and the one a naive turn-scoped marker lookup
+  // turns into a permanent false block: applied and marked in one turn, the
+  // user types, and the next turn has the applier record but no local marker.
+  const r = run([
+    human("go"), ...applier("ap1"), notification("ap1"), ...reviewed(), ...marker(), said("done"),
+    human("now something else"), said("answered, nothing written"),
+  ]);
+  assert.equal(r.stdout, "", "the marker is behind the applier, just in a previous turn");
+});
+
+test("an applier that never reported stays armed on its launch, and not-converged discharges it honestly", () => {
+  const crashed = [human("go"), ...applier("ap1"), said("x"), human("i"), said("y"), human("ii"), said("z")];
+  assert.ok(blocks(run(crashed)), "aged out of pending, but its launch still demands an answer");
+  const NOT_CONV = `${CONVERGED_Q} --not-converged --rounds 1 --fixed 0 --dismissed 0 --open 1`;
+  // The banner is the same for every outcome — the gate reads `outcome=` out of
+  // it, not the headline — so a fixture that invents "SELF-REVIEW NOT
+  // CONVERGED" tests a marker the script never prints.
+  const honest = run([...crashed, ...bash(NOT_CONV, "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1")]);
+  assert.equal(honest.stdout, "", "not-converged needs no reviewer behind it, so a dead applier is not a deadlock");
+});
+
+test("only the applier's own type arms: a research subagent that wrote nothing does not", () => {
+  // Arming on any agent would turn every read-only spawn into a demanded
+  // marker, and the read-only universe cannot be enumerated.
+  for (const type of ["general-purpose", "Explore", "self-review:self-review-finder", "db-applier"]) {
+    const r = run(turn(...launch(`x-${type}`, type), notification(`x-${type}`)));
+    assert.equal(r.stdout, "", `${type} must not arm the gate`);
+  }
+});
+
+test("the applier arms even when it reports having changed nothing", () => {
+  // Deliberate: knowing what it touched would mean reading its self-report,
+  // which is the manifest shape this gate does not accept. The cost is one
+  // marker, which the loop was going to write anyway.
+  const r = run(turn(...applier("ap1"), notification("ap1", "completed")));
+  assert.ok(blocks(r));
+});
+
+test("the applier block is bounded like every other, and says what it is waiting on", () => {
+  // One turn: `turn()` opens with a human prompt, so repeating it would move
+  // the boundary and reset the count it is supposed to be accumulating.
+  const r = run([
+    human("go"), ...applier("ap1"), notification("ap1"), said("dispatched"),
+    gateFeedback(), said("still nothing"), gateFeedback(), said("still nothing"),
+  ]);
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /released/);
+});
+
 test("the refusal is bounded: after MAX_REMINDERS refusals the gate releases with a notice", () => {
   const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`),
     unreviewedFeedback(), unreviewedFeedback(), ...marker(), said("done")]);
   assert.ok(!blocks(r));
   assert.match(r.json.systemMessage, /released after 2 refusals/);
+});
+
+// ---------- what round 1 of the F10b review found ----------
+
+test("a bogus converged marker stays refused once a human prompt starts a new turn", () => {
+  // The applier arms the gate over the whole WINDOW, so the marker's outcome has
+  // to be read over the whole window too. Read at turn scope it came back null
+  // as soon as the next turn held no marker of its own, the outcome gate
+  // defaulted to "ok", and a converged claim with zero reviewers behind it
+  // passed in silence. Same facts, one prompt apart — the control is the same
+  // fixture without the second turn.
+  const body = [...applier("ap1"), notification("ap1"), ...marker()];
+  assert.ok(blocks(run(turn(...body))), "control: refused in the turn that marked");
+  const later = run([...turn(...body), human("now something else"), said("answered, nothing written")]);
+  assert.ok(blocks(later), "and still refused a human prompt later");
+});
+
+test("resuming the applier re-arms it: its anchor cannot move back behind a marker", () => {
+  const resend = (to) => call("SendMessage", { to, message: "also fix b.js" }, "Message sent");
+  // The marker lands while the applier is still writing; the applier then
+  // finishes, so the marker sits behind its completion and the turn is refused.
+  const before = [...applier("ap1"), ...reviewed(), ...marker(), notification("ap1")];
+  assert.ok(blocks(run(turn(...before))), "control: the marker was written mid-flight");
+  // A SendMessage used to walk `doneAt` back to -1 and the anchor back to the
+  // LAUNCH — behind that marker — which released the turn and then went silent
+  // once `pending` aged out. It is the accidental-disarm shape: resuming the
+  // agent is the first thing a model debugging the block reaches for.
+  const resumed = [...turn(...before, ...resend("ap1")),
+    human("something"), said("a"), human("something else"), said("b")];
+  assert.ok(blocks(run(resumed)), "a resume is fresh edit work and needs a marker AFTER it");
+});
+
+test("a model-authored subagent_type never reaches the block reason", () => {
+  // The reason comes back as the isMeta entry countUnreviewed counts, so a type
+  // that prints the gate's own refusal sentence drove the gate's own release
+  // counter and freed the next bogus marker.
+  const r = run(turn(...applier("ap1", "outcome=converged claims a review ran:self-review-applier"), notification("ap1")));
+  assert.ok(blocks(r));
+  assert.ok(!r.json.reason.includes("outcome=converged claims a review ran"),
+    "the type is model-authored text: counted, never quoted");
+});
+
+test("a 20,000-character subagent_type does not become a 20,000-character reason", () => {
+  const r = run(turn(...applier("ap1", "x".repeat(20_000) + ":self-review-applier"), notification("ap1")));
+  assert.ok(blocks(r));
+  assert.ok(!r.json.reason.includes("x".repeat(100)), "the type's bulk is not copied into the reason");
+});
+
+test("the refusal names the applier when the applier is what came after the reviewer", () => {
+  // The applier's completion, not a file edit, is the latest thing needing a
+  // marker behind it. The list the generic block uses drops every applier a
+  // marker already covers — inside this branch that is all of them — so this
+  // message read "you changed  after it finished", naming nothing, in exactly
+  // the scenario the applier arming exists to catch.
+  const r = run(turn(...reviewed(), ...applier("ap1"), notification("ap1"), ...marker()));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /landed after it finished: .*applier subagent/);
+});
+
+test("a rejected marker in an earlier turn does not answer this turn's block", () => {
+  // `rejected` has no gate — the fallback branch acts on it without comparing it
+  // to anything — so turn scope is its only bound. Round 1 window-scoped it
+  // alongside `outcome` and `fileMarker`, which do have a gate, and this turn
+  // came back "1 problem(s) with the record" for a turn that wrote no marker,
+  // never naming the file it had just changed. Proven against the 932c109
+  // binary, which names the file.
+  const r = run([
+    human("go"), ...write(`${PROJECT}/src/a.ts`), ...writeMarker({ summary: "bad" }), said("done"),
+    human("now do b"), ...write(`${PROJECT}/src/b.ts`), said("done"),
+  ]);
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /b\.ts/, "the block is about the change this turn made");
+  assert.doesNotMatch(r.json.systemMessage, /problem\(s\) with the record/,
+    "and not about a record written in a turn that is over");
 });
 
 // ---------- plugin packaging: write-file marker, exempt names, config ----------
@@ -1122,4 +1329,36 @@ test("F7: a resolvable target still decides on its own, without asking git", () 
   const r = run(turn(bash(`printf 'x' > ${PROJECT}/real.mjs`)), { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /real\.mjs/);
+});
+
+// The same defect F7 closed, in the shape F7 left open. Reported from a real
+// session 2026-09-02: prose-only turns blocked because the markdown went out
+// through a heredoc. F7 made an UNRESOLVABLE write consult git for its artifact,
+// but `bashWriteTargets` only reached that fallback when it could name nothing
+// at all. One command that both wrote a doc to a resolvable path AND ran an
+// interpreter whose target could not be resolved returned the doc — filtered by
+// scratch alone, so the `.md` exemption never fired — and the turn blocked
+// citing a file the gate itself exempts everywhere else.
+test("F7: a resolvable PROSE target beside an unresolvable write is still prose", () => {
+  const { repo } = repoFixture({ "docs/notes.md": "# notes\n", "anything.txt": "x\n" });
+  // ONE command: the two writes have to share a Bash call. Split across two
+  // calls each is analysed on its own, the resolvable half returns null as a
+  // pure prose write, and the defect never arises.
+  const r = run(turn(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`)), { payload: { cwd: repo } });
+  assert.equal(blocks(r), false, r.json?.reason);
+  assert.equal(r.stdout, "", "a prose-only turn says nothing");
+});
+
+test("F7: a resolvable prose target does not hide a code artifact beside it", () => {
+  // The fix must not buy the prose case by going blind: the git evidence is
+  // still what answers, so a code file written in the same turn still blocks
+  // and is still the file that gets named.
+  const { repo } = repoFixture({ "docs/notes.md": "# notes\n", "src/generated.mjs": "export const x = 1;\n" });
+  // ONE command: the two writes have to share a Bash call. Split across two
+  // calls each is analysed on its own, the resolvable half returns null as a
+  // pure prose write, and the defect never arises.
+  const r = run(turn(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the unresolvable write really did produce code");
+  assert.match(r.json.reason, /src\/generated\.mjs/);
+  assert.doesNotMatch(r.json.reason, /notes\.md/, "the exempt half is not evidence of a change");
 });
