@@ -288,7 +288,10 @@ evidence standard, the output format, and the sonnet · high default), and
 **no Bash at all**. Spawn what the row says: substituting the finder there hands
 a shell to the one angle whose whole design is that it does not have one. If a
 *reviewer* type is missing, use `general-purpose` and paste the contents of that
-agent file (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief.
+agent file (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief —
+and give it the prefixed name §2d requires (`self-review-finder-…`), because its
+registered type is `general-purpose`, which no guard recognises, so the name is
+the only thing containing it.
 **Never do that for `self-review-applier`**: the Stop gate arms on that exact
 agent type, so a substitute is invisible to it *and* carries `Bash` — the gate
 stops seeing the edits and the one writing agent stops being the one that cannot
@@ -379,6 +382,22 @@ message, then end the turn) when:
   to counter, so an outsider rules on all of them, the earlier ones included;
 - a candidate's fix would change behaviour, a contract, or a stated decision,
   and you are not certain.
+
+**Name the verifier, and the name must start with `self-review-verifier`** —
+`self-review-verifier-r2-b1`, not `r2-verify`. This is containment, not
+housekeeping: the harness puts a named agent's **name** into the `agent_type`
+that `PreToolUse` hooks receive, so `tree-guard` matches the name and never the
+registered type. A verifier named off-convention has a shell in the author's
+working tree that no guard is watching. `tier.mjs` already names every finder
+this way; the verifier is the one the lead names by hand. Measured 2026-09-03
+(F10h) after the guard turned out to have been inert for roughly ninety finders.
+
+**The same rule is load-bearing for the `general-purpose` substitute** that
+§2b sends you to when a reviewer type is missing. That agent's registered
+type is `general-purpose`, which no guard recognises, so the prefixed name is
+the *only* thing standing between it and the author's tree: name it
+`self-review-finder-…` or `self-review-verifier-…` to match the role whose
+brief it is carrying. An unnamed substitute is an unguarded shell.
 
 Decide per verdict:
 

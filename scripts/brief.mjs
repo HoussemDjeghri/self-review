@@ -103,16 +103,26 @@ export function buildPlan(tier, round, config = {}) {
     round,
     source: "default plan",
     verifier: tier === "L" ? "agent" : "author",
-    finders: rows.map((row) => ({
-      name: `r${round}-${row.angles.join("").toLowerCase()}`,
-      kind: "code",
-      angles: row.angles,
-      agent: "self-review-finder",
-      model: row.model ?? "sonnet",
-      effort: "high",
-      calls,
-      impact: row.impact,
-    })),
+    finders: rows.map((row) => {
+      // The name leads with the agent type, and that is containment rather than
+      // convention: the harness puts a named agent's NAME into the `agent_type`
+      // its PreToolUse hooks see, so `tree-guard` matches this string and never
+      // the registered type. `tier.mjs` does the same for the same reason —
+      // these are two generators feeding one guard, and this one is the
+      // fallback the skill reaches for when the other is broken, which is
+      // exactly when an unguarded reviewer would go unnoticed. F10h.
+      const agent = "self-review-finder";
+      return {
+        name: `${agent}-r${round}-${row.angles.join("").toLowerCase()}`,
+        kind: "code",
+        angles: row.angles,
+        agent,
+        model: row.model ?? "sonnet",
+        effort: "high",
+        calls,
+        impact: row.impact,
+      };
+    }),
   };
 }
 

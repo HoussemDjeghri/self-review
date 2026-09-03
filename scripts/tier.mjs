@@ -405,17 +405,26 @@ export function buildFinders({ tier, round, kinds, markers, config, impactConfig
   const callsFor = { code: config.finders.callsCode, docs: config.finders.callsDocs, config: config.finders.callsConfig };
   const full = new Set(impactConfig.fullFor);
   const docsDepth = new Set(impactConfig.docsFor);
-  const finders = rows.map((row) => ({
-    name: `r${round}-${row.angles.join("").toLowerCase()}`,
-    kind: row.kind,
-    angles: row.angles,
+  const finders = rows.map((row) => {
     // X alone gets the grader, which has no shell. Every other angle reads the
     // change; X reads a TRANSCRIPT that `coldrun.sh` already produced inside
     // containment, and the one thing that must stay impossible is a reviewer
     // deciding for itself which invocation of unknown code is safe to run.
     // Held by the agent's tool list rather than by a sentence in its brief —
     // two review rounds in a row returned `wrong-layer` on the sentence.
-    agent: isColdGrader(row) ? "self-review-cold-grader" : "self-review-finder",
+    const agent = isColdGrader(row) ? "self-review-cold-grader" : "self-review-finder";
+    return {
+    // The type leads the name, and that is a containment property rather than a
+    // convention. Measured 2026-09-03 on the installed plugin: the harness puts
+    // a spawned agent's NAME into the `agent_type` its PreToolUse hooks see, so
+    // `tree-guard` matches this string and never the registered type. While
+    // these rows were named `r1-ab`, the guard was inert for every finder it
+    // ever produced — roughly ninety shells in the author's working tree, and
+    // every review round read the guard and correctly found it correct. F10h.
+    name: `${agent}-r${round}-${row.angles.join("").toLowerCase()}`,
+    kind: row.kind,
+    angles: row.angles,
+    agent,
     model: row.model ?? "sonnet",
     effort: "high",
     // The grader's work is one transcript plus the entry points it names, not
@@ -426,7 +435,8 @@ export function buildFinders({ tier, round, kinds, markers, config, impactConfig
     // they can act on; the rest get two lines and a path (DESIGN §4.3).
     impact: row.angles.some((angle) => full.has(angle)) ? "full" : row.angles.some((angle) => docsDepth.has(angle)) ? "docs" : "summary",
     weightFixLines: true,
-  }));
+    };
+  });
   return { finders, merged };
 }
 

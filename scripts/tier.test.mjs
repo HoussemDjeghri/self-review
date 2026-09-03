@@ -398,7 +398,10 @@ test("mixed kinds merge within a kind to fit the cap, and no kind is dropped", (
   assert.ok(result.finders.length <= TIER.finders.maxPerRound);
   assert.deepEqual(result.merged, [["G", "into", "Q+V"]]);
   assert.deepEqual(result.finders.find((f) => f.angles.includes("G")).angles, ["G", "Q", "V"]);
-  assert.equal(result.finders.find((f) => f.angles.includes("G")).name, "r1-gqv");
+  // The type leads the name because `tree-guard` matches on the name the
+  // harness hands it, never on the registered type (F10h). The seam itself is
+  // asserted in tree-guard.test.mjs, against this generator's real output.
+  assert.equal(result.finders.find((f) => f.angles.includes("G")).name, "self-review-finder-r1-gqv");
   for (const kind of ["code", "docs", "config"]) {
     assert.ok(result.finders.some((f) => f.kind === kind), `${kind} kept a finder`);
   }

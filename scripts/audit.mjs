@@ -149,12 +149,22 @@ function roleOf(entries, meta) {
 /**
  * Which round a reviewer belongs to. The brief is handed over as a path, so the
  * path is the reliable evidence; the angle text and the agent's own name are the
- * fallbacks for a brief passed inline.
+ * fallbacks for a brief passed inline. The name arm matches the round
+ * segment wherever it sits, because a generated name leads with the agent
+ * type (`self-review-finder-r1-ab`) and only the older, unprefixed shape
+ * (`r1-ab`) put it first.
  */
 function roundOf(entries, name) {
   const head = textOf(entries.find((entry) => entry.type === "user")?.message).slice(0, 1500);
   const fromPath = /round-(\d+)\//.exec(head) ?? /\bround (\d+)\b/i.exec(head);
-  const fromName = /^r(\d+)/.exec(name);
+  // The shape here is chosen elsewhere: `tier.mjs`'s buildFinders and
+  // `brief.mjs`'s buildPlan both emit `<agent-type>-r<round>-<angles>`. There is
+  // deliberately no drift test binding this to them, unlike tree-guard's: this
+  // arm is reached only by a transcript whose first message carries neither a
+  // `round-N/` path nor the words "round N", which a generated brief always
+  // does, and the cost of being wrong here is a `round ?` in a retrospective
+  // report rather than a lost working tree. Ruled 2026-09-03.
+  const fromName = /(?:^|-)r(\d+)(?:-|$)/.exec(name);
   const digits = fromPath?.[1] ?? fromName?.[1];
   return digits === undefined ? null : Number(digits);
 }

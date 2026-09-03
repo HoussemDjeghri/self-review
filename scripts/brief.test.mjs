@@ -46,7 +46,8 @@ test("the fallback plan follows the round-1 groups, and merges by round", () => 
   assert.deepEqual(large.finders.filter((f) => f.model === "opus").map((f) => f.angles), [["G"], ["H"]]);
   assert.equal(buildPlan("M", 2).finders.length, 2, "round 2 merges to two finders");
   assert.deepEqual(buildPlan("L", 3).finders.map((f) => f.angles), [["compact"]], "round 3+ is one compact finder");
-  assert.equal(buildPlan("M", 2).finders[0].name, "r2-abdqv");
+  assert.equal(buildPlan("M", 2).finders[0].name, "self-review-finder-r2-abdqv",
+    "the fallback plan's names must lead with the agent type too — tree-guard reads the name");
 });
 
 test("only the dismissed section of the ledger travels to the next round", () => {
@@ -233,10 +234,10 @@ test("the CLI writes one brief per plan row, creates the state directory, and pr
   assert.equal(results.length, 6);
   assert.ok(lines.length <= 8, `${lines.length} stdout lines`);
   assert.match(lines[0], /^# 6 briefs for round 1, tier L .* verifier: agent$/);
-  assert.match(lines[1], /^r1-ab {2}self-review-finder {2}sonnet\/high {2}40 calls {2}\S+r1-ab\.md/);
-  assert.ok(existsSync(path.join(dir, "round-1", "briefs", "r1-g.md")));
+  assert.match(lines[1], /^self-review-finder-r1-ab {2}self-review-finder {2}sonnet\/high {2}40 calls {2}\S+self-review-finder-r1-ab\.md/);
+  assert.ok(existsSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md")));
   assert.ok(existsSync(path.join(dir, "round-1", "state")), "the state directory exists before the finder appends to it");
-  assert.match(readFileSync(path.join(dir, "round-1", "briefs", "r1-g.md"), "utf8"), /ship phase 2/);
+  assert.match(readFileSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md"), "utf8"), /ship phase 2/);
 });
 
 test("a tier.json plan drives the briefs, including its own names and models", () => {

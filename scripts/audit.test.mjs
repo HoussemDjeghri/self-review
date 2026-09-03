@@ -419,7 +419,9 @@ test("a location is read from whichever field the finder's schema of the day use
 test("a finder whose brief was inlined is placed by its own name", () => {
   // The fallback roundOf() keeps for exactly this case had no fixture: every
   // other transcript here names its round in the first user message, so only
-  // the path arm was ever exercised.
+  // the path arm was ever exercised. The names below are the shape the
+  // generators actually emit — a fixture in the retired unprefixed shape
+  // tests the arm against input that can no longer occur.
   const inlined = (timestamp, rows) => [
     { type: "user", timestamp, message: { content: "YOUR ANGLE — A · line-by-line scan. Findings as JSON." } },
     assistant(timestamp, [{ type: "text", text: "```json\n" + JSON.stringify(rows) + "\n```" }]),
@@ -427,11 +429,11 @@ test("a finder whose brief was inlined is placed by its own name", () => {
   const row = [{ file: "src/a.ts", line: 42, class: "correctness" }];
   const file = session(
     [
-      assistant("2026-08-23T10:01:00Z", [spawn("r2-ab"), spawn("r12-cd"), spawn("v1")]),
+      assistant("2026-08-23T10:01:00Z", [spawn("self-review-finder-r2-ab"), spawn("self-review-finder-r12-cd"), spawn("v1")]),
       assistant("2026-08-23T10:30:00Z", [bashMarker("rounds=12 fixed=1 tier=L")]),
     ],
-    [["ar2-ab-d7e007c386c1cc6d", inlined("2026-08-23T10:02:00Z", row), { name: "r2-ab", customAgentType: "self-review-finder" }],
-     ["ar12-cd-d7e007c386c1cc6e", inlined("2026-08-23T10:03:00Z", row), { name: "r12-cd", customAgentType: "self-review-finder" }],
+    [["aself-review-finder-r2-ab-d7e007c386c1cc6d", inlined("2026-08-23T10:02:00Z", row), { name: "self-review-finder-r2-ab", customAgentType: "self-review-finder" }],
+     ["aself-review-finder-r12-cd-d7e007c386c1cc6e", inlined("2026-08-23T10:03:00Z", row), { name: "self-review-finder-r12-cd", customAgentType: "self-review-finder" }],
      ["av1-8a93200c18eeed9e", verifierTranscript("2026-08-23T10:10:00Z"), { name: "v1", customAgentType: "self-review-verifier" }]]);
   const [review] = audit(file).reviews;
   assert.deepEqual(review.overlap.map((r) => r.round), [2, 12],

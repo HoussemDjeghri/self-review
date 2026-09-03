@@ -51,7 +51,16 @@ import { afterPrefixes, inlineShell, words } from "./lib/shell.mjs";
 const GUARD_TAG = "[tree-guard]";
 
 /** The reviewers of this loop. A plugin agent's type carries a `plugin:` prefix. */
-const REVIEWER = /(^|:)self-review-(finder|verifier|cold-grader)$/;
+// Matches BOTH the registered type (`self-review:self-review-finder`, what a
+// spawn with no name sends) and the generated name (`self-review-finder-r1-ab`,
+// what `tier.mjs` produces) — because the harness puts a named agent's NAME
+// into `agent_type`, so this regex is the only thing standing between a
+// reviewer's shell and the author's uncommitted work, and it sees whichever of
+// the two the lead happened to send. A name that does not start with the
+// agent's own type is NOT guarded, by design: the plugin generates every name
+// it is responsible for, and an unrecognised one is treated as not a reviewer,
+// the same accepted fail-open as an unlisted `rm` spelling. F10h.
+const REVIEWER = /(^|:)self-review-(finder|verifier|cold-grader)(-|$)/;
 
 /**
  * The git verbs a reviewer may run. Everything else is denied.

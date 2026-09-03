@@ -108,6 +108,17 @@ real result; a claim of "tests pass" in the transcript is not evidence. Flag:
 behaviour with no test, a test that passes for the wrong reason, a skipped or
 `.only` test left behind, a check that cannot run because of the change.
 
+**Then ask the inert question, of every mechanism in scope that can do nothing
+without failing** — a copy, a filter, a guard, a matcher run against data some
+other process hands it. Name where it proves it engaged: a test fed captured
+real input, or an assertion at runtime. No such proof is a finding on its own,
+whatever the code reads like. Three defects shipped from this repository past
+green rounds and all three had that shape — `rsync -a` exits 0 whether it
+copied or skipped, a suite passes whether it read the shipped tree or the
+repository, and a PreToolUse guard's allow path and its inert path are the same
+silence. Reading cannot separate those; only input that was really observed
+can, so ask for it here.
+
 ### G · Security *(conditional: input handling, auth, files, network, secrets, shell, HTML)*
 Trace every piece of untrusted data the change touches from entry to use:
 injection (SQL, shell, path, template, header, log), missing or bypassable

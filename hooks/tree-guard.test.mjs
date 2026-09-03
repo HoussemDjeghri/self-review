@@ -19,6 +19,102 @@ const FINDER = {
 const call = (command, over = {}) => evaluate({ ...FINDER, ...over, tool_input: { command } });
 const denied = (command, over) => Boolean(call(command, over));
 
+// Measured 2026-09-03, on the installed plugin, by logging the hook's real
+// PreToolUse payload: spawning a subagent WITH A NAME replaces `agent_type`
+// with that name. A finder launched as `r1-ab` arrives here as
+// `{agent_id: "ar1-ab-579bcafc7cb1ce5c", agent_type: "r1-ab"}`, and `agent_id`
+// carries the name too, so the payload holds no second source of truth. The
+// guard was therefore inert for roughly ninety finders — each with a shell in
+// the author's tree — while every review round read this file and correctly
+// found it correct. The code matched its intent; the intent did not match the
+// harness.
+//
+// The fix is that the plugin names its own agents, and the name leads with the
+// type (`tier.mjs`). So this regex must match both spellings, and the test that
+// matters is the one below binding it to the string tier.mjs actually emits.
+// F10h.
+test("both spellings of a reviewer are guarded: the registered type and the generated name", () => {
+  const registered = { agent_id: "a70e82d2662144940", agent_type: "self-review:self-review-finder" };
+  const generated = { agent_id: "aself-review-finder-r1-ab-579bcafc", agent_type: "self-review-finder-r1-ab" };
+  for (const [what, over] of [["the unnamed spawn", registered], ["the generated name", generated]]) {
+    assert.ok(denied("git stash", over), `${what}: a reviewer's shell reaches git`);
+    assert.ok(denied("git checkout -- scripts/x.mjs", over),
+      `${what}: this is the exact verb from the field report that destroyed uncommitted work`);
+    assert.ok(!denied("git status", over), `${what}: a reviewer may still read`);
+  }
+  assert.ok(denied("git stash", { agent_type: "self-review-cold-grader-r1-x" }));
+  assert.ok(denied("git stash", { agent_type: "self-review-verifier-r1-v" }));
+});
+
+// Stated rather than hidden: an off-convention name is NOT guarded, and that is
+// the accepted fail-open. The plugin generates every name it is responsible for
+// — the test below is what keeps that true — and a PreToolUse hook that holds a
+// turn hostage over an unrecognised string is the worse failure. The day agent
+// names are chosen outside this plugin, this line becomes the finding.
+test("a name that does not lead with the agent's type is not recognised as a reviewer", () => {
+  assert.ok(!denied("git stash", { agent_type: "r9-nametest" }),
+    "documenting the hole the fix leaves, so nobody discovers it by accident twice");
+});
+
+// The seam. TWO generators choose finder names — `tier.mjs` for a normal
+// round and `brief.mjs`'s buildPlan for the `--tier` fallback the skill
+// reaches for when tier.mjs fails — and this regex reads both, in files
+// edited for unrelated reasons. That is the shape that already produced this
+// defect once. So the assertion is not on a literal: it runs each real
+// generator and feeds its real output to the real guard. Rename the rows in
+// either without touching the regex and this fails here, not in the author's
+// working tree three days later. The fallback generator is the one that
+// matters most: it runs precisely when the normal path is broken, which is
+// when nobody is looking at names.
+test("every name tier.mjs generates is a name tree-guard recognises", async () => {
+  const { buildFinders } = await import("../scripts/tier.mjs");
+  const { loadConfig } = await import("./lib/config.mjs");
+  const full = loadConfig();
+  const config = { ...full.tier, impactDepths: full.impact };
+  const kinds = { code: ["cli.mjs"], docs: ["README.md"], config: ["app.json"],
+    instructional: [], executable: ["cli.mjs"], asset: [], ignored: [] };
+  const seen = [];
+  for (const tier of ["S", "M", "L"]) {
+    for (const round of [1, 2, 3]) {
+      const { finders } = buildFinders({
+        tier, round, kinds,
+        markers: { security: ["cli.mjs"], auth: [], concurrency: ["cli.mjs"] },
+        config, impactConfig: full.impact, compact: false,
+      });
+      for (const row of finders) {
+        seen.push(row.name);
+        assert.ok(denied("git stash", { agent_id: `a${row.name}-deadbeef`, agent_type: row.name }),
+          `tier.mjs generates the name "${row.name}", which tree-guard does not recognise as a reviewer — that agent gets an unguarded shell in the author's tree`);
+      }
+    }
+  }
+  assert.ok(seen.length >= 6, `the generator produced almost nothing (${seen.length} rows) — this test has stopped testing anything`);
+});
+
+test("every name brief.mjs's fallback plan generates is a name tree-guard recognises", async () => {
+  const { buildPlan } = await import("../scripts/brief.mjs");
+  const seen = [];
+  for (const tier of ["S", "M", "L"]) {
+    for (const round of [1, 2, 3]) {
+      for (const row of buildPlan(tier, round).finders) {
+        seen.push(row.name);
+        assert.ok(denied("git stash", { agent_id: `a${row.name}-deadbeef`, agent_type: row.name }),
+          `brief.mjs --tier ${tier} generates the name "${row.name}", which tree-guard does not recognise as a reviewer — that agent gets an unguarded shell in the author's tree`);
+      }
+    }
+  }
+  assert.ok(seen.length >= 6, `the fallback generator produced almost nothing (${seen.length} rows) — this test has stopped testing anything`);
+});
+
+// Depth is NOT the variable — measured in the same run. A depth-2 finder's
+// payload carries every key a depth-1 one does; it read as unguarded only
+// because its parent had named it off-convention.
+test("depth 2 is not a hole; a name is", () => {
+  assert.ok(denied("git stash",
+    { agent_id: "aself-review-finder-r2-cef-11c485", agent_type: "self-review-finder-r2-cef" }),
+    "a depth-2 finder the plugin named is guarded exactly like a depth-1 one");
+});
+
 test("the undo from the field report is denied, and so is every other writing verb", () => {
   assert.ok(denied("git checkout -- scripts/x.mjs"));
   for (const verb of ["restore .", "reset --hard", "stash", "stash push -u", "clean -fd", "switch main",
@@ -214,6 +310,16 @@ test("run as the harness runs it, it denies on stdin and fails open on nonsense"
   assert.equal(JSON.parse(deny.stdout).hookSpecificOutput.permissionDecision, "deny");
 
   assert.equal(hook({ ...FINDER, tool_input: { command: "git log" } }).stdout, "");
+  // The generated spelling, through the real process. Every other generated-name
+  // assertion calls evaluate() in-process and every other subprocess assertion
+  // uses the unnamed type, so without this line the two halves of the fix are
+  // each tested and their composition is not — and the composition is what the
+  // harness actually runs.
+  const named = hook({ agent_id: "aself-review-finder-r1-ab-deadbeef", agent_type: "self-review-finder-r1-ab",
+    tool_name: "Bash", tool_input: { command: "git stash" } });
+  assert.equal(named.status, 0, "a hook must never hold a turn hostage");
+  assert.equal(JSON.parse(named.stdout).hookSpecificOutput.permissionDecision, "deny",
+    "the name tier.mjs generates, denied through stdin exactly as the harness delivers it");
   assert.equal(hook({}).stdout, "", "no agent_id, no opinion");
   assert.equal(hook({ ...FINDER, tool_input: { command: "git checkout -- x" } }, { TREE_GUARD: "off" }).stdout, "",
     "the kill switch every hook in this plugin has");

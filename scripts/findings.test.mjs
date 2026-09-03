@@ -332,7 +332,7 @@ test("CLI: record reads stdin, prior writes a file brief.mjs can consume", () =>
   const brief = spawnSync(process.execPath, [BRIEF, "--tier", "S", "--intent", path.join(work, "intent.md"),
     "--scope", scope, "--prior", out, "--out", path.join(work, "briefs")], { encoding: "utf8", cwd: repo });
   assert.equal(brief.status, 0, brief.stderr);
-  const briefText = readFileSync(path.join(work, "briefs", "r1-compact.md"), "utf8");
+  const briefText = readFileSync(path.join(work, "briefs", "self-review-finder-r1-compact.md"), "utf8");
   assert.match(briefText, /PRIOR FINDINGS IN THIS REPO/);
   assert.match(briefText, /double charge on retry/);
 });
