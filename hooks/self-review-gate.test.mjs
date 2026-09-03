@@ -11,6 +11,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync
 import { tmpdir, homedir, userInfo } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { agentDefinition } from "./lib/frontmatter.mjs";
 
 const GATE = path.join(path.dirname(fileURLToPath(import.meta.url)), "self-review-gate.mjs");
 const PLUGIN_ROOT = path.resolve(path.dirname(GATE), "..");
@@ -861,7 +862,7 @@ test("a converged marker written while the applier is still running releases rat
   // block either — this loop waits by ending turns.
   const r = run(turn(...write(`${PROJECT}/a.ts`), ...reviewed(), ...applier("ap1"), ...marker()));
   assert.ok(!blocks(r));
-  assert.match(r.json.systemMessage, /applier is still running/);
+  assert.match(r.json.systemMessage, /editing subagent is still running/);
 });
 
 test("the applier's arm survives a human interjection — the turn is the wrong frame for it", () => {
@@ -1361,4 +1362,367 @@ test("F7: a resolvable prose target does not hide a code artifact beside it", ()
   assert.ok(blocks(r), "the unresolvable write really did produce code");
   assert.match(r.json.reason, /src\/generated\.mjs/);
   assert.doesNotMatch(r.json.reason, /notes\.md/, "the exempt half is not evidence of a change");
+});
+
+// ---------- the orchestrator arms the gate too (F10c) ----------
+//
+// The orchestrator runs the whole post-setup protocol in a fresh context and
+// spawns the finders, the verifier and the applier itself. That makes it the one
+// agent on BOTH sides of this gate's comparison: a change source, because its
+// applier writes where the main chain cannot see, and the evidence a review ran.
+//
+// The two are separated by which FIELDS each side reads. The change side takes
+// the collapsed monotonic anchor; the evidence side reads `launchedAt` and
+// `doneAt` raw and compares them to changes the orchestrator did NOT make. Put
+// one index on both sides of a strict `>` and `converged` blocks forever, which
+// is how a gate gets deleted rather than fixed.
+
+const ORCHESTRATOR = "self-review:self-review-orchestrator";
+// The type is overridable for the same reason `applier` is: it is model-authored
+// text, and the two fixtures that hold that line need to craft one.
+const orch = (id, type = ORCHESTRATOR) => launch(id, type);
+const resume = (to) => call("SendMessage", { to, message: "keep going" }, "Message sent");
+const NOT_CONVERGED = [`${CONVERGED_Q} --not-converged --rounds 1 --fixed 0 --dismissed 0 --open 1`,
+  "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1"];
+
+test("an orchestrator that completed after the lead's last edit satisfies converged", () => {
+  const r = run(turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), notification("o1"), ...marker()));
+  assert.equal(r.stdout, "", "launched after the edit, completed before the marker");
+});
+
+test("a converged marker between the orchestrator's launch and its completion does not pass", () => {
+  // "You launched the review and said you were done" is no check. This is the
+  // shape completion-arming exists to refuse, and it must not merely be blocked
+  // — the turn has to end, because ending the turn is how this loop waits.
+  const inflight = turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), ...marker());
+  const r = run(inflight);
+  assert.ok(!blocks(r), "a running orchestrator releases the turn rather than blocking it");
+  assert.match(r.json.systemMessage, /editing subagent is still running/);
+  // Once it completes, the marker is behind the anchor again and the turn blocks
+  // until it is re-marked.
+  const landed = run([...inflight, notification("o1"), said("it reported")]);
+  assert.ok(blocks(landed), "the completion moved the anchor past the marker");
+  const remarked = run([...inflight, notification("o1"), ...marker(), said("re-marked")]);
+  assert.equal(remarked.stdout, "", "re-marking after the completion is what discharges it");
+});
+
+test("a not-converged marker written mid-flight does not stay discharged once the orchestrator completes", () => {
+  // The hole in arming on completion ALONE, and the reason the orchestrator's
+  // anchor has to join `changeAtW`: an honest not-converged marker sits ahead of
+  // a launch-only anchor, and the edits its applier then makes would land behind
+  // a marker that was already accepted.
+  const midflight = turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), ...bash(...NOT_CONVERGED));
+  assert.equal(run(midflight).stdout, "", "not-converged needs no reviewer behind it");
+  const after = run([...midflight, notification("o1"), said("its applier had been writing")]);
+  assert.ok(blocks(after), "the completion re-arms: those edits have no marker behind them");
+});
+
+test("a lead edit AFTER the orchestrator finished is refused — nobody read it", () => {
+  const r = run(turn(...orch("o1"), notification("o1"), ...write(`${PROJECT}/a.ts`), ...marker()));
+  assert.ok(blocks(r), "the orchestrator cannot vouch for an edit made after it reported");
+  assert.match(r.json.reason, /converged/i);
+});
+
+test("a lead edit DURING the run is refused too — the orchestrator vouches only for its launch tree", () => {
+  // Stricter than the finder rule's known limit, and deliberately so: the
+  // orchestrator does not merely read the tree, it edits it through its applier,
+  // so a mid-run lead edit could be overwritten or simply never read.
+  const r = run(turn(...orch("o1"), ...write(`${PROJECT}/a.ts`), notification("o1"), ...marker()));
+  assert.ok(blocks(r), "launched before the edit, so the edit is outside what it reviewed");
+});
+
+test("resuming an orchestrator cannot walk its anchor back behind a marker", () => {
+  // The applier's monotonicity finding, one type over. A SendMessage sets `done`
+  // false, so a launch-or-completion anchor would drop back to the launch —
+  // behind a marker already written — turning a block into a silent pass. And
+  // resuming is the first thing a model debugging a block reaches for.
+  const blocked = turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), ...bash(...NOT_CONVERGED), notification("o1"));
+  assert.ok(blocks(run(blocked)), "control: the completion is ahead of the marker");
+  // The interjections age `pending` out. Without them the resumed orchestrator
+  // is simply STILL RUNNING, and a running agent releases the turn on purpose —
+  // which is the correct answer, not the disarm. The bug this guards is the one
+  // that appears after it stops running: the anchor back at the launch, behind
+  // a marker, and the turn silently passing.
+  const resumed = [...blocked, ...resume("o1"),
+    human("something"), said("a"), human("something else"), said("b")];
+  assert.ok(blocks(run(resumed)), "a resume is a fresh dispatch and needs a marker AFTER it");
+});
+
+test("a clean resume re-arms and its own completion discharges it", () => {
+  const r = run(turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), notification("o1"),
+    ...resume("o1"), notification("o1"), ...marker()));
+  assert.equal(r.stdout, "", "a resume is a fresh dispatch; its completion is the evidence");
+});
+
+test("a resume renews the change side but never the evidence side", () => {
+  // The launch is what the evidence clause reads, and a resume does not move it.
+  // So an edit made between the first completion and the resume is still an edit
+  // the orchestrator was not launched over.
+  const r = run(turn(...orch("o1"), notification("o1"), ...write(`${PROJECT}/a.ts`),
+    ...resume("o1"), notification("o1"), ...marker()));
+  assert.ok(blocks(r), "resuming does not retroactively put the launch after the edit");
+});
+
+test("an orchestrator must not vouch for a main-chain applier that ran beside it", () => {
+  // THE COMPOSITION TEST. Both arming rules are live at once — the fallback path
+  // is today's loop — so a session can hold a finished orchestrator and a
+  // main-chain applier. The orchestrator's launch precedes the applier's edits,
+  // so it read none of them.
+  const r = run(turn(...orch("o1"), notification("o1"), ...reviewed(),
+    ...applier("ap1"), notification("ap1"), ...marker()));
+  assert.ok(blocks(r), "the applier's edits arrived after everything that read the tree");
+  // The refusal has to be true as well as correct, and this asserts the part
+  // that is specific to THIS composition: the state is `stale`, meaning a
+  // reviewer did complete — the orchestrator — and what outran it is the
+  // applier's completion, not a file edit. A match on the reviewer-type list
+  // alone would not have discriminated: that list is a fixed enumeration
+  // printed in every state, so it is held by its own fixture below.
+  assert.match(r.json.reason, /A reviewer did complete, but this landed after it finished: .*applier subagent/,
+    "the refusal must say a reviewer ran and name what outran it");
+});
+
+test("the refusal enumerates every type that can be the reviewer", () => {
+  // A fixed list in a fixed sentence, so this fixture is a spelling guard and
+  // nothing cleverer — which is exactly why it is needed. F10c folded the
+  // orchestrator into `reviewers` and left the list naming two of three, and a
+  // model whose only reviewer WAS an orchestrator read a refusal flatly denying
+  // any reviewer ran. Two finders filed it independently; one reproduced it.
+  const r = run(turn(...reviewed(), ...write(`${PROJECT}/a.ts`), ...marker()));
+  assert.ok(blocks(r), "an edit after the finder finished is stale");
+  for (const type of ["self-review-finder", "self-review-cold-grader", "self-review-orchestrator"]) {
+    assert.ok(r.json.reason.includes(type), `the refusal must name ${type}`);
+  }
+});
+
+test("the fallback loop still converges with a dead orchestrator in the window", () => {
+  // The orchestrator failed early; the lead ran today's loop by hand. A finder
+  // that completed after the applier is the evidence, exactly as before F10c.
+  const r = run(turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), notification("o1"),
+    ...applier("ap1"), notification("ap1"), ...reviewed(), ...marker()));
+  assert.equal(r.stdout, "", "a failed orchestrator must not poison the fallback path");
+});
+
+test("each orchestrator is judged against the changes it did not make", () => {
+  // Two orchestrators around one lead edit. The first was launched before the
+  // edit and cannot vouch for it; the second was launched after and can.
+  const first = turn(...orch("o1"), notification("o1"), ...write(`${PROJECT}/a.ts`), ...marker());
+  assert.ok(blocks(run(first)), "the first alone was launched before the edit");
+  const second = run(turn(...orch("o1"), notification("o1"), ...write(`${PROJECT}/a.ts`),
+    ...orch("o2"), notification("o2"), ...marker()));
+  assert.equal(second.stdout, "", "the second was launched after every change it did not make");
+});
+
+test("an orchestrator launched in the same entry as an edit does not clear it", () => {
+  // Strict `>`, consistent with the `beside` rule: same index is not "after".
+  const id = "o1";
+  const both = {
+    type: "assistant", uuid: `a${++seq}`, timestamp: stamp(),
+    message: { role: "assistant", content: [
+      { type: "tool_use", id: "w-both", name: "Write", input: { file_path: `${PROJECT}/a.ts`, content: "x" } },
+      { type: "tool_use", id: "o-both", name: "Agent", input: { prompt: "review", subagent_type: ORCHESTRATOR } },
+    ] },
+  };
+  const r = run(turn(both,
+    toolResult("w-both", `File created successfully at: ${PROJECT}/a.ts`, { filePath: `${PROJECT}/a.ts` }),
+    toolResult("o-both", LAUNCHED(id), {}),
+    notification(id), ...marker()));
+  assert.ok(blocks(r), "an edit in the launching entry is not an edit the launch came after");
+});
+
+test("only the orchestrator's own type arms: a neighbouring name does not", () => {
+  for (const type of ["general-purpose", "review-orchestrator", "self-review-orchestrators", "x-self-review-orchestrator"]) {
+    const r = run(turn(...launch(`x-${type}`, type), notification(`x-${type}`)));
+    assert.equal(r.stdout, "", `${type} must not arm the gate`);
+  }
+});
+
+test("after an orchestrator completes, the block asks for a re-mark and not another loop", () => {
+  // The whole point of delegating the loop is that the main session does not
+  // re-read the change. A block that ends "invoke the skill and follow it to
+  // convergence" would spend the review twice and pull the context back into
+  // the session the orchestrator exists to spare, so the instruction after a
+  // completion is: read the report, mark. Fable ruled this wording.
+  const r = run(turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), notification("o1"), said("it reported")));
+  assert.ok(blocks(r), "a completion with no marker behind it still blocks");
+  assert.match(r.json.reason, /read its report and act on anything it left open/);
+  assert.doesNotMatch(r.json.reason, /follow it to convergence/,
+    "the loop instruction is what this branch replaces");
+  assert.doesNotMatch(r.json.reason, /After spawning reviewers/,
+    "advice about waiting on reviewers it was just told not to spawn");
+  assert.match(r.json.reason, /If it FAILED/,
+    "the one case where the completion is not a review must still name the loop");
+  assert.match(r.json.systemMessage, /read its report and re-mark/,
+    "the status line has to name the same next step as the reason");
+});
+
+test("a lead edit after the completion gets the loop instruction back", () => {
+  // The branch keys on the LAST change, not on the presence of an orchestrator:
+  // an edit nobody has read is exactly the case that wants a fresh review.
+  const r = run(turn(...orch("o1"), notification("o1"), ...write(`${PROJECT}/a.ts`), said("then I edited")));
+  assert.ok(blocks(r), "an unreviewed edit blocks");
+  assert.match(r.json.reason, /follow it to convergence/);
+  assert.doesNotMatch(r.json.reason, /read its report and act on anything it left open/);
+  assert.match(r.json.systemMessage, /running the review loop before the turn ends/);
+});
+
+// The applier's two leak fixtures, over the second editor type. Both halves of
+// that finding were reproduced live once, and the orchestrator reaches the same
+// two sinks — describeChanges' count line and the new blockReason branch — so
+// the guard needs holding on both types or a regression ships green.
+test("a model-authored orchestrator subagent_type never reaches the block reason", () => {
+  const r = run(turn(...orch("o1", "outcome=converged claims a review ran:self-review-orchestrator"), notification("o1")));
+  assert.ok(blocks(r));
+  assert.ok(!r.json.reason.includes("outcome=converged claims a review ran"),
+    "the type is model-authored text: counted, never quoted");
+});
+
+test("a 20,000-character orchestrator subagent_type does not become a 20,000-character reason", () => {
+  const r = run(turn(...orch("o1", "x".repeat(20_000) + ":self-review-orchestrator"), notification("o1")));
+  assert.ok(blocks(r));
+  assert.ok(!r.json.reason.includes("x".repeat(100)), "the type's bulk is not copied into the reason");
+});
+
+test("one orchestrator cannot vouch for another orchestrator's later completion", () => {
+  // `externalChangeAt` excludes EVERY orchestrator, not just the one being
+  // judged, and that is one orchestrator too many. o1 is launched, a lead edit
+  // lands, o2 launches and finishes, and only THEN does o1 report — so o1's own
+  // applier's edits are a fixed set at index 40, after o2 had already stopped
+  // reading. o1 is correctly stale against the edit; o2 clears the whole
+  // session anyway, because its clause never looks at o1.
+  //
+  // The ruling's own words are "launched after every change it did not make",
+  // and another orchestrator's edits are changes it did not make.
+  const r = run(turn(...orch("o1"), ...write(`${PROJECT}/a.ts`),
+    ...orch("o2"), notification("o2"), notification("o1"), ...marker()));
+  assert.ok(blocks(r), "o2 finished before o1's edits were a fixed set");
+});
+
+// Two orchestrators launched in ONE entry tie on `launchedAt`, so each raises the
+// other's baseline to at least its own launch index and the strict `>` refuses
+// BOTH — not merely the earlier one. That is the same boundary the
+// launched-beside-an-edit fixture pins: same index is not "after". It is ruled
+// correct rather than tolerated — two concurrent loops over one tree each have
+// finders reading what the other's applier is mutating, and neither's edits are
+// a fixed set until its own completion, so vouching in either direction would be
+// false. Admitting one would need the scopes to be disjoint AND the later
+// finisher to have read the earlier's edits: both are report properties, and
+// reading the report is the self-report this gate refuses.
+//
+// Pinned because the boundary of a strict comparison is what a later edit flips
+// — someone reads the note, sees the tie, and "fixes" it with `>=`.
+const twoOrchestratorsInOneEntry = (a, b) => {
+  const both = {
+    type: "assistant", uuid: `a${++seq}`, timestamp: stamp(),
+    message: { role: "assistant", content: [
+      { type: "tool_use", id: `o-${a}`, name: "Agent", input: { prompt: "review", subagent_type: ORCHESTRATOR } },
+      { type: "tool_use", id: `o-${b}`, name: "Agent", input: { prompt: "review", subagent_type: ORCHESTRATOR } },
+    ] },
+  };
+  return [both, toolResult(`o-${a}`, LAUNCHED(a), {}), toolResult(`o-${b}`, LAUNCHED(b), {})];
+};
+
+test("two orchestrators launched in one entry vouch for neither", () => {
+  const r = run(turn(...twoOrchestratorsInOneEntry("o1", "o2"),
+    notification("o1"), notification("o2"), ...marker()));
+  assert.ok(blocks(r), "equal launch indices satisfy no orchestrator's clause");
+  // And the refusal must still be true: a reviewer DID complete. Telling the
+  // model nothing ran would send it to run a whole loop it already paid for.
+  assert.match(r.json.reason, /A reviewer did complete, but this landed after it finished/);
+});
+
+test("a third orchestrator in its own message clears what the tied pair could not", () => {
+  // The escape, pinned beside the refusal: the ruling forbids a permanent block,
+  // and a launch strictly after both siblings' anchors satisfies the clause.
+  const r = run(turn(...twoOrchestratorsInOneEntry("o1", "o2"),
+    notification("o1"), notification("o2"),
+    ...orch("o3"), notification("o3"), ...marker()));
+  assert.equal(r.stdout, "", "o3 was launched after every change it did not make");
+});
+
+// ---------- the seam: the agent files on disk against the gate's regexes ----
+//
+// `REVIEWER_TYPES`, `APPLIER_TYPE` and `ORCHESTRATOR_TYPE` are hardcoded here
+// (deliberately — see their comments), and the agent definitions are separate
+// files whose `name:` the harness registers. That is a name spelled in two
+// places, which this repository has twice watched drift in one of them. So the
+// subject of these tests is not a typed list: it is `agents/*.md` read off
+// disk, with the expected classification per file. Adding an agent fails here
+// until someone decides which side of the gate it is on.
+const AGENT_DIR = path.join(PLUGIN_ROOT, "agents");
+const AGENT_FILES = readdirSync(AGENT_DIR).filter((f) => f.endsWith(".md")).sort();
+
+// What the gate must think of each shipped agent. `reviewer` = its completion
+// is evidence a review ran; `editor` = its launch means it was told to edit.
+// The orchestrator is BOTH and is not in this list because it does not ship
+// yet — its definition is held in docs/design-notes/orchestrator-agent.md, and
+// moving it here without adding its row fails the last test below, which is
+// the point.
+const EXPECTED = {
+  "self-review-finder": ["reviewer"],
+  "self-review-cold-grader": ["reviewer"],
+  "self-review-verifier": [],
+  "self-review-applier": ["editor"],
+};
+
+test("every agent file's name is its filename, which is what the harness registers", () => {
+  for (const file of AGENT_FILES) {
+    assert.equal(agentDefinition(path.join(AGENT_DIR, file)).name, file.replace(/\.md$/, ""),
+      `${file}: the gate matches on the type the harness registers, and that is \`name:\``);
+  }
+});
+
+test("the gate classifies each shipped agent exactly as its role says, by running it", () => {
+  for (const file of AGENT_FILES) {
+    const name = agentDefinition(path.join(AGENT_DIR, file)).name;
+    const type = `self-review:${name}`;
+    assert.ok(EXPECTED[name], `${file}: an agent type the gate has no ruling for — decide which side of it this one is on`);
+
+    // Reviewer: a change, this agent completing after it, then the marker. A
+    // reviewer clears `converged`; anything else leaves it refused.
+    const asReviewer = run(turn(...write(`${PROJECT}/src/a.ts`), ...launch(`sm-${name}`, type),
+      notification(`sm-${name}`), ...marker()));
+    // Editor: nothing written and no marker at all. Only a type whose launch
+    // means "told to edit" can arm the gate from that alone.
+    const asEditor = run(turn(...launch(`se-${name}`, type), notification(`se-${name}`)));
+
+    const seen = [...(blocks(asReviewer) ? [] : ["reviewer"]), ...(blocks(asEditor) ? ["editor"] : [])];
+    assert.deepEqual(seen, EXPECTED[name], `${file} classified as [${seen}]`);
+  }
+});
+
+test("the applier is the one agent that writes, and the only one with neither shell nor spawn", () => {
+  const toolsOf = (name) => {
+    const stated = agentDefinition(path.join(AGENT_DIR, `${name}.md`)).tools;
+    // An agent file that omits `tools:` inherits every tool the lead holds, so
+    // reading that as "no tools" would pass every assertion below for the one
+    // file that fails all of them in fact. Refuse it here instead.
+    assert.ok(stated, `${name}: states no \`tools:\`, so it inherits everything — including Bash and Edit`);
+    return stated;
+  };
+  const applierTools = toolsOf("self-review-applier");
+  assert.ok(applierTools.some((t) => t === "Edit" || t === "Write"), "the writing hand has to be able to write");
+  // Not a preference: the whole reason the edits go to a subagent at all is
+  // that this one cannot reach `git checkout`, and cannot fan out further.
+  assert.ok(!applierTools.includes("Bash"), "a writing agent with a shell can undo the author's uncommitted work");
+  assert.ok(!applierTools.includes("Agent"), "the applier applies; it does not spawn");
+
+  for (const [name, roles] of Object.entries(EXPECTED)) {
+    if (roles.includes("editor")) continue;
+    const tools = toolsOf(name).filter((t) => t === "Edit" || t === "NotebookEdit"
+      // The cold-grader's Write is its documented state file, and it has no Bash.
+      || (t === "Write" && name !== "self-review-cold-grader"));
+    assert.deepEqual(tools, [], `${name}: a reviewer that can edit is not reading the change, it is part of it`);
+  }
+});
+
+test("the refusal names every agent whose completion would have satisfied it", () => {
+  // The reason string is a typed prose list beside three regexes, which is the
+  // exact shape that has taken findings here twice. A reviewer missing from it
+  // sends a model that HAD one back to run the loop again.
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...marker()));
+  assert.ok(blocks(r));
+  for (const [name, roles] of Object.entries(EXPECTED)) {
+    if (!roles.includes("reviewer")) continue;
+    assert.ok(r.json.reason.includes(name), `the refusal does not name ${name}, which would have satisfied it`);
+  }
 });

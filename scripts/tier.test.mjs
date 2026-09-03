@@ -3,7 +3,7 @@
 // numbers and keyword lists config/defaults.json actually ships.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -45,23 +45,47 @@ const IMPACT = (over = {}) => ({
   adapter: "grep", counts: { caller_files: 0, broken: 0 }, untested: [], project_has_tests: true, symbols: [], graph: null, ...over,
 });
 
+// A checkout built here, not the one this file happens to sit in. These rules
+// are about what a file SAYS it is — a shebang, an execute bit, a path under a
+// fixture corpus — so the tree that answers them has to be one the test wrote.
+// Reading the real repository instead made three of the tests below assert two
+// things at once: the rule, and that `plugin/scripts/impact.mjs` still exists
+// under that name. It also made them fail from an install, where the paths they
+// name are not there and `process.cwd()` is wherever node was started.
+const REPO = mkdtempSync(path.join(tmpdir(), "sr-tier-repo-"));
+const put = (rel, body, mode) => {
+  const at = path.join(REPO, rel);
+  mkdirSync(path.dirname(at), { recursive: true });
+  writeFileSync(at, body, mode === undefined ? undefined : { mode });
+};
+put("plugin/scripts/impact.mjs", "#!/usr/bin/env node\n", 0o755);
+put("plugin/scripts/lib/wire.mjs", "export const wire = 1;\n");
+put("plugin/scripts/coldrun.sh", "#!/usr/bin/env bash\n", 0o755);
+// Mode 644 and no shebang: the file says it is sourced, and `*.sh` used to
+// override it.
+put("plugin/scripts/lib/path.sh", "# Sourced, never executed\n", 0o644);
+put("README.md", "# readme\n");
+put("evals/corpora/bash-docs/base/bin/publish.sh", "#!/usr/bin/env bash\n", 0o755);
+put("evals/corpora/config/base/Dockerfile", "FROM scratch\n");
+put("evals/corpora/js-cli/base/package.json", "{}\n");
+
 // --- step 1 ----------------------------------------------------------------
 test("executable surface: a file that declares itself runnable, not a directory that looks like it", () => {
-  // The two live one directory apart in this very repo and only one of them is
-  // a thing anyone invokes, which is why the question is asked of the file.
-  // Paths are repo-root relative, and the plugin is a subdirectory of the repo.
+  // The two live one directory apart and only one of them is a thing anyone
+  // invokes, which is why the question is asked of the file rather than of the
+  // directory. Paths are repo-root relative, and the plugin is a subdirectory.
   const files = [
     { path: "plugin/scripts/impact.mjs", status: "M" },   // shebang + execute bit
     { path: "plugin/scripts/lib/wire.mjs", status: "M" }, // a library beside it
     { path: "README.md", status: "M" },
   ];
-  const withRoot = classifyChanged(files, TIER, EXEMPT, process.cwd());
+  const withRoot = classifyChanged(files, TIER, EXEMPT, REPO);
   assert.deepEqual(withRoot.executable, ["plugin/scripts/impact.mjs"], "a shebang is the file saying it is an entry point");
 
   // No root to ask, or a file that is gone: fails closed to "not runnable" —
   // one missed finder, never a crashed plan.
   assert.deepEqual(classifyChanged(files, TIER, EXEMPT).executable, []);
-  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/deleted-yesterday.mjs", status: "D" }], TIER, EXEMPT, process.cwd()).executable, []);
+  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/deleted-yesterday.mjs", status: "D" }], TIER, EXEMPT, REPO).executable, []);
 
   // What carries no shebang of its own is what the glob list is for.
   const globbed = classifyChanged([{ path: "package.json", status: "M" }, { path: "Makefile", status: "M" }], TIER, EXEMPT, "/nonexistent");
@@ -74,10 +98,10 @@ test("an extension never makes a file an entry point", () => {
   // itself. `scripts/lib/path.sh` says in its own second line "Sourced, never
   // executed", carries mode 644 and no shebang — and the glob claimed it
   // anyway, planning angle X for a change that touches nothing a user runs.
-  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/lib/path.sh", status: "M" }], TIER, EXEMPT, process.cwd()).executable, [],
+  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/lib/path.sh", status: "M" }], TIER, EXEMPT, REPO).executable, [],
     "a sourced-only library is not an entry point because of how it is spelled");
   // The runnable shell script beside it still is — by its own shebang.
-  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/coldrun.sh", status: "M" }], TIER, EXEMPT, process.cwd()).executable,
+  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/coldrun.sh", status: "M" }], TIER, EXEMPT, REPO).executable,
     ["plugin/scripts/coldrun.sh"]);
 });
 
@@ -110,15 +134,16 @@ test("a test fixture is not the product, however runnable it looks", () => {
   // This repository's own corpora hold a shebang'd, executable bin/publish.sh,
   // a Dockerfile and a package.json — and a bare glob matches by basename at
   // ANY depth, so editing one planned a Cold-run finder to go install and run
-  // a wire-break fixture as if it were the plugin.
+  // a wire-break fixture as if it were the plugin. The fixture root above
+  // reproduces that layout; the rule is what is under test, not the corpora.
   const fixtures = [
     { path: "evals/corpora/bash-docs/base/bin/publish.sh", status: "M" },
     { path: "evals/corpora/config/base/Dockerfile", status: "M" },
     { path: "evals/corpora/js-cli/base/package.json", status: "M" },
   ];
-  assert.deepEqual(classifyChanged(fixtures, TIER, EXEMPT, process.cwd()).executable, []);
+  assert.deepEqual(classifyChanged(fixtures, TIER, EXEMPT, REPO).executable, []);
   // The shipped entry point beside them still counts.
-  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/impact.mjs", status: "M" }], TIER, EXEMPT, process.cwd()).executable,
+  assert.deepEqual(classifyChanged([{ path: "plugin/scripts/impact.mjs", status: "M" }], TIER, EXEMPT, REPO).executable,
     ["plugin/scripts/impact.mjs"]);
 });
 

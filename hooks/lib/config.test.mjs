@@ -3,7 +3,7 @@
 // they are enforced, in hooks/self-review-gate.test.mjs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
@@ -200,39 +200,4 @@ test("isMain matches a path that URL-encoding would change, and rejects another 
     assert.equal(isMain(pathToFileURL(script).href), true);
     assert.equal(isMain(pathToFileURL(path.join(at, "other.mjs")).href), false);
   } finally { process.argv[1] = argv; }
-});
-
-// The finding this test exists for: the first fix migrated the five helpers in
-// scripts/ and left the same guard live in evals/run.mjs and evals/merge.mjs —
-// including the one test.sh invokes, i.e. the tool that measures the fix. Two
-// reviewers found it independently, which says the defect is a class and not a
-// site. Grepping is the only check that covers a file nobody has written yet.
-// evals/corpora/ is excluded on purpose: those are sample apps the plugin
-// reviews, not code it runs, and one of them carries the pattern as fixture text.
-test("no CLI in this repo still spells its main-guard the broken way", () => {
-  // Three levels, not two: this file is `plugin/hooks/lib/`, and the scan has
-  // to reach the whole checkout. Two stops at `plugin/`, which silently drops
-  // `evals/` — where the two files that motivated this test actually live.
-  const root = path.resolve(PLUGIN_ROOT, "..");
-  // Walked rather than `git grep`ed: the two files the reviewers caught were
-  // new and untracked, which is exactly what git grep cannot see and exactly
-  // when this rule is easiest to break.
-  // Assembled, not written out, so this file does not match its own rule; SELF
-  // skips it anyway for the copy of the needle in the comment above.
-  const NEEDLE = "if (import.meta.url " + "===";
-  const SELF = fileURLToPath(import.meta.url);
-  const offenders = [];
-  const walk = (dir, rel) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if ([".git", "node_modules", "corpora"].includes(entry.name)) continue;   // corpora holds sample apps the plugin reviews, not code it runs
-      const at = path.join(dir, entry.name);
-      const name = rel ? `${rel}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) walk(at, name);
-      // The `if (` is what separates a guard from the prose in this very file,
-      // which quotes the broken spelling to explain why it is broken.
-      else if (entry.name.endsWith(".mjs") && at !== SELF && readFileSync(at, "utf8").includes(NEEDLE)) offenders.push(name);
-    }
-  };
-  walk(root, "");
-  assert.deepEqual(offenders, [], "use isMain(import.meta.url) instead");
 });

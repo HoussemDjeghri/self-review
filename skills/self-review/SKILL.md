@@ -41,9 +41,10 @@ call budget.
 2. **Act once per round, in one go.** When a notification wakes you and other
    reviewers are still out, reply with one line and end the turn again — do
    not start fixing from partial results (fixes move the tree under the
-   reviewers still reading it). When the last one lands: verify, fix, ledger,
-   next round or marker, in a single stretch with as few tool calls as it
-   takes — except the marker, which gets a message of its own (§4). Read cited line ranges (`sed -n 'a,bp'`), not whole files.
+   reviewers still reading it). When the last one lands: verify, write the
+   directives, dispatch the applier, end the turn. When it reports: pre-flight,
+   ledger, record, next round or marker — each stretch in as few tool calls as
+   it takes, except the marker, which gets a message of its own (§4). Read cited line ranges (`sed -n 'a,bp'`), not whole files.
 
 Rough cost, in fresh-context agents: tier S ≈ 1, M ≈ 3–4 (a mixed change up
 to 6), L ≈ 6 — **6 finders per round is the hard cap at every tier**. Extra
@@ -286,13 +287,14 @@ evidence standard, the output format, and the sonnet · high default), and
 `self-review-cold-grader` for the angle-`X` row, which is the same reviewer with
 **no Bash at all**. Spawn what the row says: substituting the finder there hands
 a shell to the one angle whose whole design is that it does not have one. If a
-type is missing, use `general-purpose` and paste the contents of that agent file
-(`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief. **Never do
-that for `self-review-applier`**: the Stop gate arms on that exact agent type, so
-a substitute is invisible to it *and* carries `Bash` — the gate stops seeing the
-edits and the one writing agent stops being the one that cannot reach a shell,
-which is both halves of that design gone in a single substitution. If the applier
-type is missing, stop and say so. Write the briefs with one call rather than by hand — assembling them costs 4–6
+*reviewer* type is missing, use `general-purpose` and paste the contents of that
+agent file (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) at the top of the brief.
+**Never do that for `self-review-applier`**: the Stop gate arms on that exact
+agent type, so a substitute is invisible to it *and* carries `Bash` — the gate
+stops seeing the edits and the one writing agent stops being the one that cannot
+reach a shell, which is both halves of that design gone in a single
+substitution. If the applier type is missing, apply the fixes yourself as §2e's
+fallback says, and say so in the report. Write the briefs with one call rather than by hand — assembling them costs 4–6
 calls per round and gets a section wrong sooner or later:
 
 `round.sh` wrote them; the Agent-call table it printed is the round's plan.
@@ -411,16 +413,41 @@ has not found the root cause: escalate it to angle S rather than committing it.
 Two rounds of findings in the same unit ends the choice — the next round runs
 angle S, and that unit gets no further patch until its invariant is written.
 
-Then apply the fixes yourself — you hold the task context that makes a fix
-correct rather than merely local. Smallest change that resolves the finding; no
-opportunistic refactors, which would widen the next round's scope for no
-reason. Batch the edits; load `clean-code` (and `react-patterns` /
-`frontend-craft` when the rules call for them) as for any edit. Bug fixes get
-the failing test first when the project has tests. Re-run the pre-flight
-checks that the fixes could have broken.
+Then dispatch the fixes — do not apply them yourself. You hold the task context
+that makes a fix correct rather than merely local, so that context goes into a
+**directive** per finding (`references/briefs.md` → Applier directives), written
+to `<work>/round-<r>/directives.md`: the invariant the fix restores, the concrete
+change, the failing test to add first when the project has tests, and what nearby
+not to touch. A directive missing the invariant or the concrete change is not
+dispatchable. Launch **one** `self-review-applier` for the round — prompt
+`Read <path> and follow it.` — and end the turn; it applies the directives in
+order and reports `applied` / `deviated` / `blocked` per directive. One per
+round, never one per finding: concurrent edits in one tree collide. **Do not edit
+while it runs**, and never launch it beside a finder.
 
-Update the ledger (`references/briefs.md` → ledger format): fixed, dismissed,
-open. Then record the round's verdicts — one call, batched with the fixes:
+If it never reports at all — killed, or a usage-limit reset — do not re-dispatch
+the same file: §2f says what to read first, because its edits are already in
+the tree. When it reports: re-run the pre-flight checks the fixes could have
+broken (§1's command), read its JSON, rule on each `deviated` (accept it, or add a directive
+for the next round) and each `blocked` (rewrite the directive for a fresh
+applier, or make that one edit yourself — your own hands are the fallback, after
+it has reported, never during). The gate arms on the applier's launch and treats
+its completion as your last change, so the next round's finders must complete
+after it — which this order already guarantees.
+
+If the applier type is not available, apply the fixes yourself: smallest change
+that resolves the finding, no opportunistic refactors, which would widen the next
+round's scope for no reason; load `clean-code` (and `react-patterns` /
+`frontend-craft` when the rules call for them) as for any edit; the failing test
+first when the project has tests; then re-run the pre-flight checks the fixes
+could have broken.
+
+Once it has reported and you have ruled on each `deviated` and `blocked` — or,
+on the fallback branch, once your own fixes are in — update the ledger
+(`references/briefs.md` → ledger format): fixed, dismissed, open. Then record
+the round's verdicts, in one call. Never before the applier reports: a `fixed`
+verdict written at dispatch goes into the cross-session memory as a fact about
+an edit that may have come back `blocked`.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/findings.mjs" record --work <work> --round 1 <<'JSON'
@@ -445,7 +472,7 @@ tree would be a changed file the next review has to review. It validates every
 record before it writes any, so a rejected call costs a retry, not half a
 round.
 
-### 2f · If a reviewer dies, salvage before you re-spawn
+### 2f · If an agent dies, salvage before you re-spawn
 
 Sessions get killed mid-round — the usage-limit reset is the common case — and
 the reflex of re-spawning every silent reviewer re-pays 90–150k of context per
@@ -470,6 +497,18 @@ The session id is the UUID in your scratchpad path; the briefs in
   informal notes count as salvage too — and paste whatever survived into the
   new brief marked "already found — verify, do not re-derive, continue from
   here", so the dead agent's tokens still bought something.
+
+**An applier that dies is the other case, and the reflex above is wrong for
+it.** A dead reviewer costs re-paid context; a dead applier leaves the working
+tree in a state nobody has read, because its edits are already on disk and what
+died was the report saying which directive reached which file. So look at the
+tree first — `git diff`, and `git status` for files a directive told it to
+create — and read that against the directives you dispatched. Then dispatch a
+**rewritten** directives file covering only what is still undone. Never re-send
+the original: an applier told again to make an edit that is already there comes
+back `blocked` on a file that is in fact correct, and the round spends itself
+arguing with its own fixes. Its state file and salvaged transcript say what it
+believed it applied; the tree says what it did, and the tree wins.
 
 ## 3 · Converge or go again
 
@@ -616,6 +655,8 @@ could not measure itself.
 is refused unless a `self-review-finder` or `self-review-cold-grader` finished
 **after your last change and before the marker** — so the order is: last fix,
 then a finder that completes, then the marker, with nothing edited in between.
+An applier's completion counts as your change: the gate anchors on it, so the
+round after an applier needs a finder that completed after the applier finished.
 That is §3's "you never declare done right after fixing" made mechanical, and
 it is the same order the loop already runs in; you only trip it by editing
 after the final round or by marking a review you did not spawn. A verifier does
@@ -711,6 +752,12 @@ with recommendations, and the checks you ran with their real results.
 - **Spawning a panel.** Fourteen finders on one change is not thoroughness,
   it is the budget. The tier table is the ceiling.
 - **Editing while a round is in flight.** Wait for the last finder; then act.
+- **Fixing by hand what you dispatched an applier for.** Two writers in one
+  tree in one round. Rule on `blocked` after it reports; never edit while it
+  runs.
+- **Two appliers in one round, or one per finding.** Sequential over the
+  round's directives is the design; parallel appliers collide in the tree and
+  each re-pays the context.
 - **Finders that self-censor.** The brief and the agent prompt both say pass
   half-believed candidates through. If a finder returns `[]` on a large,
   logic-heavy change, check its transcript before trusting it.
@@ -763,6 +810,7 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `skills/self-review/references/angles.md` — the angle catalogue, per artifact kind
 - `skills/self-review/references/briefs.md` — intent block, finder/verifier briefs, ledger, report
 - `agents/self-review-finder.md`, `agents/self-review-cold-grader.md`, `agents/self-review-verifier.md` — the reviewer agents
+- `agents/self-review-applier.md` — the writing hand (§2e): one per round, no shell
 - `scripts/coldrun.sh` — the contained cold run behind angle `X`; run by `round.sh`, never by a reviewer
 - `hooks/self-review-gate.mjs` — the Stop gate that enforces all of this
 - `hooks/poll-guard.mjs` — the PreToolUse hook that denies repeated status checks

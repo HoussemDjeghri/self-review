@@ -112,6 +112,26 @@ The JSON array described in your instructions — one verdict per candidate id,
 with quoted proof and fix_risk. Nothing after the JSON.
 ```
 
+## Applier directives (`<work>/round-<r>/directives.md`; the Agent prompt is `Read <path> and follow it.`)
+
+One `self-review-applier` per round, never one per finding — concurrent edits in
+one tree collide. A directive missing its invariant or its concrete change is
+not dispatchable; the applier returns it `blocked` unopened.
+
+```
+DIRECTIVES — round <r>
+Repository root: <abs path>
+Project has tests: yes (<runner>) | no
+
+D1 · <file>:<line> · <finding id> · <severity>
+Invariant: <the property the fix restores, stated so it can be falsified>
+Change: <the concrete edit — old text → new text, or the unit to add — exact enough to apply without deciding anything>
+Test first: <file and assertion of the failing test to add> | none
+Do not touch: <the neighbouring thing that looks wrong and is out of scope>
+
+D2 · …
+```
+
 ## The ledger (keep it in `<scratch>/self-review/ledger.md`, update every round)
 
 ```

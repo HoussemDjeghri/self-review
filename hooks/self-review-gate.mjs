@@ -23,10 +23,12 @@
  *     agents are read-only by instruction (their prompt forbids writes; they keep
  *     Bash to run tests), so the gap would matter for any background agent
  *     told to edit.
- *   - The LAUNCH of a self-review-applier — the one agent type whose dispatch
- *     implies it was told to edit. The launch stands in for the edit evidence
- *     an async result does not carry; the applier section further down says why
- *     arming on the launch alone is the point rather than a compromise.
+ *   - The LAUNCH of a self-review-applier or a self-review-orchestrator — the
+ *     agent types whose dispatch implies they were told to edit. The launch
+ *     stands in for the edit evidence an async result does not carry; the
+ *     applier section further down says why arming on the launch alone is the
+ *     point rather than a compromise. The orchestrator is additionally review
+ *     evidence, under a clause of its own — see `reviewerState`.
  *   Paths under tmp, the session scratchpad, and Claude's own runtime state
  *   (~/.claude/projects, plans, todos, …) are ignored: scratch is not work.
  *   Prose, config and data files (.md, .json, .yaml, .txt, images, …) are
@@ -45,9 +47,11 @@
  *
  * AND `converged` MUST HAVE A READER BEHIND IT. A marker whose outcome is
  * `converged` claims an independent reader looked at the final state, so it is
- * refused unless a plugin reviewer — `self-review-finder` or
- * `self-review-cold-grader`, never a verifier, which presupposes findings the
- * author generated — COMPLETED after the last change and before the marker.
+ * refused unless a plugin reviewer — `self-review-finder`,
+ * `self-review-cold-grader` or `self-review-orchestrator`, never a verifier,
+ * which presupposes findings the author generated — COMPLETED after the last
+ * change and before the marker. An orchestrator satisfies this alone, under a
+ * clause of its own, because it ran the loop: see `reviewerState`.
  * 29 of the first 112 real markers claimed a converged review with no rounds
  * at all, and one review spawned zero finders while billing 24.3M tokens: the
  * main session read the whole scope and reviewed itself, which is the one
@@ -160,6 +164,25 @@ const REVIEWER_TYPES = /(?:^|:)self-review-(?:finder|cold-grader)$/;
 // (`*-applier`) would arm on another plugin's agent this one knows nothing
 // about, which is a block bought with a guess.
 const APPLIER_TYPE = /(?:^|:)self-review-applier$/;
+// The orchestrator runs the whole post-setup protocol in a fresh context and
+// spawns the finders, the verifier and the applier ITSELF, so the lead pays one
+// spawn and one wake instead of a dozen turns against a 200k context. That makes
+// it both sides of this gate's comparison at once: it causes writes, through an
+// applier the main chain cannot see, AND its completion is the evidence that a
+// review ran. The two are kept apart by which FIELDS each side reads — see
+// `reviewerState` and `externalChangeAt`. Hardcoded for the same reasons as the
+// applier above.
+const ORCHESTRATOR_TYPE = /(?:^|:)self-review-orchestrator$/;
+// "An agent told to edit is a change source, anchored at its last dispatch or
+// completion" is ONE rule over two types, not two rules. Keeping it one is what
+// makes the mixed session — a failed orchestrator and a main-chain applier in
+// the same window — compose instead of needing a third case.
+//
+// Composed from the two constants rather than a third regex re-spelling their
+// union: a name spelled in two places is a name that can drift in one of them,
+// and this file has already taken two rounds of findings for exactly that, on
+// its prose lists. `isEditor` is where a third editing type would be added.
+const isEditor = (type) => APPLIER_TYPE.test(type) || ORCHESTRATOR_TYPE.test(type);
 // The outcome token inside a script-form marker's output line. The record is
 // `outcome=… rounds=…`, so the first whitespace-delimited word after the `=` is
 // the whole value.
@@ -729,7 +752,7 @@ function scanAgents(entries, results) {
     const done = own.length > 0 && !last.resume;
     // A resume is a fresh dispatch of work, so the record has to move FORWARD
     // on one. Without this, `doneAt` reverting to -1 walks an applier's anchor
-    // backward, behind a marker already written — see applierAnchor.
+    // backward, behind a marker already written — see editorAnchor.
     const resumes = own.filter((e) => e.resume);
     const interjections = humanAt.filter((i) => i > at).length;
     agents.push({
@@ -771,15 +794,47 @@ function scanAgents(entries, results) {
 // four are separated because they take four different actions, and one message
 // telling a model to launch a finder when one is already running buys a
 // duplicate review of the same scope.
-function reviewerState(agents, changeAt, markerAt) {
-  const reviewers = agents.filter((a) => REVIEWER_TYPES.test(a.type));
+function reviewerState(agents, externalChangeAt, changeAt, markerAt) {
+  const orchestrators = orchestratorsIn(agents);
+  // Readers UNION orchestrators. A finished orchestrator has read everything it
+  // was launched over, so "late" and "stale" have to see it too — otherwise a
+  // session whose only reviewer was an orchestrator reads as "none" and the
+  // message tells the model to launch a finder it already delegated. Not
+  // "running": an orchestrator is an editor, so a pending one is intercepted by
+  // the "applying" branch below and never reaches that line.
+  const reviewers = [...agents.filter((a) => REVIEWER_TYPES.test(a.type)), ...orchestrators];
   // An applier still running cannot have been read by anyone, whatever the
   // finders did: its edits are not a fixed set yet, so no completion can be
   // "after the last change". Checked before "ok" because a finder that
   // completed after the last MAIN-CHAIN change would otherwise satisfy the
   // condition while the tree is still moving.
-  if (appliersIn(agents).some((a) => a.pending)) return "applying";
+  if (editorsIn(agents).some((a) => a.pending)) return "applying";
   if (reviewers.some((a) => a.doneAt > changeAt && a.doneAt < markerAt)) return "ok";
+  // The orchestrator's own clause, and the reason it is a SEPARATE line rather
+  // than a wider `reviewers` filter: its anchor is IN `changeAt`, because it is
+  // a change source, so the line above can never admit it. One index on both
+  // sides of a strict `>` is a permanent block — which is the failure mode that
+  // gets a gate deleted, not merely worked around.
+  //
+  // What makes it evidence instead is that it is compared to changes it did NOT
+  // make. `externalChangeAt` is the lead's own writes plus any MAIN-CHAIN
+  // applier; an orchestrator launched after all of those vouches for the tree it
+  // was given. An orchestrator launched BEFORE a main-chain applier does not,
+  // and this is what refuses it.
+  //
+  // A SIBLING orchestrator's anchor belongs in that baseline too, and leaving it
+  // out was a hole a reviewer reproduced live against the real gate: o1 launches,
+  // a lead edit lands, o2 launches and finishes, o1 reports only afterwards. o1
+  // is correctly stale against the edit, but o2 cleared the whole session,
+  // because `externalChangeAt` excludes every orchestrator rather than only the
+  // one being judged — and o1's edits are a fixed set at ITS completion, which
+  // o2 had already stopped reading before. The baseline is therefore per-agent:
+  // everything THIS orchestrator did not do, siblings included. That is the
+  // ruling's own wording — "launched after every change it did not make".
+  if (orchestrators.some((o) =>
+    o.doneAt !== -1 && o.doneAt < markerAt &&
+    o.launchedAt > Math.max(externalChangeAt,
+      ...orchestrators.filter((x) => x !== o).map(editorAnchor)))) return "ok";
   // Still running is not missing. Blocking here would tell the model to spawn a
   // second finder over the same scope, or to poll — and ending the turn is how
   // this loop waits. So this one releases: the completion wakes the model, and
@@ -833,9 +888,11 @@ function reviewerState(agents, changeAt, markerAt) {
 // one SendMessage to a blocking fixture released it, the same fixture without
 // the resume still blocked. The max also states the honest thing: a resume is a
 // fresh dispatch of edit work, so it needs a marker after it, not before it.
-const applierAnchor = (a) => Math.max(a.launchedAt, a.resumedAt ?? -1, a.doneAt);
+const editorAnchor = (a) => Math.max(a.launchedAt, a.resumedAt ?? -1, a.doneAt);
 // Whole-window indices, like every other agent record.
 const appliersIn = (agents) => agents.filter((a) => APPLIER_TYPE.test(a.type));
+const editorsIn = (agents) => agents.filter((a) => isEditor(a.type));
+const orchestratorsIn = (agents) => agents.filter((a) => ORCHESTRATOR_TYPE.test(a.type));
 
 // This branch needs a bound of its OWN. `countReminders` counts feedback since
 // the last marker, which works for the generic block because a blocked model has
@@ -863,7 +920,13 @@ function unreviewedReason(state, changes, lastChangeAt, cwd) {
       : [`No reviewer agent ran in this window — a verifier alone does not count, because verifying findings you generated yourself is reviewing your own work.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`];
   return [
-    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder or self-review-cold-grader) completed between the last change — your own edit, or an applier finishing — and the marker.`,
+    // The orchestrator belongs in both lists, and it was missed in both when
+    // F10c folded it into `reviewers`: it can reach "late", "stale" and "none"
+    // like any reader, and its completion is a change source like an applier's.
+    // A model whose only reviewer WAS an orchestrator would otherwise read a
+    // refusal flatly denying any reviewer ran, and start again from zero — which
+    // spends in the main session exactly what delegating the loop saves.
+    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder, self-review-cold-grader or self-review-orchestrator) completed between the last change — your own edit, or an editing subagent finishing — and the marker.`,
     middle,
     `${action} ${MARKER_BODY}`,
     `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts. If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
@@ -894,9 +957,12 @@ function evaluate(entries, cwd) {
   // An applier's writes land whenever they land, and this gate deliberately
   // releases a turn while a subagent runs so the human can type — so the turn
   // is the wrong frame for it, and the whole window is the right one. Nothing
-  // to review and no applier ever launched is today's silent pass.
+  // to review and no editing subagent ever launched — neither an applier nor an
+  // orchestrator — is today's silent pass.
   const appliers = appliersIn(agents);
-  if (changes.length === 0 && appliers.length === 0) return null;
+  const orchestrators = orchestratorsIn(agents);
+  const editors = editorsIn(agents);
+  if (changes.length === 0 && editors.length === 0) return null;
 
   // BOTH FRAMES, together, because getting them apart is what went wrong here,
   // and the frame each field takes is decided by WHAT GATES IT.
@@ -931,10 +997,18 @@ function evaluate(entries, cwd) {
   const toWindow = (i) => i + boundary + 1;
   // The latest thing needing a marker behind it, in window indices: the last
   // main-chain change, or the applier's completion, whichever is later.
-  const changeAtW = Math.max(
+  // Everything the orchestrator did NOT do: the lead's own writes, and any
+  // applier launched on the main chain beside it. This is the lower bound of the
+  // orchestrator's evidence clause in `reviewerState`.
+  const externalChangeAt = Math.max(
     changes.length ? toWindow(lastChangeAt) : -1,
-    ...appliers.map(applierAnchor),
+    ...appliers.map(editorAnchor),
   );
+  // The latest thing needing a marker behind it. The orchestrator's anchor joins
+  // it here — as a change source it is indistinguishable from an applier, and
+  // leaving it out is what lets a `not-converged` marker written mid-flight sit
+  // ahead of `changeAtW` while the orchestrator's applier is still editing.
+  const changeAtW = Math.max(externalChangeAt, ...orchestrators.map(editorAnchor));
   // One frame for everything that becomes prose, so a message cannot describe
   // the wrong entry: file changes converted up, appliers already there.
   const inFrame = [
@@ -942,7 +1016,8 @@ function evaluate(entries, cwd) {
     // No agent type on the record: nothing reads one, and round 1 removed the
     // only thing that did. Carrying it anyway is a field a later edit could
     // innocently print, reopening the leak with no test to catch it.
-    ...appliers.map((a) => ({ index: applierAnchor(a), kind: "applier" })),
+    ...appliers.map((a) => ({ index: editorAnchor(a), kind: "applier" })),
+    ...orchestrators.map((a) => ({ index: editorAnchor(a), kind: "orchestrator" })),
   ];
   // What still has no marker behind it — what the generic block is about, where
   // naming an applier that was already reviewed and marked would be wrong.
@@ -951,7 +1026,7 @@ function evaluate(entries, cwd) {
   // including the one at changeAtW, which is the one that message has to name.
   // It read "you changed  after it finished" in exactly the scenario the applier
   // arming exists to catch.
-  const described = inFrame.filter((c) => c.kind !== "applier" || c.index > markerAtW);
+  const described = inFrame.filter((c) => (c.kind !== "applier" && c.kind !== "orchestrator") || c.index > markerAtW);
 
   if (markerAtW > changeAtW) {
     // Only an affirmative `converged` is gated: the other two outcomes are
@@ -974,7 +1049,7 @@ function evaluate(entries, cwd) {
     // a finder that completed after the APPLIER finished, not merely after the
     // lead's own last edit.
     const state = outcome === "converged"
-      ? reviewerState(agents, changeAtW, markerAtW)
+      ? reviewerState(agents, externalChangeAt, changeAtW, markerAtW)
       : "ok";
     // A reviewer still working is not a missing one, and this loop waits by
     // ending turns: release, exactly as the pending branch below does.
@@ -989,7 +1064,7 @@ function evaluate(entries, cwd) {
     // next Stop sees a finished applier and asks for the re-mark.
     if (state === "applying") {
       return {
-        systemMessage: `self-review gate: a converged marker landed while the applier is still running — turn released so its edits can finish; review them and re-mark after it reports`,
+        systemMessage: `self-review gate: a converged marker landed while an editing subagent is still running — turn released so its edits can finish; review them and re-mark after it reports`,
       };
     }
     if (state !== "ok") {
@@ -1039,7 +1114,7 @@ function evaluate(entries, cwd) {
   return {
     decision: "block",
     reason: blockReason(described, reminders, cwd) + beside,
-    systemMessage: `self-review gate: ${describeChanges(described, cwd)} — running the review loop before the turn ends`,
+    systemMessage: `self-review gate: ${describeChanges(described, cwd)} — ${lastChange(described)?.kind === "orchestrator" ? "read its report and re-mark before the turn ends" : "running the review loop before the turn ends"}`,
   };
 }
 
@@ -1078,18 +1153,42 @@ function describeChanges(changes, cwd) {
   // released — and let a 20,000-character type produce a 21,653-character
   // block. Reproduced live, both halves.
   if (appliers.length) parts.push(`${appliers.length} applier subagent(s) that may have edited files`);
+  // The count only, for the same reason as the applier line above: the type is
+  // model-authored text.
+  const orchestrators = changes.filter((c) => c.kind === "orchestrator");
+  if (orchestrators.length) parts.push(`${orchestrators.length} orchestrator subagent(s) that ran a review and may have edited files`);
   return parts.join(" · ");
 }
+
+// The latest change in the frame, by transcript position. Two callers need it
+// and they must agree: the block's own sentence and the one-line status beside
+// it would otherwise name different next steps.
+const lastChange = (changes) =>
+  changes.length ? changes.reduce((a, c) => (c.index > a.index ? c : a)) : null;
 
 function blockReason(changes, reminders, cwd) {
   const lead = reminders > 0
     ? `Second reminder: no converged marker has appeared since your last edit. `
     : "";
+  // An orchestrator that completed with nothing after it has ALREADY run the
+  // loop, so "run the review loop" is the wrong instruction here: it would pay
+  // for the review a second time and pull back into the main session exactly
+  // the context the orchestrator exists to keep out of it. What is missing is
+  // the marker, not the review. The test is the LAST change in the frame — a
+  // lead edit after the completion is unread by anyone, and that case wants the
+  // loop.
+  const latest = lastChange(changes);
+  const now = latest?.kind === "orchestrator"
+    ? `${lead}Now: read its report and act on anything it left open, then mark convergence in a message of its own, AFTER your last edit: ${MARKER_BODY} — the marker is what clears this gate. Do not launch a second review of the same tree. If it FAILED, its completion is not a review: invoke the Skill tool with skill "${SKILL_NAME}" and run the loop yourself.`
+    : `${lead}Now: invoke the Skill tool with skill "${SKILL_NAME}" and follow it to convergence — fresh reviewer subagents, verify each candidate, fix what survives, re-review until a round is clean. Finish by marking convergence in a message of its own, AFTER your last edit: ${MARKER_BODY} — the marker is what clears this gate — and only then write your final summary.`;
   return [
     `${GATE_TAG} Files changed this turn but the self-review loop has not converged, so the turn cannot end yet.`,
     `Changed: ${describeChanges(changes, cwd)}`,
-    `${lead}Now: invoke the Skill tool with skill "${SKILL_NAME}" and follow it to convergence — fresh reviewer subagents, verify each candidate, fix what survives, re-review until a round is clean. Finish by marking convergence in a message of its own, AFTER your last edit: ${MARKER_BODY} — the marker is what clears this gate — and only then write your final summary.`,
-    `After spawning reviewers, END YOUR TURN with a one-line status: while subagents are running this gate lets the turn end, and their completion (a task notification, or an idle notification for a named agent — read its report with the skill's salvage.mjs) wakes you. Never poll with ListAgents or TaskOutput — each check is a full-context turn that tells you nothing new.`,
+    now,
+    // Suppressed on the orchestrator branch, which has just told the model not
+    // to launch anything: advice about waiting on reviewers it is not spawning
+    // reads as an instruction to spawn them.
+    ...(latest?.kind === "orchestrator" ? [] : [`After spawning reviewers, END YOUR TURN with a one-line status: while subagents are running this gate lets the turn end, and their completion (a task notification, or an idle notification for a named agent — read its report with the skill's salvage.mjs) wakes you. Never poll with ListAgents or TaskOutput — each check is a full-context turn that tells you nothing new.`]),
     `If the review genuinely does not apply, mark that outcome rather than skipping the marker — but name it, because it is a different claim: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
   ].join("\n");
 }

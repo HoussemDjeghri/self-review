@@ -2,9 +2,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { evaluate, offence } from "./tree-guard.mjs";
+import { agentDefinition, grants } from "./lib/frontmatter.mjs";
 
 const GUARD = path.join(path.dirname(fileURLToPath(import.meta.url)), "tree-guard.mjs");
 
@@ -215,4 +217,24 @@ test("run as the harness runs it, it denies on stdin and fails open on nonsense"
   assert.equal(hook({}).stdout, "", "no agent_id, no opinion");
   assert.equal(hook({ ...FINDER, tool_input: { command: "git checkout -- x" } }, { TREE_GUARD: "off" }).stdout, "",
     "the kill switch every hook in this plugin has");
+});
+
+// The other half of the seam tested in self-review-gate.test.mjs: `REVIEWER`
+// above is a third hardcoded list of the same names, and this one decides
+// whether an agent's shell can touch git at all. The subject is again the files
+// on disk, so a new agent with a shell is covered the day it ships rather than
+// the day someone remembers this regex.
+test("every shipped agent that has a shell is inside tree-guard", () => {
+  const agentDir = path.join(path.dirname(GUARD), "../agents");
+  // `grants` counts an agent that states no `tools:` as holding a shell,
+  // because it holds every tool the lead does. The inline parser this replaced
+  // read that file as tool-less and left it out of this list entirely.
+  const withShell = readdirSync(agentDir).filter((file) => file.endsWith(".md"))
+    .filter((file) => grants(agentDefinition(path.join(agentDir, file)), "Bash"));
+  assert.ok(withShell.length > 0, "no agent has a shell — this test has stopped testing anything");
+  for (const file of withShell) {
+    const type = `self-review:${file.replace(/\.md$/, "")}`;
+    assert.ok(denied("git stash", { agent_type: type }),
+      `${file} carries Bash and is outside tree-guard: its shell can reach git`);
+  }
 });
