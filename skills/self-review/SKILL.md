@@ -1,6 +1,6 @@
 ---
 name: self-review
-description: Convergent multi-agent review of work you just produced — code, docs, configs, skills, plans, commit text, chat answers. Use after finishing any task that wrote or changed code, before reporting done (the Stop gate arms for code files only — prose, config, data and asset changes are reviewed on demand); whenever the Stop gate says "[self-review-gate]"; and whenever the user says "review your work", "check it", "self-review", "double-check", or "/self-review". Fresh reviewer subagents find candidates from distinct angles, each candidate is verified against the file, you fix what survives, then a fresh round re-reviews — until a round is clean or effectively converged (no real findings left), or the findings stop converging (a severity-weighted trend, not a fixed count) and it escalates to you. Budgeted: few finders, Sonnet by default, and waiting by ending the turn, never by polling. Ends by marking convergence — a CONVERGED.json write, or scripts/converged.sh — which is what lets the turn end.
+description: Convergent multi-agent review of work you just produced — code, docs, configs, skills, plans, commit text, chat answers. Use after finishing any task that wrote or changed code, before reporting done (the Stop gate arms for code files only — prose, config, data and asset changes are reviewed on demand); whenever the Stop gate says "[self-review-gate]"; and whenever the user says "review your work", "check it", "self-review", "double-check", or "/self-review". Fresh reviewer subagents find candidates from distinct angles, each candidate is verified against the file, you fix what survives, then a fresh round re-reviews — until a round is clean or effectively converged (no real findings left), or the findings stop converging (a severity-weighted trend, not a fixed count) and it escalates to you. Budgeted: few finders, Sonnet by default, and waiting inside one bounded call on the reviewers' transcripts, never by polling or by ending the turn. Ends by marking convergence — a CONVERGED.json write, or scripts/converged.sh — which is what lets the turn end.
 argument-hint: "[what to review — defaults to everything changed this turn]"
 ---
 
@@ -27,24 +27,34 @@ call budget.
 
 ## What a review costs, and the two rules that keep it cheap
 
-1. **Wait by ending the turn.** After spawning reviewers, write one line
-   ("3 reviewers running — continuing when they report") and stop. The Stop
-   gate lets a turn end while subagents are running, and each finisher wakes
-   you — a `<task-notification>` for an unnamed agent, a teammate idle
-   notification for a named one (it carries no report: read that with
-   `salvage.mjs`, §2c). `ListAgents`, `TaskOutput(block=false)`, `Monitor`, `sleep` —
-   every one is a full-context turn that tells you nothing; the `poll-guard`
-   hook denies `ListAgents` and `TaskOutput(block=false)` from the third call
-   on (Monitor and sleep are not guarded — do not use them to wait on agents).
-   If the gate keeps blocking after a genuine attempt, it releases itself with
-   a notice after two reminders; do not fight it.
-2. **Act once per round, in one go.** When a notification wakes you and other
-   reviewers are still out, reply with one line and end the turn again — do
-   not start fixing from partial results (fixes move the tree under the
-   reviewers still reading it). When the last one lands: verify, write the
-   directives, dispatch the applier, end the turn. When it reports: pre-flight,
-   ledger, record, next round or marker — each stretch in as few tool calls as
-   it takes, except the marker, which gets a message of its own (§4). Read cited line ranges (`sed -n 'a,bp'`), not whole files.
+1. **Wait inside one call, never across turns.** After launching reviewers, the
+   next call is `"${CLAUDE_PLUGIN_ROOT}/scripts/wait.mjs" --work <work> --round <n> [names…]`,
+   with the Bash tool's `timeout` set to `600000`. It blocks until every named
+   reviewer's transcript shows a finished report or has been silent past the
+   stale limit, then prints one line per reviewer and exits: `0` — all settled,
+   collect now (§2c); `1` — some still active and the round's 30-minute wait
+   budget is not spent, call it again as the very next tool call; `3` — budget
+   spent, treat the active ones as dead (§2f). Do not end the turn to wait, and
+   do not check on a reviewer any other way: `ListAgents`,
+   `TaskOutput(block=false)`, `Monitor`, `sleep` — every one is a full-context
+   turn that tells you nothing the wait did not, and `poll-guard` denies the
+   first two from the third call on. The harness's wake-ups still arrive — an
+   idle notification for a named agent, a `<task-notification>` for an unnamed
+   one — but they are a courtesy, not the signal: they carry no report, and on
+   2026-09-03 three reviewers reported into the lead's inbox with
+   `success:true` and nothing was delivered for 2h49m while the transcripts on
+   disk said finished within ten minutes. If one wakes you between calls, do not
+   act on it; go back to the same call. The Stop gate still releases a turn
+   while subagents run; that is the fallback for a `wait.mjs` that cannot run —
+   exit 2 with "no subagent transcripts", not an exit 2 naming a bad flag, which
+   you fix and re-run — and never the way to wait.
+2. **Act once per round, in one go.** When `wait.mjs` exits 0, act once: verify,
+   write the directives, dispatch the applier, wait again on its name, then
+   pre-flight, ledger, record, next round or marker — each stretch in as few
+   tool calls as it takes, except the marker, which gets a message of its own
+   (§4). Never start fixing from partial results while reviewers are still out:
+   fixes move the tree under the reviewers still reading it. Read cited line
+   ranges (`sed -n 'a,bp'`), not whole files.
 
 Rough cost, in fresh-context agents: tier S ≈ 1, M ≈ 3–4 (a mixed change up
 to 6), L ≈ 6 — **6 finders per round is the hard cap at every tier**. Extra
@@ -278,7 +288,7 @@ point); docs `P1` · `P2+V` · `P3` · `P4` (P4 only for
 skills, prompts, agent files, CLAUDE.md, runbooks); config `K1` · `K2`. Tier S
 uses the compact brief.
 
-### 2b · Spawn finders — fresh agents, in parallel, then stop
+### 2b · Spawn finders — fresh agents, in parallel, then wait in one call
 
 Use the Agent tool with the `subagent_type` each `finders[]` row names — normally
 `self-review-finder` (read-only by instruction — its prompt forbids writes, and
@@ -325,10 +335,12 @@ Without `tier.json`, `--tier S|M|L` builds that tier's default plan.
 **Pass the brief as a path, not as text**: the Agent prompt is
 `Read <brief path> and follow it.` — about 30 tokens instead of the ~1,300 an
 inlined brief costs, on every finder of every round. Launch all finders of the
-round in **one message**, then end the turn with the one-line status (rule 1
-above). Finders run in the background: in current builds the
-main session's Agent tool always launches them that way and wakes you as each
-one completes (pass `run_in_background: true` where a build exposes it). If
+round in **one message**, then call `wait.mjs` (rule 1) as the next call —
+nothing in between, and no edits to the files in scope while it runs. Finders
+run in the background: in current builds the
+main session's Agent tool always launches them that way (pass
+`run_in_background: true` where a build exposes it); their completion
+notifications are not the signal — `wait.mjs` is. If
 your Agent tool says only synchronous subagents are supported, you are inside
 a subagent — the results come back in the same call and there is nothing to
 wait for. While they read, do not edit, commit, or rebase the
@@ -348,8 +360,10 @@ so in the report rather than waiting.
 
 ### 2c · Collect and deduplicate
 
-A finder's report is its last message, which the wake-up does not carry. Read
-every report in one call: `scripts/salvage.mjs <session-id> <name> <name>…`
+When `wait.mjs` exits 0, its table says which reviewers finished and which
+died; a dead one goes to §2f before anything else. A finder's report is its
+last message, which the wake-up does not carry. Read every finished report in
+one call: `scripts/salvage.mjs <session-id> <name> <name>…`
 prints each named agent's report (no names: lists the agents; the session id
 is the UUID in your scratchpad path). In the same call, run
 `scripts/treecheck.sh --work <work> --round <n>`: it is silent unless the
@@ -374,7 +388,7 @@ quoted counter-proof is not a dismissal** — it is an unverified candidate, and
 it gets a verifier.
 
 Spawn `self-review-verifier` agents (one per batch of ≤ 8 candidates, in one
-message, then end the turn) when:
+message, then `wait.mjs` on their names) when:
 
 - the tier is L;
 - dismissals in the round reach three in total — counted across every
@@ -439,8 +453,8 @@ to `<work>/round-<r>/directives.md`: the invariant the fix restores, the concret
 change, the failing test to add first when the project has tests, and what nearby
 not to touch. A directive missing the invariant or the concrete change is not
 dispatchable. Launch **one** `self-review-applier` for the round — prompt
-`Read <path> and follow it.` — and end the turn; it applies the directives in
-order and reports `applied` / `deviated` / `blocked` per directive. One per
+`Read <path> and follow it.` — then `wait.mjs` on its name; it applies the
+directives in order and reports `applied` / `deviated` / `blocked` per directive. One per
 round, never one per finding: concurrent edits in one tree collide. **Do not edit
 while it runs**, and never launch it beside a finder.
 
@@ -497,11 +511,11 @@ Sessions get killed mid-round — the usage-limit reset is the common case — a
 the reflex of re-spawning every silent reviewer re-pays 90–150k of context per
 agent for work that already happened: a subagent's transcript survives on disk
 even when its delivery did not, and this session's own round 3 was recovered
-exactly that way. So when a reviewer dies, goes idle without a report, or you
-resume after a reset:
+exactly that way. So when a reviewer dies, goes idle without a report,
+`wait.mjs` lists it as dead, or you resume after a reset:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id>            # each agent: finished/partial, calls, context
+"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id>            # each agent: finished/active/dead, calls, context
 "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id> <name>     # its last message (--all-text: every text block)
 ```
 
@@ -509,11 +523,14 @@ The session id is the UUID in your scratchpad path; the briefs in
 `round-<r>/briefs/` say who was launched. Then:
 
 - **finished** — its last message is the report. Use it as delivered; never
-  re-spawn an agent whose report already exists.
-- **partial** — read its state file (`round-<r>/state/<name>.jsonl`): the
+  re-spawn an agent whose report already exists. A reviewer `wait.mjs` listed
+  as dead that reports afterwards is not collected twice: use whichever report
+  exists.
+- **dead** (or **active**, when you are salvaging one `wait.mjs` gave up on) —
+  read its state file (`round-<r>/state/<name>.jsonl`): the
   findings it had confirmed before dying. Re-spawn the angle only when the
-  state file and the transcript's salvaged text are both empty — a partial's
-  informal notes count as salvage too — and paste whatever survived into the
+  state file and the transcript's salvaged text are both empty — an unfinished
+  agent's informal notes count as salvage too — and paste whatever survived into the
   new brief marked "already found — verify, do not re-derive, continue from
   here", so the dead agent's tokens still bought something.
 
@@ -764,8 +781,9 @@ with recommendations, and the checks you ran with their real results.
 
 ## Things that break the loop (and what to do instead)
 
-- **Polling.** "I'll wait for the notification" followed by `ListAgents` is
-  the failure this skill is budgeted against. End the turn.
+- **Waiting by ending the turn, or by polling.** Both are the failure this
+  skill is budgeted against — one measured at 30M tokens, the other at 2h49m of
+  silence. The wait is `wait.mjs`, in one call.
 - **Reviewing with your own eyes and calling it a round.** Spawn the agent;
   tier S is one agent, not zero.
 - **Spawning a panel.** Fourteen finders on one change is not thoroughness,

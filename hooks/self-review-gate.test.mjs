@@ -665,10 +665,23 @@ test("a synchronous Agent result (no launch text) is not pending", () => {
   assert.ok(blocks(r));
 });
 
-test("the block reason names the allow-listed absolute marker command and says to end the turn", () => {
+test("the block reason names the allow-listed absolute marker command and says how to wait", () => {
   const r = run(turn(write(`${PROJECT}/a.js`)));
   assert.match(r.json.reason, new RegExp(CONVERGED_SH));
-  assert.match(r.json.reason, /END YOUR TURN/);
+  assert.match(r.json.reason, /scripts\/wait\.mjs/);
+  assert.doesNotMatch(r.json.reason, /END YOUR TURN/,
+    "the gate must not still teach the wait the skill retired");
+});
+
+test("the unreviewed reason's spawn advice says how to wait, like the block reason does", () => {
+  // Round 1 rewrote blockReason() and pinned it; this second copy of the same
+  // advice went on telling the model to end the turn for another whole release.
+  // One assertion per message, because one assertion covered one message.
+  const r = run(turn(...write(`${PROJECT}/a.js`), ...marker()));
+  assert.match(r.json.reason, /outcome=converged claims a review ran/,
+    "the fixture must reach unreviewedReason(), or the assertion below passes vacuously");
+  assert.doesNotMatch(r.json.reason, /END YOUR TURN/,
+    "every wait instruction in this hook must point at wait.mjs");
 });
 
 // ---------- converged claims a reviewer ran (F10a-prime ruling 2) ----------

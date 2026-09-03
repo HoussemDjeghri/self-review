@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.7.1" src="https://img.shields.io/badge/version-0.7.1-191919">
+  <img alt="version 0.7.2" src="https://img.shields.io/badge/version-0.7.2-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -73,10 +73,13 @@ enforcing:
 - **Prose is not code.** Markdown, JSON/YAML, data and images are exempt from
   the gate by default and reviewed on demand (`/self-review <path>`) — a review
   loop that churns on a README costs tokens and changes nothing.
-- **Waiting costs nothing.** After spawning reviewers the session *ends the
-  turn*; each finisher wakes it. A second hook denies `ListAgents` /
-  `TaskOutput` polling after two checks, because every status check re-reads the
-  whole context to learn nothing.
+- **Waiting is one call, and it is bounded.** After spawning reviewers the
+  session blocks in a single call on `scripts/wait.mjs`, which reads the
+  reviewers' own transcripts and returns when each has reported or gone silent
+  past a stale limit — cheaper than being woken once per finisher, and it ends
+  rather than hanging when a completion notification is never delivered. A
+  second hook denies `ListAgents` / `TaskOutput` polling after two checks,
+  because every status check re-reads the whole context to learn nothing.
 
 ## Install
 
@@ -233,8 +236,8 @@ the gate off for a session entirely, set `SELF_REVIEW_GATE=off`.
 
 ## What ships today, and what doesn't
 
-Shipping: the gate, the poll guard, the skill and its reviewer agents, scope and
-salvage scripts, the cost cutters (`brief.mjs` builds a round's briefs,
+Shipping: the gate, the poll guard, the skill and its reviewer agents, scope,
+salvage and wait scripts, the cost cutters (`brief.mjs` builds a round's briefs,
 `preflight.sh` runs the project's own checks first, `audit.mjs` reports what a
 review cost), the context pair (`impact.mjs` computes the blast radius,
 `tier.mjs` turns it into a tier and an angle plan), per-repo memory
@@ -252,8 +255,8 @@ underneath it always runs, so the analysis has no language support to fall
 outside of.
 
 **On cost numbers:** the loop is budgeted — reviewer models and effort are
-pinned, every agent has a call budget, and the session waits by ending the turn
-instead of polling. `scripts/audit.mjs` now measures it, per review, from the
+pinned, every agent has a call budget, and the session waits inside one bounded
+call instead of polling or paying a turn per finisher. `scripts/audit.mjs` now measures it, per review, from the
 transcripts. The numbers stay out of this README until they come from more than
 one machine's sessions and from the eval corpus (§4.7) rather than from the
 project's own development, because a single session's figures published as

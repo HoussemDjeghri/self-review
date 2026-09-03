@@ -17,6 +17,8 @@
   "pollGuard": { "maxChecks": 2 },
   "brief": { "maxTokens": 2800, "impactMaxLines": 80, "priorMaxLines": 10 },
   "preflight": { "skip": [] },
+  "$comment.wait": "wait.mjs blocks inside one call until the round's reviewers report, reading their transcripts on disk rather than trusting completion notifications. callSeconds stays under the Bash tool's 600s ceiling so the script ends the call and prints its table; settleSeconds is longer than the largest measured gap between a reviewer's last text and the tool call that followed it; staleSeconds exceeds the longest single tool call a reviewer can make; budgetMinutes bounds the whole round's waiting.",
+  "wait": { "callSeconds": 570, "settleSeconds": 60, "staleSeconds": 660, "budgetMinutes": 30 },
   "$comment.coldRun": "uncontained: angle X executes nothing unless it achieves FULL containment — sandbox-exec on macOS, bubblewrap on Linux — and the entry points come back UNVERIFIED rather than clean. Denying only the network (unshare -rn, when bubblewrap is absent) does not count: it leaves writes and reads unconfined, so a buggy entry point still reaches the real filesystem with your permissions. Set this true only on a host you know holds no credentials; it then buys the best containment available, not none. It is not in REPO_ADDITIVE, so a checked-in .self-review.json cannot set it.",
   "coldRun": { "uncontained": false },
   "impact": {

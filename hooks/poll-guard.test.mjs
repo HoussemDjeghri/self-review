@@ -56,6 +56,8 @@ test("the third ListAgents since anything new arrived is denied, with the reason
   assert.ok(denied(out));
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /\[poll-guard\] Denied: this would be status check #3/);
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /end your turn/);
+  assert.match(out.hookSpecificOutput.permissionDecisionReason, /scripts\/wait\.mjs/,
+    "the denial must say how to wait, not only how not to");
   assert.match(out.systemMessage, /poll-guard/);
 });
 

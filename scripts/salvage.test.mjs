@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,12 +39,12 @@ function run(args, env = {}) {
   return spawnSync(process.execPath, [SALVAGE, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
 }
 
-test("the listing names every agent with finished/partial, call count and context", () => {
+test("the listing names every agent with its status, call count and context", () => {
   const { dir } = layout();
   const r = run([dir]);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /afind1-0123456789abcdef\s+finished\s+2 calls/);
-  assert.match(r.stdout, /afind2-fedcba9876543210\s+partial\s+2 calls  ctx 100k/);
+  assert.match(r.stdout, /afind2-fedcba9876543210\s+active\s+2 calls  ctx 100k/);
   assert.match(r.stdout, /100k/);
   assert.ok(!r.stdout.includes("not-a-transcript"));
 });
@@ -57,7 +57,7 @@ test("naming an agent prints its last message; --all-text prints everything it s
   assert.match(done.stdout, /"file":"src\/x\.ts"/);
   assert.ok(!done.stdout.includes("reading the scope"));
   const partial = run([dir, "find2"]);
-  assert.match(partial.stdout, /partial/);
+  assert.match(partial.stdout, /active/);
   assert.match(partial.stdout, /suspect x\.ts:42/);
   assert.ok(!partial.stdout.includes("session limit"), "harness banners are not the agent's work");
   const all = run([dir, "find1", "--all-text"]);
@@ -85,8 +85,19 @@ test("a torn final line and a zero-call transcript are handled", () => {
   const r = run([dir]);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /atorn-1234\s+finished\s+1 calls/);
-  assert.match(r.stdout, /azero-5678\s+partial\s+0 calls/);
+  assert.match(r.stdout, /azero-5678\s+active\s+0 calls/);
   assert.match(run([dir, "azero"]).stdout, /\(no text yet\)/);
+});
+
+// The status is about silence, not about the transcript alone: the same file
+// reads `active` while it is warm and `dead` once nothing has touched it for
+// longer than a reviewer's longest single tool call.
+test("a transcript nothing has written to for a long time reads dead, not active", () => {
+  const { dir } = layout();
+  const cut = path.join(dir, "agent-afind2-fedcba9876543210.jsonl");
+  const longAgo = Date.now() / 1000 - 20 * 60;
+  utimesSync(cut, longAgo, longAgo);
+  assert.match(run([dir]).stdout, /afind2-fedcba9876543210\s+dead\s+2 calls/);
 });
 
 test("a tilde CLAUDE_CONFIG_DIR is expanded, like the sibling hooks do", () => {

@@ -910,7 +910,7 @@ function unreviewedReason(state, changes, lastChangeAt, cwd) {
   // subagent's edit — reading `.file` off it directly prints "undefined" for
   // two of the three kinds.
   const latest = describeChanges(changes.filter((c) => c.index === lastChangeAt), cwd);
-  const spawn = `launch one self-review-finder scoped to the changed files — a single finder with an all-angles brief is the legitimate floor, because tier S is exactly that — then END YOUR TURN to let it run (its completion wakes you; never poll with ListAgents or TaskOutput), fix anything real it finds,`;
+  const spawn = `launch one self-review-finder scoped to the changed files — a single finder with an all-angles brief is the legitimate floor, because tier S is exactly that — then wait for it in ONE call with the skill's scripts/wait.mjs (never end the turn to wait, and never poll with ListAgents or TaskOutput), fix anything real it finds,`;
   const [middle, action] = state === "late"
     ? [`A reviewer did complete, but only AFTER the marker was written — nothing had read the result when you claimed it. Do not launch another one: it has already reported.`,
       `Read its report, act on it, and then re-mark, in a message of its own:`]
@@ -1188,7 +1188,7 @@ function blockReason(changes, reminders, cwd) {
     // Suppressed on the orchestrator branch, which has just told the model not
     // to launch anything: advice about waiting on reviewers it is not spawning
     // reads as an instruction to spawn them.
-    ...(latest?.kind === "orchestrator" ? [] : [`After spawning reviewers, END YOUR TURN with a one-line status: while subagents are running this gate lets the turn end, and their completion (a task notification, or an idle notification for a named agent — read its report with the skill's salvage.mjs) wakes you. Never poll with ListAgents or TaskOutput — each check is a full-context turn that tells you nothing new.`]),
+    ...(latest?.kind === "orchestrator" ? [] : [`After spawning reviewers, wait in ONE call with the skill's scripts/wait.mjs (Bash timeout 600000) — it blocks on the reviewers' own transcripts and prints who finished and who died. Do not end the turn to wait, and never poll with ListAgents or TaskOutput: each check is a full-context turn that tells you nothing new. This gate does let the turn end while subagents run, which is the fallback for a wait.mjs that cannot run, not the way to wait.`]),
     `If the review genuinely does not apply, mark that outcome rather than skipping the marker — but name it, because it is a different claim: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
   ].join("\n");
 }

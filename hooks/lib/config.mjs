@@ -37,6 +37,14 @@ export const FALLBACK = {
   pollGuard: { maxChecks: 2 },
   brief: { maxTokens: 2800, impactMaxLines: 80, priorMaxLines: 10 },
   preflight: { skip: [] },
+  // wait.mjs's clocks, all seconds but the last. `callSeconds` is under the
+  // Bash tool's 600 s ceiling so the script, not the tool, ends the call and
+  // the table still gets printed. `settleSeconds` is longer than the largest
+  // measured gap between a reviewer's last text and the tool call that
+  // followed it (31.9 s over 119 transcripts). `staleSeconds` exceeds the
+  // longest single tool call a reviewer can make, so a slow test run is not
+  // read as death.
+  wait: { callSeconds: 570, settleSeconds: 60, staleSeconds: 660, budgetMinutes: 30 },
   // Angle X refuses to execute anything on a host that cannot reach FULL
   // containment — seatbelt or bubblewrap. Denying only the network is not
   // enough. This key turns that refusal off, buying best-available execution
