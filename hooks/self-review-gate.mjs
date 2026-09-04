@@ -339,6 +339,16 @@ function maskQuotes(cmd) {
   let out = "";
   for (let i = 0; i < cmd.length;) {
     const ch = cmd[i];
+    // A backslash at top level escapes the next character, so neither is shell
+    // syntax — mask both. Without this the scan had no escape awareness at all
+    // and read `\"` as OPENING a quoted region: `echo a\"b | grep "x>y"` lost
+    // phase and exposed the `>` inside the later quoted string as a redirect,
+    // reporting a read-only pipeline as a write. `echo a\>b` was the same hole
+    // one step shorter — an escaped operator read as an operator. The quote fix
+    // below only stopped one way of INJECTING a stray quote; this is the defect
+    // both spellings reached. `afterDoubleQuoted` already handles an escape
+    // inside an open string; top level was the gap.
+    if (ch === "\\" && i + 1 < cmd.length) { out += "QQ"; i += 2; continue; }
     const end = ch === "'" ? afterSingleQuoted(cmd, i + 1) : ch === '"' ? afterDoubleQuoted(cmd, i + 1)
       : ch === "`" ? afterBacktick(cmd, i + 1) : ch === "$" && cmd[i + 1] === "(" ? afterSubstitution(cmd, i + 2) : 0;
     if (end) { out += "Q".repeat(end - i); i = end; }
@@ -352,12 +362,23 @@ function maskQuotes(cmd) {
 // check see the real target instead of an opaque `$S`. Each reference takes
 // the assignment most recently made before it — a name reused later in the
 // command must not rewrite an earlier target.
+// A value this pattern cannot capture WHOLE must not be substituted in part.
+// `[^\s;&|]+` stops at the space inside `$(ls x)`, so `f=$(ls x)` was recorded
+// as `$(ls` and every later `$f` became that fragment — unbalanced syntax
+// injected into the command. `maskQuotes` then lost phase on the unclosed
+// `$(`, and a `>` inside a later quoted string read as a redirect: a read-only
+// pipeline was reported as writing to whatever word followed it. So a value
+// holding a substitution is OPAQUE — the reference is left as written, which
+// is what an unknown value has always meant here.
+const OPAQUE_VALUE = /\$\(|`/;
+
 function expandLocalAssignments(cmd) {
   const assignments = [...cmd.matchAll(/(?:^|[\s;&|])([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|]+)/g)]
-    .map((m) => ({ at: m.index, name: m[1], value: m[2].replace(/^["']|["']$/g, "") }));
+    .map((m) => ({ at: m.index, name: m[1], raw: m[2], value: m[2].replace(/^["']|["']$/g, "") }));
   return cmd.replace(/\$\{?([A-Za-z_]\w*)\}?/g, (whole, name, at) => {
     const latest = assignments.findLast((a) => a.name === name && a.at < at);
-    return latest ? latest.value : whole;
+    if (!latest || OPAQUE_VALUE.test(latest.raw)) return whole;
+    return latest.value;
   });
 }
 

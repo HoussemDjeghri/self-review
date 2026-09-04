@@ -424,6 +424,23 @@ test("read-only shell commands do not block", () => {
     `cat > /tmp/scratch/run.sh <<'EOF'\nsed -i 's/a/b/' ${PROJECT}/x\nEOF`, // data body mentioning sed -i, scratch target
     `for c in "python3 -c \\"open('${PROJECT}/x','w')\\"" "mv a b"; do echo "$c"; done`, // quoted test data, not executed code
     `python3 - <<'EOF'\nimport tempfile\nf = tempfile.NamedTemporaryFile("w"); f.write("x")\nEOF`, // tempfile is not a project write
+    // A value the assignment scanner cannot capture whole must not be
+    // substituted in part. `[^\\s;&|]+` stops at the space inside `$(ls x)`,
+    // so `$f` was replaced by the fragment `$(ls` — unbalanced syntax, which
+    // desynchronised maskQuotes and exposed the `>` inside a later quoted
+    // string as a redirect. Reported by a peer session this gate falsely
+    // blocked, and reproduced against the shipped 0.7.4.
+    `f=$(ls x); echo "$f" | grep "a>b"`,
+    `f=\`ls x\`; echo "$f" | grep "a>b"`,
+    `n=$(wc -l < ${PROJECT}/a.ts); echo "lines: $n" | grep "1>2"`,
+    // The same desync reached without any assignment at all: a backslash at
+    // top level escapes the next character, and the scan had no escape case,
+    // so `\"` was read as OPENING a quoted region. Found by a reviewer of the
+    // three cases above, which had closed only one way of injecting the stray
+    // quote rather than the defect both spellings reached.
+    `echo a\\"b | grep "x>y"`,
+    `f=a\\"b; echo $f | grep "x>y"`,
+    `echo a\\>b`, // an escaped operator is not an operator
   ];
   for (const c of cases) assert.equal(run(turn(bash(c, ""))).stdout, "", c);
 });
