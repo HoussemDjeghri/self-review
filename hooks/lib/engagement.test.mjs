@@ -123,7 +123,7 @@ test("the covered list and tree-guard's own regex cannot drift apart in silence"
   const guard = await import("../tree-guard.mjs");
   const denied = (agentType) =>
     guard.evaluate({ agent_id: "a1", agent_type: agentType, tool_name: "Bash", tool_input: { command: "git checkout ." } });
-  for (const type of ["self-review-finder-r1-ab", "self-review-verifier-r1", "self-review-cold-grader-r1-x"]) {
+  for (const type of ["self-review-finder-r1-ab", "self-review-verifier-r1", "self-review-cold-grader-r1-x", "self-review-ticket-validator"]) {
     assert.ok(denied(type), `tree-guard must cover ${type}, which engagement.mjs counts as covered`);
   }
 });

@@ -7,8 +7,9 @@
 #
 # It captures the scope, runs pre-flight (round 1 only), computes the blast
 # radius and the plan, pulls the prior findings for these files, and writes the
-# briefs — then prints the tier line, the pre-flight summary and the Agent-call
-# table. Nothing else; every line it prints lands in the main session's context
+# briefs — then prints the tier line, the Agent-call table, and the pre-flight
+# summary last, because the pre-flight verdicts are what the caller acts on
+# before spawning anyone. Nothing else; every line it prints lands in the main session's context
 # and is paid for again on every later turn.
 #
 # It exists because of a measurement, not a preference. In the 2026-08-29 loop

@@ -62,7 +62,8 @@ alone:
   nothing names the *new* value either, ask who serves it — a rename done on
   one side only is the same bug in the other direction.
 
-A contract marked **too many matches** is the opposite of noise. The admission
+A contract whose row says **more than the report lists, so the count below is a
+floor** is the opposite of noise. The admission
 gates have already rejected the generic strings, so a token that still collects
 hundreds of signature-verified hits is a foundational endpoint — the widest
 blast radius in the change, and the row most worth your time. Its listed
@@ -136,53 +137,20 @@ on every path (including the error path), unbounded growth (caches, queues,
 logs), work done on a hot path or at startup that should be lazy or batched.
 
 ### X · Cold run *(conditional: the change touches something a user runs — a CLI, a script, a hook, a plugin, an installed entry point)*
-Every other angle reads the artifact. This one grades what the artifact **did**
-when it was run the way a user gets it, and its evidence is a transcript rather
-than a line number.
+The run has already happened: `scripts/coldrun.sh` ran each entry point the way
+a user gets it — a copy of the tree, reached through a symlink, at a path
+**containing a space**, with a foreign working directory, inside a sandbox that
+denies the network. Your brief names the transcript; its header names the
+containment tier and your agent file says what each tier means.
 
-The run has already happened when you receive this. `scripts/coldrun.sh` copied
-the working tree out of the repository into a directory whose path **contains a
-space** — where unquoted `$0`, `dirname` and glob expansion fail — reached it
-through a symlink, gave it a working directory that is neither the copy nor the
-source, and invoked each entry point inside a sandbox that **denies the network
-and confines every write to that directory**. Your brief names the transcript.
+**You have no shell and you do not run the artifact.** That is the mechanism,
+not an oversight: deciding which invocation is safe requires reading the code
+under review, which is circular, so containment holds safety and coverage is
+allowed to be wrong. A belief that something more should have run is a *finding*
+naming the argv, for a person to run — never an execution decision of your own.
 
-**You do not run the artifact, and you have no shell.** That is the mechanism,
-not an oversight. This angle used to hand a reviewer a shell and a rule about
-which invocations were safe — `--help`, `--version`, `--dry-run` — and the rule
-was circular: the code you would read to decide that a `--dry-run` flag is
-honoured is exactly the code under review because it might be broken. One
-mis-parse and a `deploy` reaches the real network with the real credentials,
-and there is no undo. Safety is held by containment now; **which** invocation
-runs is a coverage question, and coverage questions are allowed to be wrong.
-
-Read the transcript's header first. It names the containment tier:
-
-* **contained** — network denied, writes confined. Grade what ran.
-* **network-denied** — network denied, writes and reads not confined. Only reachable when the host's owner opted in with `coldRun.uncontained: true`; otherwise this tier refuses to execute. Grade what ran, and say so if a finding turns on a file the artifact wrote or read.
-* **uncontained** — the host offered no sandbox, so **nothing ran**. The entry points are UNVERIFIED, not verified-clean. File one `minor` candidate saying angle X could not be exercised and what the transcript says would fix it. Never report a pass.
-
-The failure this angle exists for is **silent success**: a tool that resolves a
-path against `$PWD`, needs a sibling that only exists in the source tree, or
-breaks on the space, and does nothing at all without saying so. So:
-
-* **exit 0 with empty stdout is a FINDING, not a pass**;
-* a documented flag the artifact does not recognise;
-* an error naming a path inside the source tree — it only works next to its repository;
-* `command not found`, an unresolved shebang, a missing dependency;
-* `KILLED at the … timeout` — an entry point that blocks on nothing;
-* output contradicting what the artifact declares: the README's usage line, the `--help` text, the docs this change edited.
-
-What is **not** a finding: the coverage line at the end of the transcript. A
-bare invocation, `--help` and `--version` fire before argument parsing, so they
-catch the preamble class and not the artifact doing its job. Reporting that gap
-on every entry point every round is how an angle gets switched off. Raise it
-only when the artifact's real invocation is the one place a defect in *this*
-change could show — and then as one candidate naming the argv you would want
-run, for a person to decide on and run by hand. There is no config key that
-takes it today; a per-entry-point argv map is deliberately not built yet. A
-belief that something more should be run is an input to someone else's
-decision, never an execution decision of your own.
+The failure this angle exists for is **silent success**, so **exit 0 with empty
+stdout is a FINDING, not a pass.** Your agent file lists the rest.
 
 ### Q · Reuse, simplification, efficiency, altitude
 *Reuse*: flag new code that re-implements something the codebase or its

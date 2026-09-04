@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { angleSections, buildPlan, dismissedFrom, estimateTokens, impactLines, logPriorShown, main, priorIdsIn, renderBrief } from "./brief.mjs";
+import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief } from "./brief.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "brief.mjs");
@@ -55,6 +55,29 @@ test("only the dismissed section of the ledger travels to the next round", () =>
   assert.deepEqual(dismissedFrom(ledger), ["- D1 — race: refuted, the lock is held", "- D2 — off-by-one: refuted"]);
   assert.deepEqual(dismissedFrom("# ledger\n\n## fixed\n- F1\n"), [], "no dismissed section means nothing to pass on");
   assert.deepEqual(dismissedFrom(""), []);
+  assert.deepEqual(fixedFrom(ledger), ["- F1 — swallowed abort"], "the fixed section is read for angle S");
+  assert.deepEqual(fixedFrom("# ledger\n\n## dismissed\n- D1\n"), []);
+  assert.deepEqual(fixedFrom(""), []);
+});
+
+test("the fix history reaches angle S and no other angle", () => {
+  const fixed = ["- [blocker] gate.mjs:1233 — wrong bound", "- [major] gate.mjs:1240 — wrong frame"];
+  const shape = renderBrief(briefArgs({
+    row: { name: "r3-s", angles: ["S"], agent: "self-review-finder", model: "sonnet", effort: "high", calls: 40, impact: "full" },
+    fixed,
+  }));
+  assert.match(shape.text, /FIX HISTORY/);
+  assert.match(shape.text, /wrong bound/, "S's step 3 is unperformable without the fix list");
+  // The rule the exception is carved out of: every other angle re-discovers a
+  // fix as correct, so telling it what was already fixed is the bias itself.
+  const line = renderBrief(briefArgs({ fixed }));
+  assert.doesNotMatch(line.text, /FIX HISTORY/);
+  assert.doesNotMatch(line.text, /wrong bound/);
+  const firstS = renderBrief(briefArgs({
+    row: { name: "r3-s", angles: ["S"], agent: "self-review-finder", model: "sonnet", effort: "high", calls: 40, impact: "full" },
+    fixed: [],
+  }));
+  assert.match(firstS.text, /none — this is the first round to reach angle S/);
 });
 
 const IMPACT = [

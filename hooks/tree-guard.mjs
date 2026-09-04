@@ -61,7 +61,7 @@ const GUARD_TAG = "[tree-guard]";
 // agent's own type is NOT guarded, by design: the plugin generates every name
 // it is responsible for, and an unrecognised one is treated as not a reviewer,
 // the same accepted fail-open as an unlisted `rm` spelling. F10h.
-const REVIEWER = /(^|:)self-review-(finder|verifier|cold-grader)(-|$)/;
+const REVIEWER = /(^|:)self-review-(finder|verifier|cold-grader|ticket-validator)(-|$)/;
 
 /**
  * The git verbs a reviewer may run. Everything else is denied.

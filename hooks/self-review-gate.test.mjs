@@ -12,6 +12,7 @@ import { tmpdir, homedir, userInfo } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentDefinition } from "./lib/frontmatter.mjs";
+import { fieldsFromFlags, validateMarker } from "./lib/marker.mjs";
 
 const GATE = path.join(path.dirname(fileURLToPath(import.meta.url)), "self-review-gate.mjs");
 const PLUGIN_ROOT = path.resolve(path.dirname(GATE), "..");
@@ -31,8 +32,8 @@ const CONVERGED_Q = SH(CONVERGED_SH);
 // for it. The gate matches the command WORD and the token in the output; it
 // never parses the arguments — which is why the prefix-parsing cases further
 // down still pass a positional summary and still clear the gate.
-const MARKER_CMD = `${CONVERGED_Q} --converged --rounds 1 --fixed 0 --dismissed 0 --open 0`;
-const MARKER_OUT = "SELF-REVIEW CONVERGED — outcome=converged rounds=1 fixed=0 dismissed=0 open=0";
+const MARKER_CMD = `${CONVERGED_Q} --converged --rounds 1 --fixed 0 --dismissed 0 --open 0 --intent author`;
+const MARKER_OUT = "SELF-REVIEW CONVERGED — outcome=converged rounds=1 fixed=0 dismissed=0 open=0 intent=author";
 const GATE_TAG = "[self-review-gate]";
 // The real account home, from the password database rather than from `$HOME`.
 // Two things here need a path that is nobody's scratch directory — the
@@ -72,7 +73,7 @@ function bash(command, output = "") { return call("Bash", { command }, output, {
 function marker() { return bash(MARKER_CMD, MARKER_OUT); }
 // The file marker holds the typed record. `body` is spread, so a test can write
 // a malformed one (the legacy {"summary": …} included) to exercise refusal.
-const CONVERGED_RECORD = { outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0 };
+const CONVERGED_RECORD = { outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, intent: "author" };
 function writeMarker(body = CONVERGED_RECORD, dir = SCRATCH) {
   return call("Write", { file_path: `${dir}/self-review/CONVERGED.json`, content: JSON.stringify(body) }, `File created successfully at: ${dir}/self-review/CONVERGED.json`);
 }
@@ -745,7 +746,7 @@ test("the plugin prefix is tolerated: a bare self-review-finder type qualifies",
 });
 
 test("only converged is gated — not-converged and not-applicable end the turn with no reviewer", () => {
-  for (const body of [{ outcome: "not-converged", rounds: 1, fixed: 0, dismissed: 0, open: 2 },
+  for (const body of [{ outcome: "not-converged", rounds: 1, fixed: 0, dismissed: 0, open: 2, intent: "author" },
     { outcome: "not-applicable", reason: "user-declined" }]) {
     assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...writeMarker(body))).stdout, "", JSON.stringify(body));
   }
@@ -1024,11 +1025,11 @@ test("a rejected marker in an earlier turn does not answer this turn's block", (
 
 test("a CONVERGED.json write in a scratch dir after the last change releases the turn and is logged", () => {
   const logDir = mkdtempSync(path.join(tmpdir(), "srlog-"));
-  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker({ outcome: "converged", rounds: 2, fixed: 1, dismissed: 0, open: 0 })), { env: { SELF_REVIEW_LOG_DIR: logDir } });
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker({ outcome: "converged", rounds: 2, fixed: 1, dismissed: 0, open: 0, intent: "author" })), { env: { SELF_REVIEW_LOG_DIR: logDir } });
   assert.equal(r.stdout, "");
   const lines = readFileSync(path.join(logDir, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.equal(lines.length, 1);
-  assert.equal(lines[0].summary, "outcome=converged rounds=2 fixed=1 dismissed=0 open=0", "the gate logs the summary it formatted, not whatever the model typed");
+  assert.equal(lines[0].summary, "outcome=converged rounds=2 fixed=1 dismissed=0 open=0 intent=author", "the gate logs the summary it formatted, not whatever the model typed");
   assert.equal(lines[0].cwd, PROJECT);
 });
 
@@ -1502,9 +1503,19 @@ test("the refusal enumerates every type that can be the reviewer", () => {
   // any reviewer ran. Two finders filed it independently; one reproduced it.
   const r = run(turn(...reviewed(), ...write(`${PROJECT}/a.ts`), ...marker()));
   assert.ok(blocks(r), "an edit after the finder finished is stale");
-  for (const type of ["self-review-finder", "self-review-cold-grader", "self-review-orchestrator"]) {
+  for (const type of ["self-review-finder", "self-review-cold-grader"]) {
     assert.ok(r.json.reason.includes(type), `the refusal must name ${type}`);
   }
+  // ...and only a way forward that EXISTS. No orchestrator ships (F10i), so
+  // naming one unconditionally sent every real install looking for an agent
+  // type that is not in plugin/agents/. The finding above is still honoured,
+  // because the session it was filed for HAS an orchestrator and sees it named:
+  assert.ok(!r.json.reason.includes("self-review-orchestrator"),
+    "a session with no orchestrator must not be sent looking for one");
+  const withOrch = run(turn(...orch("o9"), notification("o9"), ...write(`${PROJECT}/a.ts`), ...marker()));
+  assert.ok(blocks(withOrch), "an edit after the orchestrator finished is stale too");
+  assert.ok(withOrch.json.reason.includes("self-review-orchestrator"),
+    "the session whose reviewer WAS an orchestrator must still see it named");
 });
 
 test("the fallback loop still converges with a dead orchestrator in the window", () => {
@@ -1674,6 +1685,11 @@ const EXPECTED = {
   "self-review-finder": ["reviewer"],
   "self-review-cold-grader": ["reviewer"],
   "self-review-verifier": [],
+  // The ticket validator reads the intent before the code exists, so its
+  // completion is evidence about the ticket and never about the change. Listing
+  // it as a reviewer would let a session clear `converged` with an agent that
+  // never read a line of the diff.
+  "self-review-ticket-validator": [],
   "self-review-applier": ["editor"],
 };
 
@@ -1738,4 +1754,250 @@ test("the refusal names every agent whose completion would have satisfied it", (
     if (!roles.includes("reviewer")) continue;
     assert.ok(r.json.reason.includes(name), `the refusal does not name ${name}, which would have satisfied it`);
   }
+});
+
+// The gate's block reason is copied verbatim into the next tool call, so the
+// bodies it hands out and the grammar it then judges them by are one contract
+// held in two files. They came apart once already: `intent` became required for
+// a counted outcome and MARKER_BODY still spelled a record without it, so the
+// gate was telling the session to write exactly what it would refuse a call
+// later. Reading the bodies back out of a real refusal is what makes that
+// unreachable — a new required field fails here, not in a user's turn.
+test("every marker body the gate hands out validates under the grammar the gate judges by", () => {
+  const reason = run(turn(...write(`${PROJECT}/src/a.ts`))).json.reason;
+  assert.ok(reason, "expected the gate to block and give a reason");
+
+  const bodies = [...reason.matchAll(/\{"outcome":.*?\}/g)].map((m) => m[0]);
+  assert.ok(bodies.length >= 2, `expected the converged and not-applicable bodies, got ${bodies.length}`);
+  for (const body of bodies) {
+    const { problems } = validateMarker(JSON.parse(body));
+    assert.deepEqual(problems, [], `${body} — the gate offers a record its own grammar refuses: ${problems.join(" | ")}`);
+  }
+
+  // Anchored on the first flag, never on the script path: from an install the
+  // plugin root contains a space, so a pattern that reached back to
+  // `converged.sh ` matched nothing there and the test passed by finding no
+  // commands at all — green over a tree it was not reading, which is the half
+  // of the install-shape class that is worse than failing. A command runs to
+  // the end of its line, and the prose after it is set off by an em dash or a
+  // sentence break; cut at whichever comes first. `--not-converged` is prose
+  // here ("mark it --not-converged with your real counts") and is not a body
+  // the gate offers, so it is deliberately not in the alternation.
+  const commands = [...reason.matchAll(/--(?:converged|not-applicable)\b[^\n]*/g)]
+    .map((m) => m[0].split(/\s+—\s+|\.(?:\s|$)/)[0].trim());
+  assert.ok(commands.length >= 2, `expected the converged and not-applicable commands, got ${commands.length}`);
+  for (const command of commands) {
+    const { fields, problems: parseProblems } = fieldsFromFlags(command.trim().split(/\s+/));
+    assert.deepEqual(parseProblems, [], `${command} — unparseable: ${parseProblems.join(" | ")}`);
+    const { problems } = validateMarker(fields);
+    assert.deepEqual(problems, [], `${command} — the gate offers a command its own grammar refuses: ${problems.join(" | ")}`);
+  }
+});
+
+// ---------- `intent=validated` is a claim about ORDER ----------
+//
+// These are the ordering claim's own tests, and they shipped missing: the field
+// was gated with nothing exercising the gate. What is asserted here is only
+// order — a validator that COMPLETED before the first edit could still change
+// the code, one that completed after it could not. The verdict is never read,
+// so no fixture carries one, and `author` and `skipped` are never gated at all.
+// The last case is the applier one, which is the shape that was broken.
+
+// The refusal's own sentence, counted by its own tally for the same reason
+// `unreviewedFeedback` is: a model refused here HAS marked, so a count anchored
+// on the marker would reset on every re-mark and nothing would ever release.
+const unvalidatedFeedback = () => ({
+  type: "user", isMeta: true, timestamp: stamp(),
+  message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} The marker was refused: intent=validated claims a fresh reader saw the ticket, but no self-review-ticket-validator completed before this task's first code change.` },
+});
+const VALIDATOR = "self-review:self-review-ticket-validator";
+const VALIDATED_RECORD = { ...CONVERGED_RECORD, intent: "validated" };
+
+test("intent=validated passes when the validator completed before the first edit", () => {
+  const r = run(turn(...launch("tv-1", VALIDATOR), notification("tv-1"),
+    ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.equal(r.stdout, "");
+});
+
+test("intent=validated is refused when the validator completed AFTER the first edit", () => {
+  // Same entries, the write moved in front of the launch: the ticket it read
+  // had already been answered by the code, which is what the field denies.
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...launch("tv-2", VALIDATOR), notification("tv-2"),
+    ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /intent=validated/);
+  assert.match(r.json.systemMessage, /intent=validated refused/);
+});
+
+test("intent=validated is refused when no validator ran at all", () => {
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /intent=validated/);
+});
+
+test("author and skipped are honest claims about nobody, and are never gated by ordering", () => {
+  for (const intent of ["author", "skipped"]) {
+    const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker({ ...CONVERGED_RECORD, intent })));
+    assert.equal(r.stdout, "", intent);
+  }
+});
+
+test("the intent refusal is bounded: after MAX_REMINDERS it releases with a notice", () => {
+  const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`),
+    unvalidatedFeedback(), unvalidatedFeedback(),
+    ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done")]);
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /released after 2 refusals of intent=validated/);
+});
+
+test("a validator that completed while an applier was already editing is refused", () => {
+  // The applier's edits could have landed from its LAUNCH onward, so a
+  // validator finishing between that launch and the applier's completion read a
+  // ticket the code was already answering. This passed before `editorStart`:
+  // the check was handed the applier's COMPLETION anchor as "the first change",
+  // and the validator sat comfortably in front of it.
+  const r = run(turn(...applier("ap-tv"), ...launch("tv-3", VALIDATOR), notification("tv-3"),
+    notification("ap-tv"), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.ok(blocks(r), "the validator finished after the applier's edits had begun");
+  assert.match(r.json.systemMessage, /intent=validated refused/);
+});
+
+// ---------- and the ORDER is read inside this task's window ----------
+//
+// The cases above all live in one turn, which is the one shape that cannot tell
+// the task window apart from the whole session. These are the window's own
+// tests, and the first two are the defects it was added to close — both
+// reproduced live against the real hook, one in each direction. The rest pin the
+// three edges the window has: what opens it, what closes it, and what it does
+// when it holds no change at all. Simplifying `taskStart` should fail here
+// rather than in a user's session.
+
+test("an editor from an already-marked earlier round does not block a validated claim", () => {
+  // The FALSE BLOCK. `Math.min` used to take every applier and orchestrator in
+  // the WINDOW, so an editor from a round that was already reviewed and marked
+  // had a launch index far in front of this task's first edit — and no validator
+  // that ran for this ticket could beat it. The first turn is a complete,
+  // discharged round; the second is a fresh ticket, validated before a line of
+  // it was written.
+  const r = run([
+    human("fix the first thing"), ...orch("o1"), notification("o1"),
+    ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...marker(), said("round one done"),
+    human("now the second ticket"), ...launch("tv-w1", VALIDATOR), notification("tv-w1"),
+    ...write(`${PROJECT}/src/b.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done"),
+  ]);
+  assert.equal(r.stdout, "", "the earlier round's editor is not this task's first change");
+});
+
+test("a validator from an earlier, unrelated task does not satisfy a later one", () => {
+  // The FALSE ACCEPT, and the severe direction: `validatedBeforeCoding` searched
+  // every agent in the window, so ONE validator anywhere in a session
+  // permanently unlocked `intent=validated` for every later turn — including the
+  // ones whose ticket nobody read. The first turn validates a ticket and writes
+  // nothing; the second writes code and claims that validation as its own.
+  const r = run([
+    human("is this ticket sound?"), ...launch("tv-w2", VALIDATOR), notification("tv-w2"), said("it is"),
+    human("now write something else"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...writeMarker(VALIDATED_RECORD), said("done"),
+  ]);
+  assert.ok(blocks(r), "a validator that read a different ticket is not evidence about this one");
+  assert.match(r.json.systemMessage, /intent=validated refused/);
+});
+
+test("a crashed agent widens the task window by two prompts, not forever", () => {
+  // The same false accept as the test above, reached from the other side. A
+  // human prompt is spanned only while the agent crossing it is still
+  // `pending` — `!done && interjections < PENDING_INTERJECTION_LIMIT`. Testing
+  // `doneAt === -1` alone read every agent that never reported as eternally
+  // live, so one crash anywhere in a session made every later prompt an
+  // interjection, pinned `taskStart` at -1, and handed an unrelated later task
+  // the first task's validator. The adjacent comment already claimed the
+  // two-prompt bound; only the code did not have it.
+  const r = run([
+    // Launched, and no notification for it ever arrives.
+    human("is this ticket sound?"), ...launch("dead-1"),
+    ...launch("tv-w9", VALIDATOR), notification("tv-w9"), said("it is"),
+    human("unrelated one"), said("ok"),
+    human("unrelated two"), said("ok"),
+    human("now write something else"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...writeMarker(VALIDATED_RECORD), said("done"),
+  ]);
+  assert.ok(blocks(r), "the crashed agent aged out two prompts ago; this task has its own window");
+  assert.match(r.json.systemMessage, /intent=validated refused/);
+});
+
+test("a validator still running across a human prompt keeps the window open", () => {
+  // What opens the window: the latest human prompt NO agent was working through.
+  // A prompt the validator was still running across is an INTERJECTION, not a
+  // task boundary — turn-scoping on `boundary` alone would cut the window in
+  // front of the validator's own completion and refuse the marker, which is the
+  // 2026-08-22 false block in a new place.
+  const r = run([
+    human("validate then build it"), ...launch("tv-w3", VALIDATOR),
+    human("while you're there, keep the naming consistent"), notification("tv-w3"),
+    ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done"),
+  ]);
+  assert.equal(r.stdout, "", "the spanned prompt is an interjection, so the task began before it");
+});
+
+test("a marker closes the task: the next one needs a validator of its own", () => {
+  // What closes the window. The mirror of the false accept above, one step
+  // tighter: the validator here really did read THIS session's first ticket, and
+  // the marker that discharged it is what ends its reach. Without `prevMarkerAt`
+  // a second turn spanned by nothing would still cut at its own prompt — this
+  // case is the one that fails when the two cuts are collapsed into one.
+  const r = run([
+    human("first ticket"), ...launch("tv-w4", VALIDATOR), notification("tv-w4"),
+    ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done"),
+    human("second ticket"), ...write(`${PROJECT}/src/b.ts`), ...reviewed(),
+    ...writeMarker(VALIDATED_RECORD), said("done"),
+  ]);
+  assert.ok(blocks(r), "the first ticket's validator was spent on the first ticket");
+  assert.match(r.json.systemMessage, /intent=validated refused/);
+});
+
+test("a marker whose task window holds no change is not refused for intent", () => {
+  // The gate stays armed over the whole window for an applier, so a marker gets
+  // re-seen at Stops long after the task it belongs to closed. In those the task
+  // window holds no change at all — nothing for the validator to have preceded —
+  // and testing `inFrame.length` instead of the window's own first change
+  // refused a marker for an ordering there was no order to state. The reviewer
+  // branch is satisfied here (the finder completed after the applier and before
+  // the marker), so the turn ends outright; if it ever stops being satisfied
+  // this assertion becomes one on the REVIEWER refusal, never the intent one.
+  const r = run([
+    human("go"), ...applier("ap-w5"), notification("ap-w5"), ...reviewed(), ...marker(), said("applied and marked"),
+    human("now something else"), ...writeMarker(VALIDATED_RECORD), said("answered, nothing written"),
+  ]);
+  assert.equal(r.stdout, "", "no change in this task window is nothing to be ordered against");
+});
+
+test("an unresolvable Bash write is a write, and it is ordered like any other", () => {
+  // The hole round 3 found, and the reason the two enumerators are now one.
+  // `bashWriteTargets` gives three answers — no write, a write it cannot name,
+  // a named list — and the ordering check collapsed the middle one into "no
+  // write". So a code write through an interpreter armed the gate (the generic
+  // path resolves it against git) and then vanished from the ordering check,
+  // which skipped entirely and accepted the claim with zero validators.
+  //
+  // An unresolved event is not a guess: it is the parser's own report that a
+  // write happened at that index. What the gate cannot say is WHICH file, and
+  // the refusal says exactly that, so the session can take the third exit if
+  // the command only touched prose, config or scratch.
+  const unnamed = `python3 -c "import shutil; shutil.copy('x','y')"`;
+
+  const before = run(turn(...launch("tv-w6", VALIDATOR), notification("tv-w6"),
+    ...bash(unnamed), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.equal(before.stdout, "", "the validator finished first — order is satisfied whether or not the file can be named");
+
+  const after = run(turn(...bash(unnamed), ...launch("tv-w7", VALIDATOR), notification("tv-w7"),
+    ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.ok(blocks(after), "the unnamed write is the task's FIRST change; the validator read a ticket the code had answered");
+  assert.match(after.json.reason, /shell command at entry \d+ whose write target the gate could not resolve/);
+  assert.match(after.json.reason, /third exit/);
+
+  // The live reproduction, exactly as both round-3 finders filed it: the only
+  // change in the window is unnamed, no validator ran, and the claim was taken.
+  const alone = run(turn(...bash(unnamed), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.ok(blocks(alone), "intent=validated was accepted with provably zero validators");
+  assert.match(alone.json.systemMessage, /intent=validated refused/);
 });

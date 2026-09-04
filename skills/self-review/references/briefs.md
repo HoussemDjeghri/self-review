@@ -37,57 +37,27 @@ you have not checked, say so, and the finder will.
 
 ## Finder brief
 
-Send one per angle group with `subagent_type: "self-review-finder"` (fallback:
-`general-purpose`, then prepend the finder agent's system prompt text from
-`${CLAUDE_PLUGIN_ROOT}/agents/self-review-finder.md`). Launch all finders of a round in one
+Send one per angle group with the `subagent_type` the plan's row names — normally
+`self-review-finder`, but `self-review-cold-grader` for the angle-`X` row (fallback:
+`general-purpose`, then prepend that agent's system prompt text from
+`${CLAUDE_PLUGIN_ROOT}/agents/<the type>.md`). Launch all finders of a round in one
 message so they run in parallel.
 
-```
-You are reviewer <n> of <total> in round <r> of a self-review.
-
-<INTENT block>
-
-SCOPE
-Read <absolute path to round-r/scope.diff> first — changed-file list, diff, and
-new files rendered as additions. The live files are at <cwd or repo root>; read
-enclosing code/sections there. Scratch and generated files are not in scope.
-
-YOUR ANGLE
-<angle paragraph(s) pasted verbatim from references/angles.md>
-
-IMPACT (line numbers as of generation — re-read before asserting)
-<impact.md at this row's depth: full, docs, or the two-line summary>
-
-PRIOR FINDINGS IN THIS REPO (context, not a checklist)
-<prior.md from findings.mjs prior: [id] file:line · class · summary · verdict>   (omitted when there are none)
-If one of these lines is the defect you are filing, put the eight characters its
-brackets hold in your finding's `prior_id` — "prior_id": "1a2b3c4d". A wrong id
-is worse than none.
-
-ALREADY DISMISSED (do not re-report without new evidence)
-<ledger "dismissed" entries: id — summary — why refuted>   (or "none")
-
-STATE FILE (crash insurance)
-<absolute path to round-r/state/<finder-name>.jsonl> — append each candidate
-there as one JSON line the moment it firms up, batched into the same Bash call
-as your next read. If your session dies, this file is what survives.
-
-CALL BUDGET
-<n> tool calls. Spend them on reading the enclosing code and proving
-findings, not on breadth for its own sake.
-
-OUTPUT
-The JSON array described in your instructions. Up to 6 candidates, most severe
-first, `[]` if nothing qualifies. Nothing after the JSON.
-```
-
-`brief.mjs` writes exactly this, in this order — the sections that depend on a
-file (IMPACT, PRIOR FINDINGS) are dropped when that file is empty.
+`brief.mjs` writes the brief itself; this file does not reproduce it. Its
+sections, in order: the INTENT block · SCOPE (the round's `scope.diff`, plus
+where the live files are) · YOUR ANGLE, pasted verbatim from `angles.md` ·
+IMPACT at the row's depth · PRIOR FINDINGS · ALREADY DISMISSED · FIX HISTORY
+(angle `S` only) · STATE FILE · CALL BUDGET · OUTPUT. The sections that depend
+on a file are dropped when that file is empty, and a row grading a cold run
+gets a THE COLD RUN section whose wording is the script's. If you ever have to
+write one by hand, `renderSections` in `${CLAUDE_PLUGIN_ROOT}/scripts/brief.mjs`
+is the order and the wording.
 
 ## Verifier brief
 
-Spawned only in the cases SKILL.md §2d names (tier L; about to dismiss three or
-more; an uncertain behaviour-changing fix). One verifier per batch of up to 8
+Spawned only in the cases SKILL.md §2d names (tier L; the round's dismissals
+reach three in total, counted across every verification pass rather than per
+batch; an uncertain behaviour-changing fix). One verifier per batch of up to 8
 candidates, `subagent_type: "self-review-verifier"` (fallback: `general-purpose`
 + the verifier system prompt text). Otherwise you verify, with the same rubric,
 and the ledger carries your quoted proof.
@@ -154,7 +124,11 @@ Rules that keep the loop honest:
   survives — so `W` must be reconstructable from it alone, not from a transcript
   that may be gone.
 - Finders get the *dismissed* list, never the *fixed* list — a fix must be
-  re-discovered as correct by a cold reader, not taken on faith.
+  re-discovered as correct by a cold reader, not taken on faith. **Angle `S` is
+  the one exception**: it rules on whether a unit should keep being fixed, so
+  `brief.mjs` gives its row the ledger's `## fixed` lines as a FIX HISTORY
+  section. That is the opposite question, not a relaxation — the repetition is
+  S's subject and the diff cannot show it.
 - A dismissed entry needs the refuting proof; "seems fine" does not dismiss.
 - An open entry is a decision for the user, stated as a question with your
   recommendation, not a bug you chose to ignore.
@@ -169,10 +143,20 @@ Lead with the outcome; the detail is for whoever wants it.
 
 ```
 Self-review: converged in <r> rounds — <f> fixed, <d> dismissed, <o> open.
+Intent: validated before coding | author-written, unvalidated | validation skipped
 Fixed: <file:line — what> (…one line each, most important first)
 Open for you: <file:line — the question + your recommendation>
 Checks: <command → real result, e.g. `npm test` 42 passed · `tsc` clean>
 ```
+
+The **Intent** line is the same claim as the marker's `intent` field and must
+match it. It is there because the rest of the report is a claim about the code
+against the stated intent, and never a claim that the intent was right — the
+line is what tells the reader which of those two they are holding. Say
+`validated before coding (sound)`, or name the checks a `revise` failed
+(`(revise: premise, scope)`); say `validation skipped` with the round's tier
+beside it, because a skipped ticket that tiered M or L is a mismatch the reader
+should see.
 
 Say **"converged"** for a clean final round; say **"converged (last round's
 findings were all manufactured — nothing real left to fix)"** when the loop

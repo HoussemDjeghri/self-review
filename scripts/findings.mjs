@@ -58,6 +58,12 @@ const CLASS_KIND = new Map([
   ["altitude", "code"], ["accuracy", "docs"], ["completeness", "docs"], ["reader-fit", "docs"],
   ["consistency", "docs"], ["config", "config"], ["intent", "any"], ["verification", "any"],
   ["conventions", "any"], ["shape", "any"], ["out-of-angle", "any"], ["pre-existing", "any"],
+  // The cold grader's own class, and the only one no finder emits. It is "code"
+  // because angle X exists where the change ships something a user runs. Its
+  // absence here refused every X finding at `record`, silently as far as the
+  // round could tell: the finding was found, verified, fixed, and then not
+  // written down.
+  ["cold-run", "code"],
 ]);
 const FIELDS = new Set(["verdict", "file", "line", "severity", "class", "angle", "summary", "mechanism", "proof", "prior_id"]);
 // Optional on purpose: most findings have no prior line to cite, and a required
@@ -691,8 +697,21 @@ export function main(argv, { log = console.log, stdin } = {}) {
     const rounds = mine.map((record) => record.round);
     const round = Number(options.round ?? (rounds.length ? Math.max(...rounds) : 1));
     if (!Number.isInteger(round) || round < 1) throw usage(`--round needs a positive integer, not ${JSON.stringify(options.round)}`);
-    const budget = options.budget === undefined ? null : Number(options.budget);
+    let budget = options.budget === undefined ? null : Number(options.budget);
     if (budget !== null && (!Number.isInteger(budget) || budget < 1)) throw usage(`--budget needs a positive integer, not ${JSON.stringify(options.budget)}`);
+    // The round cap already exists: `tier.mjs` computed it and wrote it into
+    // this round's `tier.json` as `roundsCap`. Requiring it to be retyped as a
+    // flag meant that forgetting the flag silently turned the cap off — the
+    // verdict then answered on `W` alone and reported nothing about a spent
+    // budget, which is the one bound on cost the loop has. Read it instead;
+    // an explicit `--budget` still wins, so forcing a cap stays possible.
+    let budgetFrom = budget === null ? "" : " (given)";
+    if (budget === null && options.work) {
+      try {
+        const cap = JSON.parse(readFileSync(path.join(options.work, `round-${round}`, "tier.json"), "utf8")).roundsCap;
+        if (Number.isInteger(cap) && cap >= 1) { budget = cap; budgetFrom = ` (round ${round}'s tier.json)`; }
+      } catch { /* no plan for this round: the cap is genuinely unknown, and the line below says so */ }
+    }
     const result = convergence(mine, round, { budget });
     logConvergence(result, { review, logDir });
     for (const n of [result.previousRound, round].filter((n) => n !== null)) {
@@ -701,7 +720,7 @@ export function main(argv, { log = console.log, stdin } = {}) {
     }
     if (result.earned) log(`# round ${round} closed a ${result.tail}: one more round, then the budget is spent whatever it finds`);
     log(`${result.verdict} — ${result.reason}`);
-    log(`# the W rule and the round budget${budget === null ? " (none given: W only)" : ""}; the oscillation check and the ledger's open items stay with you (SKILL §3)`);
+    log(`# the W rule and the round budget${budget === null ? " (none found: W only)" : budgetFrom}; the oscillation check and the ledger's open items stay with you (SKILL §3)`);
     // Did the guard that protects the author's tree actually watch this round?
     // Silence here used to be indistinguishable from "watching nothing".
     let engagement = "";

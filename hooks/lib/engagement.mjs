@@ -107,7 +107,7 @@ export function noteEngagement(repoRoot, agentType, matched, { session = null, l
 // measurement. Deliberately not tree-guard's regex: a check written in the
 // terms of the thing it checks passes whenever that thing is consistent with
 // itself, which is exactly the failure being audited.
-export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|applier)\b/;
+export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|applier|ticket-validator)\b/;
 
 // Of the names this plugin generates, the ones tree-guard is meant to cover.
 // The split decides which of two DIFFERENT failures an unmatched row is, and
@@ -119,7 +119,7 @@ export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|ap
 // thing is consistent with itself. `engagement.test.mjs` asserts tree-guard's
 // REVIEWER really does match one canonical spelling of each name here, so the
 // two constants cannot drift apart in silence.
-const COVERED = /^(self-review:)?self-review-(finder|verifier|cold-grader)\b/;
+const COVERED = /^(self-review:)?self-review-(finder|verifier|cold-grader|ticket-validator)\b/;
 
 /**
  * What the log says about the round that just ran.

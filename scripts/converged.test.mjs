@@ -29,15 +29,15 @@ const run = (args, logDir, cwd = process.cwd()) =>
 const records = (logDir) =>
   readFileSync(path.join(logDir, "log.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 
-const CONVERGED_ARGS = ["--converged", "--rounds", "2", "--fixed", "3", "--dismissed", "1", "--open", "0"];
+const CONVERGED_ARGS = ["--converged", "--rounds", "2", "--fixed", "3", "--dismissed", "1", "--open", "0", "--intent", "author"];
 
 test("prints the token the gate matches and logs one typed JSON record", () => {
   const logDir = freshLogDir();
   const result = run([...CONVERGED_ARGS, "--tier", "M"], logDir);
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /^SELF-REVIEW CONVERGED — outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M$/m);
+  assert.match(result.stdout, /^SELF-REVIEW CONVERGED — outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M intent=author$/m);
   const [record] = records(logDir);
-  assert.equal(record.summary, "outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M");
+  assert.equal(record.summary, "outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M intent=author");
   assert.equal(record.outcome, "converged");
   assert.equal(record.rounds, 2);          // a number, not the string that used to corrupt the sums
   assert.equal(record.cwd, process.cwd());
@@ -130,7 +130,7 @@ test("a tier override reaches the log through the CLI, both halves of it", () =>
   const logDir = freshLogDir();
   const result = run([...CONVERGED_ARGS, "--tier", "S", "--forced", "S", "--computed", "M"], logDir);
   assert.equal(result.status, 0, `refused the override: ${result.stderr}`);
-  assert.match(result.stdout, / tier=S forced=S computed=M$/m);
+  assert.match(result.stdout, / tier=S forced=S computed=M intent=author$/m);
   const [record] = records(logDir);
   assert.equal(record.forced, "S");
   assert.equal(record.computed, "M");

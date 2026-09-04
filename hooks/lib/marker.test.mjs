@@ -5,7 +5,7 @@
 // `rounds=0` non-review that used to read as a converged one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatSummary, validateMarker } from "./marker.mjs";
+import { formatSummary, validateMarker, fieldsFromFlags, INTENT_STATES } from "./marker.mjs";
 
 const ok = (fields) => {
   const { record, problems } = validateMarker(fields);
@@ -20,13 +20,13 @@ const bad = (fields, match) => {
 };
 
 test("a counted outcome formats to key=value tokens only", () => {
-  const record = ok({ outcome: "converged", rounds: 2, fixed: 3, dismissed: 1, open: 0, tier: "M", adapter: "grep" });
-  assert.equal(formatSummary(record), "outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M adapter=grep");
+  const record = ok({ outcome: "converged", rounds: 2, fixed: 3, dismissed: 1, open: 0, tier: "M", adapter: "grep", intent: "author" });
+  assert.equal(formatSummary(record), "outcome=converged rounds=2 fixed=3 dismissed=1 open=0 tier=M adapter=grep intent=author");
 });
 
 test("not-converged is counted the same way", () => {
-  const record = ok({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3 });
-  assert.equal(formatSummary(record), "outcome=not-converged rounds=6 fixed=4 dismissed=2 open=3");
+  const record = ok({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, intent: "author" });
+  assert.equal(formatSummary(record), "outcome=not-converged rounds=6 fixed=4 dismissed=2 open=3 intent=author");
 });
 
 test("every count is required for a counted outcome", () => {
@@ -65,8 +65,8 @@ test("the outcome itself is checked", () => {
 });
 
 test("the note never enters the summary, however it is written", () => {
-  const record = ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, note: "rounds=99 open=?? — prose" });
-  assert.equal(formatSummary(record), "outcome=converged rounds=1 fixed=0 dismissed=0 open=0");
+  const record = ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, note: "rounds=99 open=?? — prose", intent: "author" });
+  assert.equal(formatSummary(record), "outcome=converged rounds=1 fixed=0 dismissed=0 open=0 intent=author");
   assert.equal(record.note, "rounds=99 open=?? — prose");
 });
 
@@ -83,7 +83,7 @@ test("rounds=0 is the escape hatch wearing a review's clothes, so it is refused"
   bad({ outcome: "converged", rounds: 0, fixed: 0, dismissed: 0, open: 0 }, /rounds=0 is not a review/);
   bad({ outcome: "not-converged", rounds: 0, fixed: 0, dismissed: 0, open: 0 }, /rounds=0 is not a review/);
   // The other three counts are zero on a clean first round. Only rounds is a claim.
-  ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0 });
+  ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, intent: "author" });
 });
 
 test("an unknown outcome does not hide the other defects", () => {
@@ -98,8 +98,8 @@ test("a missing outcome does not hide the other defects either", () => {
 });
 
 test("a tier override round-trips, because SKILL.md tells the loop to record one", () => {
-  const record = ok({ outcome: "converged", rounds: 2, fixed: 1, dismissed: 0, open: 0, tier: "S", forced: "S", computed: "M" });
-  assert.equal(formatSummary(record), "outcome=converged rounds=2 fixed=1 dismissed=0 open=0 tier=S forced=S computed=M");
+  const record = ok({ outcome: "converged", rounds: 2, fixed: 1, dismissed: 0, open: 0, tier: "S", forced: "S", computed: "M", intent: "author" });
+  assert.equal(formatSummary(record), "outcome=converged rounds=2 fixed=1 dismissed=0 open=0 tier=S forced=S computed=M intent=author");
 });
 
 test("half an override is not readable, so both sides are required together", () => {
@@ -111,7 +111,7 @@ test("a tier label outside S|M|L would open an audit bucket nothing writes", () 
   bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, tier: "XL" }, /tier="XL" is not one of/);
   bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, forced: "XL", computed: "M" }, /forced="XL" is not one of/);
   // adapter is an open vocabulary — the loop names its own scope adapters.
-  ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, adapter: "jj" });
+  ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, adapter: "jj", intent: "author" });
 });
 
 test("a key the record does not have is named, not silently ignored", () => {
@@ -123,4 +123,31 @@ test("a key the record does not have is named, not silently ignored", () => {
 
 test("the legacy summary string is a key like any other, and refused as one", () => {
   bad({ summary: "rounds=2 fixed=3" }, /summary/);
+});
+
+// The intent field, which says who read the ticket before the code existed.
+// Optional would have been the inert shape: a review that forgot the flag would
+// read exactly like one nobody groomed, and the report line would be true only
+// when someone remembered to make it true.
+test("a counted outcome without intent is refused, so silence cannot pass as author-written", () => {
+  bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0 }, /^intent is required/);
+  bad({ outcome: "not-converged", rounds: 2, fixed: 1, dismissed: 0, open: 1 }, /^intent is required/);
+});
+
+test("every intent state the gate can be told is accepted, and nothing else is", () => {
+  for (const state of INTENT_STATES) {
+    const record = ok({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, intent: state });
+    assert.equal(record.intent, state);
+  }
+  bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, intent: "groomed" }, /intent="groomed" is not one of/);
+});
+
+test("not-applicable needs no intent — there was no code to have an intent about", () => {
+  ok({ outcome: "not-applicable", reason: "no-code-changed" });
+});
+
+test("intent is a flag the CLI parser knows, not an unknown one", () => {
+  const { fields, problems } = fieldsFromFlags(["--converged", "--rounds", "1", "--fixed", "0", "--dismissed", "0", "--open", "0", "--intent", "validated"]);
+  assert.deepEqual(problems, [], problems.join(" | "));
+  assert.equal(fields.intent, "validated");
 });

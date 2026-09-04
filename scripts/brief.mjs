@@ -137,17 +137,29 @@ const read = (file, what) => {
   }
 };
 
-// Only the dismissed section travels: "fixed" would tell the next round what
-// not to look at, which is exactly the bias a fresh reviewer is there to avoid.
-export function dismissedFrom(ledgerText) {
+const ledgerSection = (ledgerText, heading) => {
   if (!ledgerText) return [];
   const lines = ledgerText.split("\n");
-  const start = lines.findIndex((line) => /^#{1,3} +dismissed\b/i.test(line));
+  const start = lines.findIndex((line) => heading.test(line));
   if (start === -1) return [];
   const rest = lines.slice(start + 1);
   const end = rest.findIndex(isHeading);
   return (end === -1 ? rest : rest.slice(0, end)).map((l) => l.trimEnd()).filter(Boolean);
-}
+};
+
+// Only the dismissed section travels to a finder: "fixed" would tell the next
+// round what not to look at, which is exactly the bias a fresh reviewer is
+// there to avoid.
+export const dismissedFrom = (ledgerText) => ledgerSection(ledgerText, /^#{1,3} +dismissed\b/i);
+
+// Angle S is the one exception, and it is not a relaxation of the rule above —
+// it is the opposite question. Every other angle asks "is this change right?",
+// and a fix list would answer it in advance. S asks "is this the right shape to
+// keep fixing?", and the evidence for that IS the fix history: one unit taking
+// a finding in three consecutive rounds is S's whole subject, and it is
+// invisible in the diff. Its step 3 ("read the fix history in the ledger") was
+// unperformable until this existed.
+export const fixedFrom = (ledgerText) => ledgerSection(ledgerText, /^#{1,3} +fixed\b/i);
 
 // Impact at the depth the row asked for. `summary` is the file's own two-line
 // header (§4.3 writes the counts there); `docs` keeps the sections a prose
@@ -193,7 +205,7 @@ export function impactLines(impactText, depth, { impactMaxLines }) {
 }
 
 // --- rendering -------------------------------------------------------------
-function renderSections({ row, index, total, round, intent, scope, live, angles, impact, prior, dismissed, stateFile, cold }) {
+function renderSections({ row, index, total, round, intent, scope, live, angles, impact, prior, dismissed, fixed = [], stateFile, cold }) {
   // Angle X's own reviewer has no shell (see agents/self-review-cold-grader.md),
   // so its lifeboat is written rather than appended with Bash.
   //
@@ -252,6 +264,14 @@ function renderSections({ row, index, total, round, intent, scope, live, angles,
     dismissed:
       `ALREADY DISMISSED (do not re-report without new evidence)\n` +
       `${dismissed.length ? dismissed.join("\n") : "none"}\n`,
+    // Shape only. The list is what earlier rounds CHANGED, so it is the
+    // arms-race evidence S rules on, and it is withheld from every other row.
+    fixed: row.angles.includes("S")
+      ? `FIX HISTORY (this review's earlier rounds, newest last)\n` +
+        `${fixed.length ? fixed.join("\n") : "none — this is the first round to reach angle S"}\n` +
+        `A unit that appears here in two rounds running is the finding, whatever\n` +
+        `each individual fix was.\n`
+      : "",
     state: grading
       ? `STATE FILE (crash insurance)\n${stateFile} — each time a candidate firms up, Write\n` +
         `the candidates you have so far there, one JSON object per line. If your session\n` +
@@ -353,7 +373,7 @@ export function logPriorShown(shown, { round, cwd = process.cwd(), logDir = LOG_
   }
 }
 
-export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, live, impactText, prior, dismissed, config, cold }) {
+export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, live, impactText, prior, dismissed, fixed = [], config, cold }) {
   // The whole plan is checked before the first file exists: a bad row must not
   // leave the earlier rows' briefs behind as a half-written round.
   const reject = (message) => { throw Object.assign(new Error(message), { exitCode: 3 }); };
@@ -386,7 +406,7 @@ export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, liv
     const brief = renderBrief({
       row, index, total,
       round: plan.round ?? 1,
-      intent, scope, live, angles, stateFile, dismissed, cold,
+      intent, scope, live, angles, stateFile, dismissed, fixed, cold,
       impact: impactLines(impactText, row.impact, config),
       prior: prior.slice(0, config.priorMaxLines),
       budget: config,
@@ -440,7 +460,9 @@ export function main(argv, { log = console.log } = {}) {
     : path.join(PLUGIN_ROOT, "skills", "self-review", "references", "angles.md");
   const outDir = path.resolve(options.out);
   const ledgerPath = options.ledger ? path.resolve(options.ledger) : "the ledger";
-  const dismissed = dismissedFrom(options.ledger ? read(ledgerPath, "the ledger") : "");
+  const ledgerText = options.ledger ? read(ledgerPath, "the ledger") : "";
+  const dismissed = dismissedFrom(ledgerText);
+  const fixed = fixedFrom(ledgerText);
   const dismissedCount = dismissed.length;
   const results = writeBriefs({
     plan,
@@ -453,6 +475,7 @@ export function main(argv, { log = console.log } = {}) {
     impactText: options.impact ? read(path.resolve(options.impact), "the impact block") : "",
     prior: options.prior ? read(path.resolve(options.prior), "prior findings").split("\n").filter(Boolean) : [],
     dismissed,
+    fixed,
     // A path, not the file: the transcript holds every byte the artifact wrote
     // and belongs in the grader's context once, when it reads it — not in
     // every brief, and not in this script's caller's context at all.

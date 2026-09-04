@@ -13,17 +13,9 @@ do: hand the change to people who were not there, let them attack it from
 different angles, check their claims, fix what is real, and look again —
 because a fix is a new change that can itself be wrong.
 
-This skill is that process, with subagents as the people. It runs at the end
-of every turn that changed code (the Stop gate enforces it for code files;
-prose, config, data and asset files are not gated — a 2026-08-22 audit of 17 reviews
-found the loop earned its cost on code with tests and produced churn on docs,
-settings and memory notes) and on demand for anything else. It is also **budgeted**: reviewers are only cheap when they are aimed, and
-two measured things burn a usage window — the main session re-reading a 400k context once
-per status check (2026-08-21), and reviewers that run on Opus or read without
-a budget (2026-08-22: one Opus finder billed 7M input tokens over 100 tool
-calls; the Sonnet docs finders ~1M over ~20). So the loop spends the main
-session's turns sparingly and gives every reviewer a model, an effort, and a
-call budget.
+This skill is that process, with subagents as the people. It runs at the end of
+every turn that changed code, and on demand for anything else. It is
+**budgeted**, and the section below is where that budget is set and why.
 
 ## What a review costs, and the two rules that keep it cheap
 
@@ -59,7 +51,8 @@ call budget.
 
 Rough cost, in fresh-context agents: tier S ≈ 1, M ≈ 3–4 (a mixed change up
 to 6), L ≈ 6 — **6 finders per round is the hard cap at every tier**. Extra
-rounds taper: ≈2 finders at round 2, 1 per round from round 3 on, plus a
+rounds taper: ≈2 finders at round 2, then from round 3 one all-angles finder
+(the *compact* brief, §2a) plus angle S — one only at tier S — plus a
 verifier per round at tier L. Tiers S and M stop after **2 rounds** at most
 (a two-round M is ~5 agents) — plus one tier-S finder on round 2's own fix
 lines when that round fixed a major or blocker (§3); only tier L may run to
@@ -69,34 +62,29 @@ rounds 3+ mostly ended `not-converged` with minors: they were paying for rounds
 that did not close. If round 1 already needs more than the cap, the scope
 is too big for one review — say so and split it.
 
-Reviewers never run on the session's own model or effort. A subagent inherits
+Reviewers never run on the session's own model or effort: a subagent inherits
 both unless its definition pins them, so a Fable session at max effort would
-otherwise spend Fable-at-max on every finder. The split, from the 2026-08-22
-measurements (a reviewer's billed input ≈ its tool calls × its context: 1–2.8M
-tokens per Sonnet finder, 3.5–7M per Opus finder, at ~5× the price per token):
-
-- **Finders: sonnet · high at every tier** (pinned in the agent file). Opus
-  finders billed 2–3× more at 5× the price, and the one blocker this loop
-  caught came from reproducing a bug by running the module — which does not
-  need Opus. Tier L passes `model: "opus"` on the Agent call only for the
-  risk-column angles, `G` security and `H` concurrency: at most two per round.
-- **Verifier: opus · high** — one agent per batch of ≤ 8 candidates, ruling on
-  the author's dismissals; it is the one place where judgment beats price.
-- **Effort high — not max, not low.** A reviewer reads and probes across tens
-  of tool steps and effort multiplies the thinking spent on each; Anthropic's
-  guidance is to keep `high`, with `medium` as the cost step-down and `low`
-  only for short, non-judgment tasks. Use `medium` when the window is short.
-- **Haiku: not used.** A reviewer's cost is calls × context, which a cheaper
-  model does not change, and review is judgment — it would trade what the
-  loop pays for to save a third of the smallest line item.
-- **Call budgets, in the agent prompts**: ~40 tool calls for a code finder,
-  ~25 for docs or config, ~10 per candidate for the verifier. At the budget
-  the agent writes what it has, with `omitted` when coverage was cut.
+otherwise spend Fable-at-max on every finder. **Finders are sonnet · high**,
+pinned in the agent file; `tier.mjs` passes `model: "opus"` only for the
+risk-column angles `G` and `H`, at most two per round. **The verifier is
+opus · high** — ruling on the author's dismissals is the one place judgment
+beats price. **Effort stays `high`**: `medium` is the step-down when the window
+is short, `low` is for short non-judgment tasks, and `max` is not a reviewer
+setting. **Haiku is not used** — a reviewer's cost is calls × context, which a
+cheaper model does not change. Call budgets live in the agent prompts (~40 tool
+calls for a code finder, ~25 for docs or config, ~10 per candidate for the
+verifier); at the budget the agent writes what it has, with `omitted` when
+coverage was cut. That split came from the 2026-08-22 measurement: billed input
+≈ tool calls × context, 1–2.8M tokens per Sonnet finder against 3.5–7M per Opus
+finder at ~5× the price, and the one blocker this loop caught was found by
+running the module, which does not need Opus.
 
 Do not pass `model: "fable"`; the env var `CLAUDE_CODE_SUBAGENT_MODEL`
 overrides all of this if a session ever needs to.
 
-These counts, models and call budgets are skill text today, not settings:
+The models are skill text; the cap, the call budgets and the round caps are
+`tier.finders` in `config/defaults.json`, which `tier.mjs` reads and `tier.json`
+records for the round. Either way:
 never tune one mid-review to fit a round. What the plugin reads from
 `${CLAUDE_PLUGIN_ROOT}/config/defaults.json` is the gate's business — the file
 kinds it exempts, `gate.maxReminders`, `pollGuard.maxChecks` — overridden per
@@ -111,8 +99,18 @@ and each one is a single token on purpose: unsubstituted, `<` and `>` are
 redirections, so a placeholder containing a space would be read as two words and
 the shell would consume the next flag as a filename instead of failing loudly.
 
-Write the **INTENT block** first (the end of this section says what goes in it) to
-`<work>/intent.md`, then set the round up in **one call**:
+The **INTENT block** goes in `<work>/intent.md` (the end of this section says
+what goes in it). Which of the three the marker claims turns on **who read the
+intent**, not on which skill ran. `--intent validated`: a validator read it
+before the code existed — the `ticket` skill is how that happens, and if it ran
+then `intent.md` is already there, so use it as it stands and do not write a
+second one. `--intent author`: the intent is written down and you are the only
+one who read it — the normal case when the `ticket` skill did not run, so write
+it now. `--intent skipped`: there is no ticket to speak of — you are reviewing a
+change whose intent was never written before the code, and the block below is
+being written now purely to brief the reviewers. All three are honest; only
+`validated` is checked, and it is checked for order. Then set the round up in
+**one call**:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/round.sh" --work <work> --round 1 --intent <work>/intent.md \
@@ -134,8 +132,7 @@ with no transcript can only file "not exercised", and it cost 237k tokens to do
 that once. Every one of them carries
 its usage in its header comment (the two shell scripts also print it on
 `--help`; the four `.mjs` CLIs reject unknown flags instead), and
-`docs/DESIGN.md` §4.1–§4.5 carries the full contract of each — so falling back
-does not mean reconstructing flags from prose.
+so falling back does not mean reconstructing flags from prose.
 
 From round 2 on, `round.sh` passes round 1's tier to `tier.mjs` as a **ceiling**.
 The scope is captured against HEAD, so a round reviewing the previous round's
@@ -293,8 +290,8 @@ The groups it encodes, for tier M — one finder each, launched in the same mess
 - **code**: `A+B+D` (line scan, removed behaviour, pitfalls) · `C+E+F` (cross-file, intent fidelity, verification audit; add `H` if async/IO/shared state) · `Q+V` (quality + conventions). Add `G` security as a fourth finder when the change touches input, auth, files, network, shell, secrets, or HTML, and `X` as its own finder when the change touches something a user runs.
 - **docs/prose**: `P1+P3` (accuracy + consistency) · `P2+V` (completeness, reader fit, conventions). Add `P4` for skills, prompts, agent files, CLAUDE.md, runbooks.
 - **config/infra**: `K1+K2` in one finder.
-- **shape**: `S`, added automatically from round 3 (and by hand whenever one unit takes findings in two rounds running). It is the only angle that may answer "delete it", so give it the ledger — its input is the fix history, not the diff alone.
-- **cold run**: `X` is always its own finder and is never merged into another. Its reviewer is `self-review-cold-grader`, whose tool list has **no Bash**: `round.sh` runs `coldrun.sh` before the round, inside a sandbox that denies the network and confines writes, and the grader reads the transcript. That costs a whole finder wherever the change ships something runnable — including a third one in round 2 — and the alternative was a reviewer deciding for itself which invocation of possibly-broken code was safe to execute, which two shape reviewers running rejected as wrong-layer.
+- **shape**: `S`, added automatically from round 3 (and by hand whenever one unit takes findings in two rounds running). It is the only angle that may answer "delete it", so its input is the fix history and not the diff alone — `brief.mjs` puts the ledger's `## fixed` lines in the S row's brief, and in no other.
+- **cold run**: at tiers M and L, `X` is always its own finder and is never merged into another (at tier S the one compact finder grades the transcript itself, and has a shell for the rest of its angles). Its reviewer is `self-review-cold-grader`, whose tool list has **no Bash**: `round.sh` runs `coldrun.sh` before the round, inside a sandbox that denies the network and confines writes, and the grader reads the transcript. That costs a whole finder wherever the change ships something runnable — including a third one in round 2 — and the alternative was a reviewer deciding for itself which invocation of possibly-broken code was safe to execute, which two shape reviewers running rejected as wrong-layer.
 - **mixed**: take the union, but the cap (6 per round, at every tier) is per round, not per kind — merge groups within a kind to fit (e.g. code `A+B+D` · `C+E+F+H` · `G+Q+V`, docs `P1+P3` · `P2+P4+V`, config `K1+K2`), never drop a kind, and name in the report any angle that did not get its own finder. A finder still reviews one kind. `tier.mjs` applies this merge order itself and records it in `merged[]`.
 
 Tier L splits the groups: code `A+B` · `C+D` · `E+F` · `Q+V` · `X` · `G` · `H`
@@ -322,30 +319,15 @@ agent type, so a substitute is invisible to it *and* carries `Bash` — the gate
 stops seeing the edits and the one writing agent stops being the one that cannot
 reach a shell, which is both halves of that design gone in a single
 substitution. If the applier type is missing, apply the fixes yourself as §2e's
-fallback says, and say so in the report. Write the briefs with one call rather than by hand — assembling them costs 4–6
-calls per round and gets a section wrong sooner or later:
-
-`round.sh` wrote them; the Agent-call table it printed is the round's plan.
-
-`findings.mjs prior` writes the ≤ 10 findings past reviews of this repository
-recorded against the files this change touches (same file, then same directory,
-then the same class of finding), one line each. `--work <work>` is this review's
-work dir — the same one every other command in this skill gets; the review's
-identity is derived from it, so *this* review's own records stay out of its own
-briefs with nothing to retype. That is the same rule as the ledger: a finder is
-never told what was just fixed. The file is written even when it is empty, so
-the `&&` chain does not break on a repository with no memory yet.
-
-It writes one brief per `finders[]` row from the template in
-`references/briefs.md`: the angle text verbatim from the catalogue, the intent
-block, the scope pointer, the impact block at that row's depth, the dismissed
-ledger, the call budget, and a state file path
-(`<work>/round-<r>/state/<name>.jsonl`) the reviewer appends its findings to as
-it works — the lifeboat §2f salvages (the `state/` dir is made during scope
-capture, §0). Each brief is held to the token budget (`brief.maxTokens`) and
-says in its own header what it had to trim. Then it prints the Agent-call
-table: one line per finder with its name, agent type, model and brief path.
-Without `tier.json`, `--tier S|M|L` builds that tier's default plan.
+fallback says, and say so in the report. `round.sh` already wrote the briefs, and the Agent-call table it printed is the
+round's plan: one line per finder with its name, agent type, model and brief
+path. Each brief carries the intent block, the scope pointer, that row's angle
+text verbatim from the catalogue, the impact block at its depth, the ≤ 10 prior
+findings this repository recorded against these files, the dismissed ledger, a
+state-file path the reviewer appends candidates to as it works (the lifeboat
+§2f salvages), and the call budget — held to `brief.maxTokens`, saying in its
+own header what it had to trim. Without `tier.json`, `brief.mjs --tier S|M|L`
+builds that tier's default plan.
 
 **Pass the brief as a path, not as text**: the Agent prompt is
 `Read <brief path> and follow it.` — about 30 tokens instead of the ~1,300 an
@@ -391,6 +373,9 @@ undid something to clean up after itself, has taken uncommitted work with it.
 Then parse each finder's JSON. Give every candidate an id (`r1-1`, `r1-2`, …). An
 `omitted` count on a sixth candidate means that finder cut real findings: its
 angle is not covered — re-run it on a narrower scope or say so in the report.
+An empty `[]` from a large, logic-heavy change is the opposite worry: both the
+brief and the agent prompt tell finders to pass half-believed candidates
+through, so read that finder's transcript before trusting its silence.
 Merge candidates that point at the same line and mechanism, keeping the one
 with the most concrete failure scenario. Drop nothing else — a finder's
 low-confidence candidate is still a candidate; verification decides.
@@ -514,7 +499,7 @@ carried a `prior_id` — the id of the `prior.md` line it was re-raising, the ei
 characters that line shows in brackets
 — copy it onto the record unchanged. It is the finder's own answer to a question
 nothing downstream can reconstruct as well, and dropping it is silent: the
-record still writes, and the memory is then measured on a guess (DESIGN §4.4).
+record still writes, and the memory is then measured on a guess.
 
 The `record` call appends to a per-repository
 file under `~/.claude/self-review/findings/` (keyed by the hashed `origin`, so
@@ -602,22 +587,13 @@ less, not a counter running out. Everything else either goes again or escalates.
 round's fix changes what untrusted input may do — a permission, an exemption, a
 path the tool opens on someone else's say-so, anything the reviewed repository
 itself can set — the next round must carry one finder briefed on that boundary
-alone, told what the earlier attempts were and that each of them failed. The
-loop may not report converged while the newest bound has only ever been read by
-finders that were looking at something else. This plugin's own
-`tier.markerDeclaring` cost eight defects over six rounds — a glob that blinded
-every scan, then any config-kind file (`Dockerfile`, `docker-compose.yml`),
-then `../secret.json` walking out of the repo, then `package.json`, which npm
-executes, then the shipped default path itself, which any reviewed repo could
-fill with a 28-byte file — and every one after the first came from a finder
-pointed straight at it. Note what that fifth one was: the *fix* that removed
-the setting from the untrusted layer introduced it. Changing the shape of a
-bound is still a change to a bound, so it earns the same adversary as the patch
-it replaced. And note how it ended: round 7 asked §2e's question — is this the
-right solution, or a working version of the wrong one? — and deleted the
-mechanism. Six rounds of hardening bought less than one round of asking whether
-the thing needed to exist. When a bound keeps taking findings, that is evidence
-about the design, not just about the patch.
+alone, told what the earlier attempts were and that each of them failed. Say in
+the report which finder that was; the loop may not report converged while the
+newest bound has only ever been read by finders looking at something else.
+Changing the *shape* of a bound is still a change to a bound. And when a bound
+keeps taking findings, that is evidence about the design, not just about the
+patch: this plugin's own `tier.markerDeclaring` took eight defects over six
+rounds of hardening, and round 7 asked §2e's question and deleted it.
 
 The number of rounds is an **outcome, not a setting**: you stop when the work
 has converged or has provably stopped converging, not when a counter runs out.
@@ -631,7 +607,7 @@ trend:
   below stops the loop first. Its fixes are themselves unreviewed. Re-capture
   the full scope (so it includes the fixes) and run fresh finders — taper the
   count as the change is mostly already reviewed and only the fixes are new (≈2
-  at round 2, 1 from round 3 on, angle groups merged, never an angle dropped,
+  at round 2, compact + S from round 3 on, angle groups merged, never an angle dropped,
   and tell them to weight the changed lines while staying free to flag ripple
   elsewhere). They get the dismissed ledger and nothing about what you fixed, so
   each fix must pass as correct on its own. **You therefore never declare done
@@ -642,16 +618,16 @@ trend:
   command, not arithmetic you carry in your head:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/findings.mjs" converge --work <work> --round <N> --budget <budget>
+"${CLAUDE_PLUGIN_ROOT}/scripts/findings.mjs" converge --work <work> --round <N>
 ```
 
   It prints each round's `W = 3·blockers + 2·majors + 1·minors` over what that
   round **fixed**, compares the two rounds over the angles they share, and says
   `CONTINUE` or `ESCALATE`. The restriction is what "compare like with like"
-  means: angle S arrives by rule at round 3 (§0) and files every non-`sound`
+  means: angle S arrives by rule at round 3 (§2a) and files every non-`sound`
   verdict as a `blocker` by construction, so an unrestricted `W` reads as an
   increase and stops a loop that is converging — it did exactly that to this
-  tool's own review, 11 → 4 → 9 (DESIGN §7.7). A round still fixes everything
+  tool's own review, 11 → 4 → 9. A round still fixes everything
   it finds; a newly-arrived angle's findings are the baseline the *next* round
   is compared against. A finder that merged angles (`A+B+D`) counts as having
   run every one of them, and its weight joins the comparison only when all of
@@ -674,28 +650,13 @@ trend:
   anything, so it never changes `CONTINUE`/`ESCALATE`. What it can say, and what
   each one asks of you:
 
-  - `tree-guard engaged: N/M …` — the guard was watching. Nothing to do.
-  - `tree-guard did NOT match …` — it failed to recognise a name this plugin
-    itself generated, so those agents held an unguarded shell in the working
-    tree. **Report it to the user**; it is a defect in the plugin, and a review
-    in progress cannot fix its own installed guard.
-  - `tree-guard matched none of the N …` — the same defect from the other side.
-    Same action.
-  - `N shell calls under <name>, a name the guard does not cover` — an agent
-    whose `tools:` list declares no Bash ran one anyway. The frontmatter is not
-    enforced by the harness: measured 2026-09-03, nine agents declared without
-    Bash made sixty successful Bash calls. **Report it to the user**; the defect
-    is in the tool list, not in the guard.
-  - `recorded N shell calls this round and none carried a session id` — the
-    payload's shape changed, or something ran the hook by hand. The guard proved
-    nothing. Same action as an unopened log.
-  - `was asked about no subagent shell call this round` — the log was open and
-    nothing reached it. Measured 2026-09-04, every reviewer type in this plugin
-    runs a shell, so this is an anomaly, not an idle round: it means the guard
-    was not consulted. Same action as an unopened log.
-  - `no engagement log was opened for this round` — the audit ran and proved
-    nothing, which is not a pass. Say so in the report rather than reading the
-    absence of an alarm as an all-clear.
+  **`tree-guard engaged: N/M` is the only wording that is a pass.** Any other —
+  a name it did not match, a name it does not cover, rows with no session id, a
+  log nothing reached, no log at all — is a defect in the plugin or in an agent's
+  tool list, and a review in progress cannot fix its own installed guard. So the
+  action is the same for every one of them: copy the line into the report
+  **verbatim** and tell the user. The tool prints the diagnosis; do not restate
+  it from memory, and do not read the absence of an alarm as an all-clear.
 
   Nothing here blocks convergence, and the line is never absent: a round that
   opened no log, or opened one nothing reached, says so in words. Silence would
@@ -709,14 +670,18 @@ trend:
   - **oscillation** — a round flags a previous round's fix as wrong; do not
     flip it back, surface both positions;
   - the **round budget** — **2 rounds at tiers S and M, 6 at tier L** — which
-    is `--budget` above, so `converge` answers `STOP` itself instead of leaving
-    a ceiling in prose that cannot see the signal it is overriding. A spent
+    `converge` reads from this round's `tier.json` (`roundsCap`), so it answers
+    `STOP` itself instead of leaving a ceiling in prose that cannot see the
+    signal it is overriding. `--budget <n>` overrides it; you should not need
+    to pass one, and forgetting it no longer turns the cap off silently. A spent
     budget is a bound on cost, never a finding of health: report that round's
     fixes as unreviewed, and never write a `STOP` up as clean.
     **One extension, at any tier**: a round that **fixed a blocker or a major**
     buys exactly one more round — that fix is the kind a cap must not leave
-    unread — run as a single tier-S finder (compact brief) scoped to that
-    round's changed lines only. A round that fixed only minors, or only
+    unread — run with `--force S --reason "extension round: <the fix>"` so it is
+    the one compact finder, scoped to that round's changed lines only. Without
+    the force the ceiling holds the tier where it was and `round.sh` plans
+    compact + S like any other round 3. A round that fixed only minors, or only
     dismissed findings, buys nothing: nothing changed that a reader has not
     already seen (measured 2026-08-22: rounds 3+ rarely closed). The extension
     is single-shot — the round it buys cannot buy another — and `converge`
@@ -732,7 +697,7 @@ trend:
   you. That condition is load-bearing, not a formality — angles are compared as
   the *sets* a finder covered exactly so the taper above cannot make
   consecutive rounds incomparable, and for as long as it could, the budget was
-  the only thing that ever stopped this loop (DESIGN §7.9). A shrinking tail of
+  the only thing that ever stopped this loop. A shrinking tail of
   minors now runs to completion inside the budget instead of being cut off at
   an arbitrary number — which is not the same as buying more budget, and does
   not; a blocker that keeps coming back forces the user in instead of being
@@ -787,14 +752,14 @@ rule anywhere:
 
 ```
 Write  <work>/CONVERGED.json          # i.e. <scratchpad>/self-review/CONVERGED.json
-{"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep"}
+{"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author"}
 ```
 
 **Or run the script**, which logs itself and works when the work dir is not
 scratch:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep
+"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep --intent author
 ```
 
 ### The record
@@ -806,6 +771,7 @@ scratch:
 | `reason` | `not-applicable` only | `no-code-changed`, `user-declined`, `scratch-only`, `other` |
 | `note` | optional; required for `reason=other` | free text — the only free text there is, and it never enters the summary |
 | `tier` `adapter` | always | `tier` is `S`, `M` or `L` from `tier.json`; `adapter` from `impact.json` (`adapter=none` when impact.mjs wrote nothing) |
+| `intent` | `converged` / `not-converged` | `validated`, `author` or `skipped` — who read the intent **before** the code was written. Required, because an absent field and "nobody read it" would otherwise be the same state. `validated` is refused unless a `self-review-ticket-validator` completed before this task's first code change; the gate checks that order and never the verdict |
 | `forced` `computed` | when you overrode the tier | both `S`, `M` or `L` from `tier.json`, and written together — one alone does not say what was overridden |
 
 Anything that does not validate is **refused** — by the script in the same
@@ -859,48 +825,6 @@ Then the final report (format in `references/briefs.md`): outcome first —
 rounds, fixed, dismissed, open — then one line per fix, the open questions
 with recommendations, and the checks you ran with their real results.
 
-## Things that break the loop (and what to do instead)
-
-- **Waiting by ending the turn, or by polling.** Both are the failure this
-  skill is budgeted against — one measured at 30M tokens, the other at 2h49m of
-  silence. The wait is `wait.mjs`, in one call.
-- **Reviewing with your own eyes and calling it a round.** Spawn the agent;
-  tier S is one agent, not zero.
-- **Spawning a panel.** Fourteen finders on one change is not thoroughness,
-  it is the budget. The tier table is the ceiling.
-- **Editing while a round is in flight.** Wait for the last finder; then act.
-- **Fixing by hand what you dispatched an applier for.** Two writers in one
-  tree in one round. Rule on `blocked` after it reports; never edit while it
-  runs.
-- **Two appliers in one round, or one per finding.** Sequential over the
-  round's directives is the design; parallel appliers collide in the tree and
-  each re-pays the context.
-- **Finders that self-censor.** The brief and the agent prompt both say pass
-  half-believed candidates through. If a finder returns `[]` on a large,
-  logic-heavy change, check its transcript before trusting it.
-- **Dismissing without a counter-proof**, or "fixing" a REFUTED finding to be
-  safe — the first ships bugs, the second adds them. The ledger carries the
-  proof either way.
-- **Telling the next round what you fixed.** It biases them into confirming.
-  They get the dismissed list only.
-- **Re-spawning a dead reviewer without salvaging.** Its transcript and state
-  file (§2f) hold what it already found; a fresh spawn re-pays that context
-  from zero.
-- **Scope drift.** Fixes are minimal; a refactor you noticed goes in the report
-  as a suggestion, not into this turn.
-- **Declaring clean on a round that merely found less.** Clean is zero (§3). A
-  round that found *only manufactured* findings is a different, deliberate
-  judgment — "effectively converged", each survivor refuted with a written
-  reason (§3) — not "I found less real stuff and I'm tired". If you can't tell
-  which it is, escalate; don't declare.
-- **Reviewing scratch, generated, or vendored files.** Exclude them from scope.
-- **Batching the marker with a real change.** A write in the same command or
-  a tool call in the same message shares its position, and the gate cannot
-  tell which came first, so it never clears. A message of its own (scratch
-  cleanup beside it is fine).
-- **Skipping the marker** or running it before the last fix. The gate will
-  send you back; do it in order.
-
 ## On demand and beyond files
 
 `/self-review <target>` reviews whatever is named — a path, "the plan above",
@@ -931,5 +855,5 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/coldrun.sh` — the contained cold run behind angle `X`; run by `round.sh`, never by a reviewer
 - `hooks/self-review-gate.mjs` — the Stop gate that enforces all of this
 - `hooks/poll-guard.mjs` — the PreToolUse hook that denies repeated status checks
-- `hooks/lib/hook.mjs` — shared fail-open `runHook()` entry point of both hooks
+- `hooks/lib/hook.mjs` — shared fail-open `runHook()` entry point of the hooks
 - `config/defaults.json` — gate exemptions, the hook limits, and the `tier` / `impact` / `brief` / `preflight` rules; override per user in `~/.claude/self-review/config.json`. A repository's own `.self-review.json` is **default closed**: it may only *add* marker words to `tier.riskPaths` and `tier.riskContent`, so a repository can make its own review stricter and nothing else

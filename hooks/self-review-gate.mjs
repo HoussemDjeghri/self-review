@@ -173,6 +173,13 @@ const APPLIER_TYPE = /(?:^|:)self-review-applier$/;
 // `reviewerState` and `externalChangeAt`. Hardcoded for the same reasons as the
 // applier above.
 const ORCHESTRATOR_TYPE = /(?:^|:)self-review-orchestrator$/;
+// The ticket validator: the one reader of the intent that ran BEFORE the code
+// existed. It is the only evidence the marker's `intent=validated` can have,
+// and the gate checks its ORDERING, never its verdict — a `revise` the session
+// acted on is as valid as a `sound`, and grading the ticket here would make
+// this the stamp the whole feature exists not to be. Hardcoded for the same
+// reasons as the two above.
+const TICKET_VALIDATOR_TYPE = /(?:^|:)self-review-ticket-validator$/;
 // "An agent told to edit is a change source, anchored at its last dispatch or
 // completion" is ONE rule over two types, not two rules. Keeping it one is what
 // makes the mixed session — a failed orchestrator and a main-chain applier in
@@ -194,16 +201,27 @@ const isEditor = (type) => APPLIER_TYPE.test(type) || ORCHESTRATOR_TYPE.test(typ
 // scored the effective `converged` as `not-applicable` and released the turn
 // with no reviewer behind it: the exact hole this rule exists to close, entered
 // through the parser.
-const MARKER_OUTCOME_RE = /\boutcome=(\S+)/;
 const MARKER_LINE_RE = /^SELF-REVIEW CONVERGED\b.*$/gm;
-function scriptOutcome(text) {
+// Any one field of that last line. `outcome` was the only reader until `intent`
+// arrived; a second hand-written regex over the same string is the drift this
+// file has already paid for twice, so both go through here.
+function scriptField(text, field) {
   const lines = text.match(MARKER_LINE_RE);
-  return lines ? MARKER_OUTCOME_RE.exec(lines[lines.length - 1])?.[1] ?? null : null;
+  if (!lines) return null;
+  return new RegExp(`\\b${field}=(\\S+)`).exec(lines[lines.length - 1])?.[1] ?? null;
 }
 // The two ways to write the record, spelled once. Both are copied verbatim out
 // of a block reason into a tool call, so they carry no placeholders a model has
 // to resolve except the numbers themselves.
-const MARKER_BODY = `Write {"outcome":"converged","rounds":2,"fixed":3,"dismissed":1,"open":0} (your real counts) to <your scratchpad>/self-review/CONVERGED.json (a scratch write needs no permission rule), or run: ${MARKER_INVOCATION} --converged --rounds 2 --fixed 3 --dismissed 1 --open 0`;
+//
+// `intent` is spelled `author` rather than left as a placeholder for the same
+// reason, and the direction of the error is deliberate: a session that copies
+// this without thinking under-claims, which is honest, while `validated` is the
+// one value the gate checks and would be refused anyway. A body the gate hands
+// out must validate — this text and `validateMarker` are one contract, and the
+// version that omitted `intent` told the session to write a record the very
+// next call refused.
+const MARKER_BODY = `Write {"outcome":"converged","rounds":2,"fixed":3,"dismissed":1,"open":0,"intent":"author"} (your real counts; intent is validated, author or skipped) to <your scratchpad>/self-review/CONVERGED.json (a scratch write needs no permission rule), or run: ${MARKER_INVOCATION} --converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author`;
 const NA_BODY = `Write {"outcome":"not-applicable","reason":"user-declined"} to that same path, or run: ${MARKER_INVOCATION} --not-applicable user-declined`;
 const MAX_REMINDERS = intEnv("SELF_REVIEW_GATE_MAX_REMINDERS", CONFIG.gate.maxReminders);
 const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
@@ -549,37 +567,73 @@ function agentEdited(entry) {
   return !!stats && ((stats.editFileCount ?? 0) > 0 || (stats.linesAdded ?? 0) > 0 || (stats.linesRemoved ?? 0) > 0);
 }
 
+/**
+ * Every write the transcript itself reports in `(from, to)`, in order, as
+ * `{ index, kind, ... }`. One enumerator, two callers: the generic block asks
+ * WHETHER this turn changed code, the intent check asks WHEN this task first
+ * did, and they must not disagree about what a write is.
+ *
+ * They did. The intent check was directed to share this branch and was written
+ * as a second loop instead, and the copy dropped one of `bashWriteTargets`'
+ * three answers — it collapsed "a write I cannot name" into "no write". A code
+ * write through an interpreter then armed the gate and skipped the ordering
+ * check, accepting `intent=validated` with provably zero validators. That is
+ * what a duplicated enumerator costs, and it is why there is now one.
+ *
+ * `unresolved` is not a guess and not a git fallback: it is the parser's own
+ * report that a write happened at this index whose non-exempt targets it could
+ * not name. Only `collectChanges` asks git, and only to learn WHICH files.
+ */
+function* writeEvents(entries, from, to, cwd) {
+  for (let index = from + 1; index < to; index += 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    for (const use of toolUses(entry)) {
+      if (EDIT_TOOLS.has(use.name)) {
+        const file = use.input?.file_path ?? use.input?.notebook_path;
+        if (file && !isExempt(file)) yield { index, kind: "file", file };
+      } else if (use.name === "Bash") {
+        // Three answers, kept as three: null is no write, [] is a write whose
+        // targets did not resolve, a list names them. bashWriteTargets has
+        // already dropped the exempt paths, so no caller filters them again.
+        const targets = bashWriteTargets(use.input?.command, cwd);
+        if (targets) yield { index, kind: "bash", targets, unresolved: targets.length === 0 };
+      }
+    }
+    if (entry.type === "user" && agentEdited(entry)) {
+      yield { index, kind: "agent", agentType: entry.toolUseResult.agentType ?? "subagent" };
+    }
+  }
+}
+
+// The first write of `(from, to)`, as the event rather than its index: the
+// refusal text needs to say whether the gate could name what was written.
+function firstWriteEvent(entries, from, to, cwd) {
+  for (const event of writeEvents(entries, from, to, cwd)) return event;
+  return null;
+}
+
 function collectChanges(turn, cwd, since) {
   const changes = [];
   // One git call per Stop at most, and only when a command shape needs it.
   let evidence;
   const witnessed = () => (evidence === undefined ? (evidence = writesSince(cwd, since)) : evidence);
-  turn.forEach((entry, index) => {
-    for (const use of toolUses(entry)) {
-      if (EDIT_TOOLS.has(use.name)) {
-        const file = use.input?.file_path ?? use.input?.notebook_path;
-        if (file && !isExempt(file)) changes.push({ index, kind: "file", file });
-      } else if (use.name === "Bash") {
-        const targets = bashWriteTargets(use.input?.command, cwd);
-        if (!targets) continue;
-        // A resolvable target decides on its own: it may be outside the repo,
-        // where git has nothing to say about it.
-        if (targets.length) { changes.push({ index, kind: "bash", files: targets }); continue; }
-        const written = witnessed();
-        if (!Array.isArray(written)) { changes.push({ index, kind: "bash", files: [], unresolved: written }); continue; }
-        const gated = written.filter((file) => !isExempt(file));
-        if (gated.length) { changes.push({ index, kind: "bash", files: gated }); continue; }
-        // Every file the turn touched is exempt: prose, config, scratch. That
-        // is a real answer — the artifact was looked at — so no change is
-        // recorded. An empty list is not: the command wrote something the
-        // evidence cannot account for, and the gate falls back to blocking.
-        if (!written.length) changes.push({ index, kind: "bash", files: [], unresolved: "nothing in the working tree changed since this turn began" });
-      }
-    }
-    if (entry.type === "user" && agentEdited(entry)) {
-      changes.push({ index, kind: "agent", agentType: entry.toolUseResult.agentType ?? "subagent" });
-    }
-  });
+  for (const event of writeEvents(turn, -1, turn.length, cwd)) {
+    if (event.kind === "file") { changes.push({ index: event.index, kind: "file", file: event.file }); continue; }
+    if (event.kind === "agent") { changes.push({ index: event.index, kind: "agent", agentType: event.agentType }); continue; }
+    // A resolvable target decides on its own: it may be outside the repo,
+    // where git has nothing to say about it.
+    if (!event.unresolved) { changes.push({ index: event.index, kind: "bash", files: event.targets }); continue; }
+    const written = witnessed();
+    if (!Array.isArray(written)) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: written }); continue; }
+    const gated = written.filter((file) => !isExempt(file));
+    if (gated.length) { changes.push({ index: event.index, kind: "bash", files: gated }); continue; }
+    // Every file the turn touched is exempt: prose, config, scratch. That is a
+    // real answer — the artifact was looked at — so no change is recorded. An
+    // empty list is not: the command wrote something the evidence cannot
+    // account for, and the gate falls back to blocking.
+    if (!written.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "nothing in the working tree changed since this turn began" });
+  }
   return changes;
 }
 
@@ -653,21 +707,25 @@ function fileMarkerSummary(use, results) {
 // unknown is never gated, because refusing on a value we failed to parse is a
 // block bought with a guess.
 function lastMarker(turn, results, cwd) {
-  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null;
+  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null;
   turn.forEach((entry, index) => {
     for (const use of toolUses(entry)) {
       const text = results.get(use.id) ?? "";
       if (use.name === "Bash" && invokesMarkerScript(use.input?.command ?? "", cwd) && MARKER_TOKEN_RE.test(text)) {
-        at = index; fileMarker = null; outcome = scriptOutcome(text);
+        at = index; fileMarker = null;
+        outcome = scriptField(text, "outcome");
+        intent = scriptField(text, "intent");
         continue;
       }
       const written = fileMarkerSummary(use, results);
       if (written === null) continue;
       if (written.problems) { rejectedAt = index; rejected = written.problems; continue; }
-      at = index; fileMarker = { id: use.id, summary: written.summary }; outcome = written.record.outcome;
+      at = index; fileMarker = { id: use.id, summary: written.summary };
+      outcome = written.record.outcome;
+      intent = written.record.intent ?? null;
     }
   });
-  return { at, fileMarker, outcome, rejected: rejectedAt > at ? rejected : null };
+  return { at, fileMarker, outcome, intent, rejected: rejectedAt > at ? rejected : null };
 }
 
 // converged.sh logs its own run; the file form is logged here, once per marker:
@@ -889,6 +947,14 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt) {
 // the resume still blocked. The max also states the honest thing: a resume is a
 // fresh dispatch of edit work, so it needs a marker after it, not before it.
 const editorAnchor = (a) => Math.max(a.launchedAt, a.resumedAt ?? -1, a.doneAt);
+// Its counterpart, and the reason there are two. `editorAnchor` is an upper
+// bound because the reviewer check asks when an editor's edits STOPPED being
+// able to move; the intent check asks when they could first have STARTED, which
+// is the launch and never the completion. Feeding one index to both accepted a
+// validator that finished while an applier was already editing — the exact
+// claim `intent=validated` exists to deny. A resume does not lower it: the
+// launch is still the earliest byte this editor could have written.
+const editorStart = (a) => a.launchedAt;
 // Whole-window indices, like every other agent record.
 const appliersIn = (agents) => agents.filter((a) => APPLIER_TYPE.test(a.type));
 const editorsIn = (agents) => agents.filter((a) => isEditor(a.type));
@@ -904,7 +970,59 @@ const UNREVIEWED_TAG = "outcome=converged claims a review ran";
 const countUnreviewed = (turn) =>
   turn.filter((e) => e.type === "user" && e.isMeta && textOf(e.message?.content).includes(UNREVIEWED_TAG)).length;
 
-function unreviewedReason(state, changes, lastChangeAt, cwd) {
+// The same self-resetting-counter problem as above, one sentence of its own: a
+// model refused here HAS marked, so re-marking moves `markerAt` past every
+// reminder and a count anchored on it would never reach the release.
+const UNVALIDATED_TAG = "intent=validated claims a fresh reader saw the ticket";
+const countUnvalidated = (turn) =>
+  turn.filter((e) => e.type === "user" && e.isMeta && textOf(e.message?.content).includes(UNVALIDATED_TAG)).length;
+
+/**
+ * The whole of `intent=validated`: did a ticket validator COMPLETE inside THIS
+ * TASK's window, before the first change of that same window?
+ *
+ * Ordering, and nothing else. The verdict is not read — a `revise` the session
+ * acted on is as good as a `sound`, and a gate that graded the ticket would be
+ * the rubber stamp the field exists not to be. Completion rather than launch,
+ * for the same reason the reviewer check uses it: a validator still running
+ * when the first edit landed did not read a ticket the code had not yet
+ * contradicted.
+ *
+ * Both bounds are the task window's, not the whole session's. `taskStart` is
+ * the lower one: a validator that finished for an earlier, unrelated task never
+ * satisfies this one, and reading the whole window let a single validator
+ * anywhere in a session unlock `validated` for every later turn. `firstChange`
+ * is the upper one — the earliest change of ANY kind inside the same window,
+ * the lead's own edit or an editing subagent's launch, because "before the
+ * code" means before the first byte of it, whoever wrote it — its launch, not
+ * its completion, because completion is when its edits stopped moving and this
+ * question is about when they could have started.
+ */
+const validatedBeforeCoding = (agents, taskStart, firstChange) =>
+  agents.some((a) => TICKET_VALIDATOR_TYPE.test(a.type) && a.doneAt !== -1
+    && a.doneAt > taskStart && a.doneAt < firstChange);
+
+function unvalidatedReason(unnamedAt = null) {
+  return [
+    `${GATE_TAG} The marker was refused: ${UNVALIDATED_TAG}, but no self-review-ticket-validator completed before this task's first code change.`,
+    "",
+    ...(unnamedAt === null ? [] : [
+      `The first change in this task is a shell command at entry ${unnamedAt} whose write target the gate could not resolve. It wrote something; the gate cannot say what. If it wrote only prose, config or scratch, the third exit below applies.`,
+      "",
+    ]),
+    "`intent=validated` is a claim about ORDER, not about quality: a fresh reader saw the intent while it could still change the code. Nothing here reads the validator's verdict — a `revise` you acted on counts exactly as much as a `sound`.",
+    "",
+    "Three honest ways forward, and each ends the turn:",
+    "",
+    "  - You wrote the intent yourself and no one else read it before you coded. That is `--intent author`, and it is never refused.",
+    "  - You decided the task did not need a validator. That is `--intent skipped`.",
+    '  - Your validator did finish before your first edit — in this turn or an earlier turn of this task — and this refusal is a late idle notice. That is `--intent author --note "validator <name> completed before the first edit; idle notice landed late"` — the note is the only free text the marker has, so it is where that record goes.',
+    "",
+    "Re-run the marker with one of those, in a message of its own. Do not spawn a validator now: it would read a ticket the code has already answered, which is the one thing this field is here to make visible.",
+  ].join("\n");
+}
+
+function unreviewedReason(state, changes, lastChangeAt, cwd, hasOrchestrator = false) {
   // Named through describeChanges, which is the one place that knows a change
   // may be a file, a shell command whose targets did not resolve, or a
   // subagent's edit — reading `.file` off it directly prints "undefined" for
@@ -926,7 +1044,14 @@ function unreviewedReason(state, changes, lastChangeAt, cwd) {
     // A model whose only reviewer WAS an orchestrator would otherwise read a
     // refusal flatly denying any reviewer ran, and start again from zero — which
     // spends in the main session exactly what delegating the loop saves.
-    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder, self-review-cold-grader or self-review-orchestrator) completed between the last change — your own edit, or an editing subagent finishing — and the marker.`,
+    //
+    // But it is named only when one is actually HERE. F10i ruled the
+    // orchestrator does not ship, so an unconditional mention sends every real
+    // install looking for an agent type that is not in `plugin/agents/`, and a
+    // refusal must only ever name a way forward that exists. Both halves of the
+    // original finding survive this: the session whose only reviewer was an
+    // orchestrator still sees it named, because it has one.
+    `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder, self-review-cold-grader${hasOrchestrator ? " or self-review-orchestrator" : ""}) completed between the last change — your own edit, or an editing subagent finishing — and the marker.`,
     middle,
     `${action} ${MARKER_BODY}`,
     `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts. If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
@@ -939,7 +1064,11 @@ function evaluate(entries, cwd) {
   const lastMessage = [...entries].reverse().find((e) => e.type === "user" || e.type === "assistant");
   if (!lastMessage || isInterrupt(lastMessage)) return null;
 
-  const boundary = entries.map(isHumanPrompt).lastIndexOf(true);
+  // Every human prompt, not just the last: the task window reaches back across
+  // the ones an agent was working through. `boundary` stays the last of them.
+  const humanAt = [];
+  entries.forEach((entry, index) => { if (isHumanPrompt(entry)) humanAt.push(index); });
+  const boundary = humanAt.length ? humanAt[humanAt.length - 1] : -1;
   const turn = entries.slice(boundary + 1);
   // When the turn began, by the transcript's own clock: the cutoff for
   // "this turn wrote it" in writesSince().
@@ -990,7 +1119,7 @@ function evaluate(entries, cwd) {
   // prompt later. logFileMarker is safe at window scope because it already
   // dedupes on the marker id anywhere in the log.
   const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
-  const { at: markerAtW, fileMarker, outcome } = lastMarker(entries, results, cwd);
+  const { at: markerAtW, fileMarker, outcome, intent } = lastMarker(entries, results, cwd);
   const lastChangeAt = changes.length ? Math.max(...changes.map((c) => c.index)) : -1;
   // ONE INDEX FRAME, declared before it is used twice below. markerAt and
   // lastChangeAt are turn-relative; agent records carry whole-window indices.
@@ -1027,6 +1156,39 @@ function evaluate(entries, cwd) {
   // It read "you changed  after it finished" in exactly the scenario the applier
   // arming exists to catch.
   const described = inFrame.filter((c) => (c.kind !== "applier" && c.kind !== "orchestrator") || c.index > markerAtW);
+
+  // THIS TASK'S WINDOW, for the intent check alone. Every index here is a
+  // WINDOW index. `intent=validated` is a claim about one ticket, so both halves
+  // of it — the validator's completion and the first byte of code it has to
+  // precede — must be read inside the task the marker is about. Read over the
+  // whole window instead, the check failed in both directions at once: an
+  // orchestrator from an already-marked round collapsed `Math.min` onto its own
+  // launch so no validator could beat it, and one validator anywhere in a
+  // session permanently unlocked `validated` for every later unrelated turn.
+  //
+  // `lastMarker` sets `at` only for an accepted marker: a rejected file write
+  // sets `rejectedAt`, and a script call whose output lacks the token sets
+  // nothing. So this is unambiguous without reading any outcome.
+  const prevMarkerAt = markerAtW >= 0 ? lastMarker(entries.slice(0, markerAtW), results, cwd).at : -1;
+  // A human prompt is an INTERJECTION when some agent launched before it was
+  // still running across it; it is a TASK BOUNDARY when none was. Turn-scoping
+  // on `boundary` alone reintroduces the 2026-08-22 false block, because an
+  // applier launched before an interjection and completing after it is exactly
+  // the shape that was made invisible. A missing completion counts as spanning
+  // only while the agent is still `pending` — `!done && interjections <
+  // PENDING_INTERJECTION_LIMIT` — which is what bounds a crashed agent to two
+  // prompts. Testing `doneAt === -1` alone instead read every crashed agent as
+  // eternally live, so one anywhere in the session pinned `taskStart` at -1 and
+  // handed a later, unrelated task an earlier task's validator: the exact false
+  // accept the window exists to prevent, reached from the other side.
+  const spans = (h) => agents.some((a) => a.launchedAt < h && (a.doneAt > h || (a.doneAt === -1 && a.pending)));
+  let spanStart = -1;
+  for (let i = humanAt.length - 1; i >= 0; i -= 1) {
+    if (!spans(humanAt[i])) { spanStart = humanAt[i]; break; }
+  }
+  // The later of the two cuts. With no previous marker and nothing spanning, this
+  // is `boundary` — which is what refuses a validator run for an earlier task.
+  const taskStart = Math.max(spanStart, prevMarkerAt);
 
   if (markerAtW > changeAtW) {
     // Only an affirmative `converged` is gated: the other two outcomes are
@@ -1076,8 +1238,45 @@ function evaluate(entries, cwd) {
       }
       return {
         decision: "block",
-        reason: unreviewedReason(state, inFrame, changeAtW, cwd),
+        reason: unreviewedReason(state, inFrame, changeAtW, cwd, orchestrators.length > 0),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
+      };
+    }
+    // The intent claim, after the reviewer one: both can fail at once, and the
+    // review is the older and larger obligation, so it is the one named first.
+    // Not `inFrame`: that list carries completion anchors, which are the wrong
+    // bound for this question (see `editorStart`).
+    //
+    // The earliest byte of this task's code, from either hand: a main-chain
+    // edit, or an editing subagent's LAUNCH. `editorStart`, never
+    // `editorAnchor` — see its comment for why the two checks need opposite
+    // bounds — and both restricted to this task's window, because a validator
+    // is a claim about this ticket and an editor from a finished task is not
+    // evidence about it.
+    const written = firstWriteEvent(entries, taskStart, markerAtW, cwd);
+    const firstChange = Math.min(
+      written ? written.index : Infinity,
+      ...appliers.filter((a) => a.launchedAt > taskStart).map(editorStart),
+      ...orchestrators.filter((a) => a.launchedAt > taskStart).map(editorStart),
+    );
+    // An unresolved first write is still the task's first write, and the
+    // refusal says so: the session knows what its own shell command did, and
+    // the third exit is right there if it wrote only prose, config or scratch.
+    const unnamed = written !== null && written.unresolved === true && written.index === firstChange;
+    // Not `inFrame.length`: a marker whose task window holds no change has
+    // nothing to be ordered against, and refusing it would refuse a marker
+    // re-seen at a later Stop because a whole-window applier kept the gate armed.
+    if (intent === "validated" && Number.isFinite(firstChange) && !validatedBeforeCoding(agents, taskStart, firstChange)) {
+      const refusals = countUnvalidated(turn);
+      if (refusals >= MAX_REMINDERS) {
+        return {
+          systemMessage: `self-review gate: released after ${refusals} refusals of intent=validated with no ticket-validator completion before the first change — the intent may never have been read. (SELF_REVIEW_GATE=off disables the gate.)`,
+        };
+      }
+      return {
+        decision: "block",
+        reason: unvalidatedReason(unnamed ? written.index : null),
+        systemMessage: `self-review gate: intent=validated refused — no ticket-validator completed before this task's first code change`,
       };
     }
     if (fileMarker) logFileMarker(fileMarker, cwd);

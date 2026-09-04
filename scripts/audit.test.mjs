@@ -509,7 +509,7 @@ test("a not-applicable window is reported beside n, not divided into it", () => 
 test("the typed script marker is read as the record it is, not as a summary string", () => {
   const file = session([
     assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
-    assistant("2026-08-23T10:30:00Z", [bashMarkerTyped("--converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --tier M --adapter grep")]),
+    assistant("2026-08-23T10:30:00Z", [bashMarkerTyped("--converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --tier M --adapter grep --intent author")]),
   ]);
   const [review] = audit(file).reviews;
   assert.equal(review.outcome, "converged");
@@ -520,7 +520,7 @@ test("the typed script marker is read as the record it is, not as a summary stri
 test("the typed file marker keeps its outcome, so a not-converged review is not read as clean", () => {
   const file = session([
     assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
-    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, tier: "L" })]),
+    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, tier: "L", intent: "author" })]),
   ]);
   const [review] = audit(file).reviews;
   assert.equal(review.outcome, "not-converged");
@@ -530,7 +530,7 @@ test("the typed file marker keeps its outcome, so a not-converged review is not 
 test("a --note never reaches the summary, however it is quoted", () => {
   const file = session([
     assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
-    assistant("2026-08-23T10:30:00Z", [bashMarkerTyped('--converged --rounds 1 --fixed 0 --dismissed 0 --open 0 --note "rounds=99 --open 7 prose"')]),
+    assistant("2026-08-23T10:30:00Z", [bashMarkerTyped('--converged --rounds 1 --fixed 0 --dismissed 0 --open 0 --intent author --note "rounds=99 --open 7 prose"')]),
   ]);
   const [review] = audit(file).reviews;
   assert.deepEqual([review.rounds, review.open], [1, 0], "the note's words must not be read as flags");

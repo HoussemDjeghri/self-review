@@ -35,6 +35,16 @@
  *   forced/computed optional, S | M | L, written together when the loop took a
  *                   tier other than the one the rules chose
  *   adapter        optional, open vocabulary — the loop names its scope adapter
+ *   intent    validated | author | skipped                      (always, for
+ *             the two counted outcomes) — who read the intent before the code
+ *             was written. `validated` means a fresh ticket-validator did, and
+ *             the Stop gate refuses that word unless one COMPLETED before this
+ *             turn's first code edit. The other two are honest claims about the
+ *             author's own account and are never gated. It is required rather
+ *             than optional because an absent field and "nobody read it" are
+ *             the same state wearing different clothes, and the report line
+ *             this feeds has to be true on every review, not on the ones that
+ *             remembered.
  *
  * `note` is deliberately NOT part of the formatted summary. Free text inside a
  * key=value string is how prose got in; it travels as its own field instead, so
@@ -48,8 +58,13 @@ export const TIERS = ["S", "M", "L"];
 // `forced`/`computed` are here because SKILL.md tells the loop to record an
 // override, and audit.mjs reads both; without them the CLI refused the whole
 // marker as an unknown flag and the file form dropped them silently.
-export const LABELS = ["tier", "adapter", "forced", "computed"];
+export const LABELS = ["tier", "adapter", "forced", "computed", "intent"];
 const TIER_LABELS = new Set(["tier", "forced", "computed"]);
+// Who read the intent before the code existed. `validated` is the only one the
+// Stop gate can check, and it checks ordering — a validator completion before
+// the first edit — never the verdict: grading the ticket would be the stamp
+// this field exists to avoid being.
+export const INTENT_STATES = ["validated", "author", "skipped"];
 
 export const isCounted = (outcome) => outcome === "converged" || outcome === "not-converged";
 const list = (values) => values.join(" | ");
@@ -157,7 +172,16 @@ export function validateMarker(fields = {}) {
     // adapter is an open vocabulary — the loop names its own scope adapters —
     // but a tier outside S|M|L opens an audit bucket nothing else writes.
     else if (TIER_LABELS.has(key) && !TIERS.includes(value)) problems.push(`${key}="${value}" is not one of ${list(TIERS)}.`);
+    else if (key === "intent" && !INTENT_STATES.includes(value)) problems.push(`intent="${value}" is not one of ${list(INTENT_STATES)}.`);
     else record[key] = value;
+  }
+
+  // Required on a counted outcome, for the reason in the header: optional here
+  // would mean every review that forgot the flag reads the same as one nobody
+  // groomed, and the report line would be true only when it was remembered.
+  // `not-applicable` is exempt — there was no code to have an intent about.
+  if (isCounted(outcome) && !has("intent")) {
+    problems.push(`intent is required for outcome=${outcome} (${list(INTENT_STATES)}) — say who read the intent before the code was written.`);
   }
 
   // Half an override is unreadable: `forced` alone does not say what was

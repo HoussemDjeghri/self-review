@@ -496,6 +496,31 @@ test("CLI: converge says the guard proved nothing when no engagement log was ope
   assert.match(opened.stdout, /# tree-guard/, "an open log still gets a line of its own");
 });
 
+test("CLI: converge takes the round cap from tier.json, so forgetting a flag cannot disable it", () => {
+  // The cap already existed — tier.mjs computes it and writes `roundsCap` into
+  // the round's plan. Requiring it to be retyped as `--budget` meant that
+  // forgetting the flag silently answered on W alone and reported nothing about
+  // a spent budget, which is the only bound on cost the loop has.
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = path.join(workdir(), "scratchpad", "self-review");
+  mkdirSync(path.join(work, "round-2"), { recursive: true });
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  const fill = (round, entries) => run(["record", "--work", work, "--round", String(round), "--log-dir", logDir], JSON.stringify(entries));
+  fill(1, [candidate({ severity: "blocker", angle: "A" }), candidate({ severity: "major", angle: "A" })]);
+  fill(2, [candidate({ severity: "minor", angle: "A" })]);
+
+  const blind = run(["converge", "--work", work, "--round", "2", "--log-dir", logDir]);
+  assert.match(blind.stdout, /none found: W only/, "no plan for the round means the cap is genuinely unknown, and it says so");
+
+  writeFileSync(path.join(work, "round-2", "tier.json"), JSON.stringify({ tier: "M", round: 2, roundsCap: 2 }));
+  const read = run(["converge", "--work", work, "--round", "2", "--log-dir", logDir]);
+  assert.match(read.stdout, /round 2's tier\.json/, "the cap is read from the plan the round already wrote");
+  assert.match(read.stdout, /STOP|ESCALATE/, "and it is actually applied, not merely printed");
+
+  const given = run(["converge", "--work", work, "--round", "2", "--budget", "6", "--log-dir", logDir]);
+  assert.match(given.stdout, /budget \(given\)/, "an explicit --budget still wins, so forcing a cap stays possible");
+});
+
 test("CLI: converge logs its decision, so a granted round leaves a trace", () => {
   // `earned` is the one rule that grants a round past the budget, and it was
   // only ever printed: afterwards, a review that ran round budget+1 looked
@@ -692,4 +717,28 @@ test("F3: a non-object entry is one problem, not a crash on the rest of them", (
   assert.match(message, /^ {2}record 1: expected an object, got "not an object"$/m);
   assert.match(message, /^ {2}record 2: severity —/m);
   assert.match(message, /^ {2}record 3: expected an object, got 42$/m);
+});
+
+// The class vocabulary lives in three places that are edited separately: this
+// map, the finder's output block, and the cold grader's. It drifted once — the
+// grader's `cold-run` was never added here, so `record` refused every angle-X
+// finding with "class is not one the finders use" and the round's own ledger
+// disagreed with the repository's. Deriving the vocabulary from the shipped
+// agent files is what makes the next added class fail here instead of there.
+test("every class the shipped reviewers can emit is one `record` accepts", () => {
+  const agentDir = path.join(HERE, "..", "agents");
+  const emitted = new Set();
+  for (const file of ["self-review-finder.md", "self-review-cold-grader.md"]) {
+    const text = readFileSync(path.join(agentDir, file), "utf8");
+    const line = text.split("\n").find((l) => l.includes('"category":'));
+    assert.ok(line, `${file}: no "category" line — the output block moved, and this test is now blind`);
+    for (const value of line.replace(/.*"category":\s*"/, "").replace(/",?\s*$/, "").split("|")) {
+      emitted.add(value.trim());
+    }
+  }
+  assert.ok(emitted.size >= 20, `only ${emitted.size} classes parsed — the parse is wrong, not the vocabulary`);
+  for (const cls of emitted) {
+    assert.equal(recordProblem({ round: 1, verdict: "fixed", severity: "major", class: cls, angle: "X", summary: "s", review: "r", file: "a.mjs" }), null,
+      `class "${cls}" is emitted by a shipped reviewer and refused by record`);
+  }
 });

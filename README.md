@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.7.3" src="https://img.shields.io/badge/version-0.7.3-191919">
+  <img alt="version 0.7.4" src="https://img.shields.io/badge/version-0.7.4-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -70,6 +70,14 @@ enforcing:
   strictly drops; a plateau, an oscillation (a round calling a previous fix
   wrong), or the round backstop stops it and hands the state to you. It never
   reports "clean" because it ran out of rounds.
+- **Convergence is a claim about the code against the stated intent, and never
+  a claim that the intent was right.** Every reviewer is told the intent's "out
+  of scope on purpose" line is deliberate, so the author's own scoping is exempt
+  from review by construction — which is why a correct implementation of a wrong
+  ticket converges. The `intent` field on the marker records who read the ticket
+  *before* the code existed: `validated` (a `ticket` skill validator did, and the
+  gate checked the ordering), `author` (you wrote it and nobody else read it), or
+  `skipped`. All three are honest; only `validated` is checked.
 - **Prose is not code.** Markdown, JSON/YAML, data and images are exempt from
   the gate by default and reviewed on demand (`/self-review <path>`) — a review
   loop that churns on a README costs tokens and changes nothing.
@@ -158,7 +166,7 @@ Two forms; the gate accepts either, after the last change, in a message of its
 own:
 
 ```
-Write <scratchpad>/self-review/CONVERGED.json   {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M"}
+Write <scratchpad>/self-review/CONVERGED.json   {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "intent": "author"}
 ```
 
 The file form is the default: a scratch write needs no permission rule, so it
@@ -166,12 +174,14 @@ works on any machine and under any permission mode. It counts only under a
 scratch path — a `CONVERGED.json` committed in your project is not a marker.
 
 The record is typed, and both forms refuse anything that is not: the outcome is
-`converged`, `not-converged` or `not-applicable`, the counts are integers, and
+`converged`, `not-converged` or `not-applicable`, the counts are integers,
+`intent` says who read the intent before the code was written (`validated`,
+`author` or `skipped`) and is required on any outcome that has counts, and
 a turn the loop does not fit is `--not-applicable <reason>` with no counts at
 all rather than a review reported as `rounds=0`.
 
 ```
-<plugin>/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M
+<plugin>/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --intent author
 ```
 
 `<plugin>` is the installed plugin directory — `${CLAUDE_PLUGIN_ROOT}` when
@@ -181,9 +191,9 @@ dirs outside scratch. The gate matches the script's *output*, so quoting or
 plugin's own copy.
 
 The summary the record serialises to is `key=value` tokens — `outcome=` first,
-then the counts, then `reason=` for a not-applicable turn and the optional
-`tier`/`adapter` labels (`forced=S|M|L` and `computed=S|M|L` join them when the
-tier was overridden) — so `scripts/audit.mjs` can count reviews by tier
+then the counts, then `reason=` for a not-applicable turn and the
+`tier`/`adapter`/`intent` labels (`forced=S|M|L` and `computed=S|M|L` join them
+when the tier was overridden) — so `scripts/audit.mjs` can count reviews by tier
 and adapter rather than parse prose. A `note` is the one free-text field and
 never enters the summary. Either form appends a line to `~/.claude/self-review/log.jsonl` — the file form
 logged by the gate, the script form by itself — and that log records

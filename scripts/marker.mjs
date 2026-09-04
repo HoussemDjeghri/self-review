@@ -8,8 +8,8 @@
  * typing a summary string.
  *
  * Usage:
- *   converged.sh --converged      --rounds N --fixed N --dismissed N --open N [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--note "…"]
- *   converged.sh --not-converged  --rounds N --fixed N --dismissed N --open N [--tier …] [--adapter …] [--note "…"]
+ *   converged.sh --converged      --rounds N --fixed N --dismissed N --open N --intent validated|author|skipped [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--note "…"]
+ *   converged.sh --not-converged  --rounds N --fixed N --dismissed N --open N --intent … [--tier …] [--adapter …] [--note "…"]
  *   converged.sh --not-applicable <no-code-changed|user-declined|scratch-only|other> [--note "…"]
  *
  * The printed token line is `SELF-REVIEW CONVERGED — <summary>` for every
@@ -21,11 +21,12 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
-import { NA_REASONS, fieldsFromFlags, formatSummary, validateMarker } from "../hooks/lib/marker.mjs";
+import { INTENT_STATES, NA_REASONS, fieldsFromFlags, formatSummary, validateMarker } from "../hooks/lib/marker.mjs";
 
+const COUNTED = `--rounds N --fixed N --dismissed N --open N --intent <${INTENT_STATES.join("|")}> [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--note "…"]`;
 const USAGE = [
-  "usage: converged.sh --converged      --rounds N --fixed N --dismissed N --open N [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--note \"…\"]",
-  "       converged.sh --not-converged  --rounds N --fixed N --dismissed N --open N [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--note \"…\"]",
+  `usage: converged.sh --converged      ${COUNTED}`,
+  `       converged.sh --not-converged  ${COUNTED}`,
   `       converged.sh --not-applicable <${NA_REASONS.join("|")}> [--note "…"]`,
 ].join("\n");
 

@@ -13,7 +13,7 @@
 # position and what users hold permission rules for, so it stays stable while
 # the work lives in marker.mjs beside it.
 #
-#   converged.sh --converged      --rounds 2 --fixed 3 --dismissed 1 --open 0 --tier M
+#   converged.sh --converged      --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author --tier M
 #   converged.sh --not-applicable user-declined --note "<the user's words>"
 set -euo pipefail
 exec node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/marker.mjs" "$@"
