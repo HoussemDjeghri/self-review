@@ -388,6 +388,13 @@ test("shell commands that write files block: heredoc, sed -i, tee, cp/mv/rm, pyt
     `cat > ${PROJECT}/setup.sh <<'EOF'\n# hi\nEOF`,
     `sed -i '' 's/a/b/' ${PROJECT}/src/a.ts`,
     `sed -e 's/x/y/' -i ${PROJECT}/src/a.ts`,
+    // A line continuation is not a separator. Segmenting on the raw newline
+    // split the verb from its flags, and this returned NO write at all — not
+    // even the unknown-write fallback — so a real in-place edit was invisible
+    // to the gate and to the intent-ordering check that reads the same answer.
+    `sed \\\n-i '' 's/a/b/' ${PROJECT}/src/a.ts`,
+    `cp\\\n ${PROJECT}/a.ts ${PROJECT}/b.ts`,
+    `echo hi \\\n> ${PROJECT}/out.js`,
     `echo hi | tee ${PROJECT}/out.js`,
     `cp ${PROJECT}/a ${PROJECT}/b`,
     `cd ${PROJECT} && mv a b`,

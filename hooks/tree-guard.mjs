@@ -177,7 +177,45 @@ function recursiveRemoval(tokens, cwd) {
   if (!flags.some((flag) => flag === "--recursive" || /^-[^-]*r/i.test(flag))) return false;
   const operands = rest.filter((token) => !token.startsWith("-"));
   if (!operands.length) return false;
-  return operands.some((operand) => !path.isAbsolute(operand) || (cwd && operand.startsWith(`${cwd}${path.sep}`)));
+  // Resolve before comparing. This compared STRINGS, so an operand that merely
+  // started with an exempt prefix was exempt wherever it actually pointed:
+  // `rm -rf /tmp/scratch/../../repo/build` deletes inside the tree and was
+  // ALLOWED. That needed no escaping and no intent to evade — it is the plainly
+  // spelled removal this guard's own threat model is about, written with a `..`
+  // in it. `path.resolve` also subsumes the relative case the old check handled
+  // separately, since a relative operand resolves against `cwd` by definition.
+  return operands.some((operand) => {
+    // No cwd is nothing to compare against, so nothing can be placed — deny
+    // everything. This read `!path.isAbsolute(operand)`, which denied a
+    // relative operand and allowed every absolute one with no comparison
+    // performed at all, so `rm -rf <absolute path to the repo>` passed at
+    // exactly the moment the guard knew least. `evaluate()` always passes a
+    // string, so this should be unreachable; a branch that is unreachable and
+    // fails OPEN is the wrong pair.
+    if (!cwd) return true;
+    // `path.relative`, not a string prefix — it normalises BOTH sides, and the
+    // first version of this fix did not. `resolved.startsWith(cwd + sep)` built
+    // a doubled separator whenever `cwd` arrived with a trailing one (`/repo/`,
+    // or a cwd of `/`, which ends in one already), and no resolved path can
+    // start with `//`. The whole check went false: with cwd `/repo/`, both
+    // `rm -rf build` and `rm -rf /repo/build` were allowed. Nothing sanitises
+    // `payload.cwd`, and every test used the one spelling without a trailing
+    // slash — so the check read as correct and was off.
+    const rel = path.relative(cwd, path.resolve(cwd, operand));
+    if (rel === "") return true; // the operand IS the working directory
+    // "Outside cwd" is two different relationships and only one of them is
+    // safe. `../sibling` is disjoint — deleting it cannot touch the author's
+    // work, and it is not this guard's business. `..` and `../..` are
+    // ANCESTORS, and cwd sits inside them: deleting one deletes the working
+    // directory as collateral, which is precisely the harm here. Both spell
+    // their `rel` with a leading `..`, so the first version of this fix read
+    // them as one case and allowed the ancestor. An ancestor is exactly a rel
+    // made of nothing BUT `..` segments, whatever the operand's spelling —
+    // `sub/../..` resolves to the same place and collapses to the same rel.
+    const segments = rel.split(path.sep);
+    if (segments.every((segment) => segment === "..")) return true;
+    return segments[0] !== "..";
+  });
 }
 
 /**
@@ -190,7 +228,13 @@ function recursiveRemoval(tokens, cwd) {
  * prevent.
  */
 export function offence(command, cwd = "", depth = 0) {
-  for (const segment of String(command).split(SEPARATORS)) {
+  // A line continuation is not a separator. Bash removes the backslash and the
+  // newline and joins the lines into one command; splitting on that raw newline
+  // left `rm` alone in one segment and `-rf /repo/build` in the next, and
+  // neither segment alone tripped anything — so `rm \<newline>-rf /repo/build`
+  // and `git\<newline> reset --hard` were both ALLOWED. Wrapping a long command
+  // across two lines is ordinary style, not evasion.
+  for (const segment of String(command).replace(/\\\n/g, "").split(SEPARATORS)) {
     const tokens = words(segment);
     if (!tokens.length) continue;
     const inline = inlineShell(tokens);

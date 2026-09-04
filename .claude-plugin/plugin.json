@@ -1,6 +1,6 @@
 {
   "name": "self-review",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Review every code change before the turn ends: fresh-context reviewer agents, a verified finding standard, honest convergence, and a measured token budget — enforced by a Stop hook, graph-aware when you have a code graph, zero-cost when you don't.",
   "author": { "name": "Houssem Djeghri", "url": "https://github.com/HoussemDjeghri" },
   "homepage": "https://github.com/HoussemDjeghri/self-review",

@@ -421,6 +421,10 @@ function splitSegments(cmd) {
       if (ch === "\\" && escapes) current += cmd[++i] ?? ""; // keep the pair in source order
     } else if (ch === "'" || ch === '"' || ch === "`") {
       quote = ch; escapes = ch === '"' || (ch === "'" && cmd[i - 1] === "$"); current += ch; // "…" and $'…' honour backslashes
+    } else if (ch === "\\" && cmd[i + 1] === "\n") {
+      i++; // a line continuation: bash removes both and joins the lines
+    } else if (ch === "\\" && i + 1 < cmd.length) {
+      current += ch + cmd[++i]; // an escaped separator is not a separator
     } else if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
       segments.push(current); current = "";
     } else {

@@ -98,6 +98,15 @@ export function words(segment) {
       const end = ch === "`" ? afterBacktick(segment, i + 1) : afterSubstitution(segment, i + 2);
       word += segment.slice(i, end);
       i = end;
+    } else if (ch === "\\" && i + 1 < segment.length) {
+      // A backslash escapes the next character and is removed from the word —
+      // the same normalising this function already did for quotes, and the
+      // reason it had to be added: `r"m"` was caught and `r\m` was not, so one
+      // backslash hid any command name from `commandOf` and a reviewer's
+      // `r\m -rf .` walked past the guard that exists to protect the author's
+      // uncommitted work. It also keeps an escaped space inside its word, so
+      // `cp a /repo/my\ file` names one target instead of two half-paths.
+      word += segment[i + 1]; i += 2;
     } else if (ch === "(" || ch === ")") { // shell metacharacters: words of their own
       flush(); out.push(ch); i++;
     } else if (/\s/.test(ch)) {
