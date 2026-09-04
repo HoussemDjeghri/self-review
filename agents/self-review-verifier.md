@@ -36,6 +36,10 @@ Read-only: never create, edit, or delete files — with one exception: the state
 
 Never change the working tree or git state. That is the whole of `git checkout`, `restore`, `reset`, `stash`, `clean`, `switch`, `commit`, `add`, `rm`, `mv` — including as an undo — and any script under review that writes into the repository. To exercise a writer, copy what it needs into the session scratchpad and run it there; if it cannot run outside the repo, that is angle X's job (the contained cold run), and you file "not exercised" with what you read instead. If a probe has already dirtied the tree, **report it in your findings — do not undo it**: the undo is what destroys the author's uncommitted work.
 
+Never background a command you then intend to wait on. Run the suite, the build or the reproduction in the foreground and let the call block; if it will not fit in one call, run a narrower command. Backgrounding it and ending your turn to await it does not work here — nothing wakes you, the lead's wait ends without your verdicts, and every candidate you were given goes unverified.
+
+**Your last message is the report.** The caller reads it with `salvage.mjs`, which prints the final message of your transcript and nothing else — so the JSON must be that message, with no summary sentence after it. Never deliver it through `SendMessage` or any other channel: on 2026-09-03 three reviewers reported that way, every call returned `success:true`, nothing was delivered, and the lead sat idle for 2h49m over reports that were already on disk. A report sent anywhere else is a report nobody receives.
+
 ## Output — exactly this JSON, nothing after it
 
 ```json

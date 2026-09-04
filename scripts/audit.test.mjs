@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { aggregate, auditSession, candidatesOf, overlapOf, parseSummary } from "./audit.mjs";
+import { aggregate, appliedBy, auditSession, candidatesOf, overlapOf, ownerWindows, parseSummary, reflagOf, reflagRows, recordsByReview } from "./audit.mjs";
 
 const SCRIPT = fileURLToPath(new URL("audit.mjs", import.meta.url));
 // auditSession's default logDir is the machine's real ~/.claude/self-review,
@@ -567,4 +567,126 @@ test("the legacy script marker is still read when it was never quoted", () => {
   const [review] = audit(file).reviews;
   assert.equal(review.markerSource, "transcript");
   assert.deepEqual([review.rounds, review.fixed, review.dismissed, review.open, review.tier], [2, 3, 1, 0, "M"]);
+});
+
+// ---------- the re-flag instrument (F10c's number, F10i's build) ------------
+
+const rec = (round, verdict, file, line, cls = "correctness", review = "r@1") =>
+  ({ review, round, verdict, file, line, class: cls, ts: `2026-09-03T1${round}:00:00.000Z` });
+
+test("a fix a later round files again is a re-flag; one no round could re-file is not counted", () => {
+  const records = [
+    rec(1, "fixed", "src/a.mjs", 10),
+    rec(1, "fixed", "src/b.mjs", 40),
+    rec(1, "dismissed", "src/c.mjs", 5),
+    rec(2, "fixed", "src/a.mjs", 11),   // adjacent line, same class: the same defect
+    rec(3, "fixed", "src/z.mjs", 1),    // round 3 is last — nothing could re-file it
+  ];
+  assert.deepEqual(reflagOf(records), [
+    { review: "r@1", round: 1, fixed: 2, recited: 1 },
+    { review: "r@1", round: 2, fixed: 1, recited: 0 },
+  ], "round 3 is absent because there is no round 4 to have found it again");
+});
+
+test("a re-flag needs the same class, and an unknown line does not score as disagreement", () => {
+  // Scoring an unparsed line as "different" would report a fix that did not
+  // hold as one that did, which is the direction that hides the defect.
+  const differentClass = [rec(1, "fixed", "src/a.mjs", 10), rec(2, "fixed", "src/a.mjs", 10, "conventions")];
+  assert.deepEqual(reflagOf(differentClass)[0], { review: "r@1", round: 1, fixed: 1, recited: 0 });
+
+  const unknownLine = [rec(1, "fixed", "src/a.mjs", 10), { ...rec(2, "fixed", "src/a.mjs", 10), line: null }];
+  assert.equal(reflagOf(unknownLine)[0].recited, 1, "file and class decide when a line is missing");
+
+  const farApart = [rec(1, "fixed", "src/a.mjs", 10), rec(2, "fixed", "src/a.mjs", 90)];
+  assert.equal(reflagOf(farApart)[0].recited, 0);
+});
+
+test("a round with an applier is attributed to it, and a round without one to the lead", () => {
+  const label = appliedBy([{ round: 2, depth: 1 }, { round: 3, depth: 2 }, { round: null, depth: 1 }]);
+  assert.equal(label(1), "lead", "no applier that round: the lead's own hand is the baseline");
+  assert.equal(label(2), "applier@1");
+  assert.equal(label(3), "applier@2", "an applier the orchestrator dispatched is a different arm");
+});
+
+test("a recorded review is claimed by the tightest window that contains it, not by every one that overlaps", () => {
+  // Two failures, one cause. Windows are computed one session at a time and
+  // cannot see each other, so "any window that contains it" let every
+  // overlapping review claim the same records — measured, 3.5x the real fixed
+  // total, then a further 6x from overlapping sessions — and it labelled a
+  // neighbour's round with the claiming window's own appliers.
+  const byReview = new Map([["a@1", [rec(1, "fixed", "src/a.mjs", 1)]]]);
+  const tight = { startedAt: "2026-09-03T10:30:00.000Z", endedAt: "2026-09-03T11:30:00.000Z", appliers: [{ round: 1, depth: 1 }] };
+  const wide = { startedAt: "2026-09-03T09:00:00.000Z", endedAt: "2026-09-03T23:00:00.000Z", appliers: [] };
+  assert.equal(ownerWindows(byReview, [wide, tight]).get("a@1"), tight);
+  assert.equal(ownerWindows(byReview, [tight, wide]).get("a@1"), tight, "and not by which one was audited first");
+  assert.equal(ownerWindows(byReview, [wide]).get("a@1"), wide, "the only container still owns it");
+  assert.equal(ownerWindows(byReview, [{ startedAt: "2026-09-04T00:00:00.000Z", endedAt: null, appliers: [] }]).size, 0,
+    "a window that does not contain the records owns nothing");
+});
+
+test("a round's re-flag row is labelled by the appliers of the review it belongs to", () => {
+  // Review B ran an applier at round 1 inside review A's longer window. Read
+  // per-window, B's row was computed once correctly and once as `lead` by A,
+  // and whichever the traversal reached first decided the number.
+  const byReview = new Map([
+    ["b@1", [rec(1, "fixed", "src/b.mjs", 10, "correctness", "b@1"), rec(2, "open", "src/b.mjs", 10, "correctness", "b@1")]],
+  ]);
+  const a = { startedAt: "2026-09-03T09:00:00.000Z", endedAt: "2026-09-03T23:00:00.000Z", appliers: [] };
+  const b = { startedAt: "2026-09-03T10:30:00.000Z", endedAt: "2026-09-03T13:00:00.000Z", appliers: [{ round: 1, depth: 2 }] };
+  const rows = reflagRows(byReview, [a, b]);
+  assert.deepEqual(rows, [{ review: "b@1", round: 1, fixed: 1, recited: 1, by: "applier@2" }]);
+  assert.equal(reflagRows(byReview, [a, b]).length, 1, "and it is counted once, not once per overlapping window");
+});
+
+test("a review no audited window contains is still counted, attributed to the lead", () => {
+  // The session that ran it may simply not be on this disk. Dropping the row
+  // would silently shrink the denominator of the rate the instrument exists for.
+  const byReview = new Map([["z@1", [rec(1, "fixed", "src/z.mjs", 3, "correctness", "z@1"), rec(2, "open", "src/z.mjs", 3, "correctness", "z@1")]]]);
+  assert.deepEqual(reflagRows(byReview, []), [{ review: "z@1", round: 1, fixed: 1, recited: 1, by: "lead" }]);
+});
+
+test("recordsByReview groups every findings file on disk by the review that filed it", () => {
+  // The one function in the re-flag pipeline that reads the disk, and the one
+  // the tests above cannot reach: they all start from a hand-built Map. Before
+  // this, the only branch any test executed was the `!existsSync` early return,
+  // so a grouping that dropped a second file, or let one file's review id
+  // overwrite another's, would have printed a plausible wrong percentage.
+  const logDir = mkdtempSync(path.join(tmpdir(), "audit-records-"));
+  assert.equal(recordsByReview(logDir).size, 0, "no findings directory is an empty index, not a throw");
+
+  const findings = path.join(logDir, "findings");
+  mkdirSync(findings, { recursive: true });
+  // `rec` is the in-memory shape the re-flag functions take; a record on disk
+  // must also satisfy `recordProblem`, or `readRecords` counts it malformed and
+  // drops it. That is the whole difference between this test and the ones
+  // above, and it is why they could not have caught a bug in here.
+  const onDisk = (record) => ({ severity: "major", angle: "A", summary: "s", ...record });
+  const write = (name, records) =>
+    writeFileSync(path.join(findings, name), records.map((one) => JSON.stringify(onDisk(one))).join("\n") + "\n");
+  // Two repositories' memory files, as findingsFile names them: one review
+  // spans both, which is what "grouped by review, not by file" has to mean.
+  write("aaa.jsonl", [rec(1, "fixed", "src/a.mjs", 10, "correctness", "one@1"), rec(1, "fixed", "src/b.mjs", 20, "correctness", "two@1")]);
+  write("bbb.jsonl", [rec(2, "open", "src/a.mjs", 11, "correctness", "one@1")]);
+  // Not a findings file: the directory holds other things, and a stray
+  // extension must not be parsed as records.
+  writeFileSync(path.join(findings, "notes.txt"), "not json\n");
+
+  const index = recordsByReview(logDir);
+  assert.deepEqual([...index.keys()].sort(), ["one@1", "two@1"]);
+  assert.equal(index.get("one@1").length, 2, "a review's records accumulate across files rather than the second file replacing the first");
+  assert.deepEqual(index.get("one@1").map((one) => one.round), [1, 2]);
+  assert.equal(index.get("two@1").length, 1);
+
+  // A record with no review id belongs to no review and is skipped, not
+  // grouped under `undefined` — where it would become a phantom review with a
+  // re-flag row of its own.
+  const { review, ...orphan } = rec(1, "fixed", "src/c.mjs", 5);
+  write("ccc.jsonl", [orphan]);
+  assert.equal(recordsByReview(logDir).has(undefined), false);
+
+  // And a row that fails the schema is dropped rather than indexed: the index
+  // is only ever as trustworthy as `readRecords`, which is the point of
+  // reading through it instead of parsing the lines here.
+  writeFileSync(path.join(findings, "ddd.jsonl"), JSON.stringify({ review: "bad@1", round: 0 }) + "\n");
+  assert.equal(recordsByReview(logDir).has("bad@1"), false);
 });

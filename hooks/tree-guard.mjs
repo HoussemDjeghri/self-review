@@ -47,6 +47,7 @@ import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
 import { isMain } from "./lib/config.mjs";
 import { afterPrefixes, inlineShell, words } from "./lib/shell.mjs";
+import { noteEngagement } from "./lib/engagement.mjs";
 
 const GUARD_TAG = "[tree-guard]";
 
@@ -210,8 +211,18 @@ export function evaluate(payload) {
   // agent_id is what separates a reviewer from the lead: the lead resets files
   // legitimately while fixing findings, and denying that would break the loop.
   if (typeof payload.agent_id !== "string" || !payload.agent_id) return null;
-  if (!REVIEWER.test(String(payload.agent_type ?? ""))) return null;
   if (payload.tool_name !== "Bash") return null;
+  const agentType = String(payload.agent_type ?? "");
+  const matched = REVIEWER.test(agentType);
+  // The audit line, before the decision. This is not a bypass patch — the file
+  // is still frozen against those — it is ruling 1's item 2: the guard's allow
+  // path and its inert path are the same silence, and that is how it came to be
+  // inert for roughly ninety named finders while every review round read it and
+  // correctly found it correct. Writing only into an open log keeps a project
+  // that never runs this loop paying nothing; failing silently keeps a hook
+  // that cannot write its audit line from holding a turn hostage.
+  noteEngagement(typeof payload.cwd === "string" ? payload.cwd : "", agentType, matched, { session: payload.session_id });
+  if (!matched) return null;
   const reason = offence(payload.tool_input?.command ?? "", typeof payload.cwd === "string" ? payload.cwd : "");
   if (!reason) return null;
   return {

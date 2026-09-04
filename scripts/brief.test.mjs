@@ -256,6 +256,45 @@ test("a tier.json plan drives the briefs, including its own names and models", (
   assert.match(readFileSync(path.join(dir, "briefs", "r2-custom.md"), "utf8"), /C · Cross-file tracer/);
 });
 
+test("what the ledger carried is stated, and an empty one at round 2 says so", () => {
+  // Rounds 2-4 of the v0.7.2 review ran on a ledger the lead never wrote:
+  // `round.sh` seeds `<work>/ledger.md` with a placeholder, so "nothing was
+  // dismissed" and "the lead forgot" produced identical silence and the
+  // dismissed list had to be pasted into the agent prompts by hand.
+  const dir = workdir();
+  writeFileSync(path.join(dir, "intent.md"), "INTENT\n");
+  writeFileSync(path.join(dir, "scope.diff"), "diff\n");
+  const plan = (round) => {
+    const file = path.join(dir, `plan-${round}.json`);
+    writeFileSync(file, JSON.stringify({
+      schema: 1, tier: "S", round, verifier: "author",
+      finders: [{ name: `r${round}-a`, kind: "code", angles: ["A"], agent: "self-review-finder", model: "sonnet", effort: "high", calls: 40, impact: "summary" }],
+    }));
+    return file;
+  };
+  const run = (round, ledgerFile) => {
+    const lines = [];
+    main(["--plan", plan(round), "--intent", path.join(dir, "intent.md"), "--scope", path.join(dir, "scope.diff"),
+          ...(ledgerFile ? ["--ledger", ledgerFile] : []), "--out", path.join(dir, `briefs-${round}`)], { log: (l) => lines.push(l) });
+    return lines.join("\n");
+  };
+
+  const placeholder = path.join(dir, "placeholder.md");
+  writeFileSync(placeholder, "_No dismissals yet._\n");
+  assert.match(run(2, placeholder), /no dismissed findings carried into this round/);
+  assert.match(run(2, placeholder), /placeholder\.md was never updated/,
+    "the line names the file the lead has to write, not just the fact");
+
+  const real = path.join(dir, "ledger.md");
+  writeFileSync(real, "# ledger\n\n## dismissed\n- D1 — refuted: the lock is held\n- D2 — refuted: unreachable\n");
+  assert.match(run(3, real), /^# 2 dismissed findings carried into every brief$/m);
+
+  // Round 1 has nothing to carry by definition, so it must not be scolded.
+  const round1 = run(1, placeholder);
+  assert.doesNotMatch(round1, /never updated/);
+  assert.match(round1, /^# 0 dismissed findings carried into every brief$/m);
+});
+
 test("a plan is rejected whole: a bad row leaves no earlier brief on disk", () => {
   const dir = workdir();
   writeFileSync(path.join(dir, "intent.md"), "INTENT\n");

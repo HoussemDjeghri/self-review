@@ -439,6 +439,9 @@ export function main(argv, { log = console.log } = {}) {
     ? path.resolve(options.angles)
     : path.join(PLUGIN_ROOT, "skills", "self-review", "references", "angles.md");
   const outDir = path.resolve(options.out);
+  const ledgerPath = options.ledger ? path.resolve(options.ledger) : "the ledger";
+  const dismissed = dismissedFrom(options.ledger ? read(ledgerPath, "the ledger") : "");
+  const dismissedCount = dismissed.length;
   const results = writeBriefs({
     plan,
     outDir,
@@ -449,7 +452,7 @@ export function main(argv, { log = console.log } = {}) {
     live: options.live ? path.resolve(options.live) : gitRoot(),
     impactText: options.impact ? read(path.resolve(options.impact), "the impact block") : "",
     prior: options.prior ? read(path.resolve(options.prior), "prior findings").split("\n").filter(Boolean) : [],
-    dismissed: dismissedFrom(options.ledger ? read(path.resolve(options.ledger), "the ledger") : ""),
+    dismissed,
     // A path, not the file: the transcript holds every byte the artifact wrote
     // and belongs in the grader's context once, when it reads it — not in
     // every brief, and not in this script's caller's context at all.
@@ -459,6 +462,7 @@ export function main(argv, { log = console.log } = {}) {
 
   logPriorShown(priorIdsIn(results.flatMap((result) => result.priorShown)), { round: plan.round });
 
+
   // The Agent-call table: everything the spawn needs, nothing else. Kept to
   // one line per finder because this output lands in the main session's
   // context, where every line is paid for on every later turn.
@@ -466,6 +470,16 @@ export function main(argv, { log = console.log } = {}) {
   for (const { row, file, tokens, trimmedImpact } of results) {
     log(`${row.name}  ${row.agent}  ${row.model}/${row.effort}  ${row.calls} calls  ${file}  (${tokens} tok${trimmedImpact ? `, -${trimmedImpact} impact` : ""})`);
   }
+  // What the briefs carry from the ledger, said out loud. An empty dismissed
+  // list reads identically whether nothing was dismissed or the lead never
+  // wrote `<work>/ledger.md` — `round.sh` seeds it with a placeholder, so the
+  // forgotten case is silent and every later round re-files what round 1
+  // already refuted. It happened across rounds 2-4 of the v0.7.2 review, and
+  // the workaround was pasting the list into the agent prompts by hand.
+  log(dismissedCount === 0 && plan.round > 1
+    ? "# no dismissed findings carried into this round — if round " +
+      `${plan.round - 1} dismissed anything, ${ledgerPath} was never updated (SKILL §2e) and these finders will re-file it`
+    : `# ${dismissedCount} dismissed finding${dismissedCount === 1 ? "" : "s"} carried into every brief`);
   return results;
 }
 

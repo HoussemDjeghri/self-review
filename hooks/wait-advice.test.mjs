@@ -76,3 +76,33 @@ test("the patterns trip on what they are for, and not on a true sentence about t
   assert.match("Do not call ListAgents to wait", WAIT_CONTEXT);
   assert.doesNotMatch("the applier reports applied / deviated / blocked", WAIT_CONTEXT);
 });
+
+// The same shape one layer over: an agent whose report is its last message.
+//
+// `salvage.mjs` prints an agent's FINAL message and nothing else, so a reporting
+// agent that delivers through `SendMessage` and signs off in prose delivers
+// nothing the lead can read. Measured on 2026-09-03 against this session's own
+// transcripts: four of five applier runs ended in prose or a markdown table
+// rather than the JSON their definition contracts for, and two of the four said
+// "Report sent to team-lead" — the report had gone out through the channel that
+// dropped three reviewer reports for 2h49m the same day.
+const AGENT_FILES = () =>
+  walkFiles(path.join(PLUGIN_ROOT, "agents"))
+    .filter((file) => file.endsWith(".md"))
+    .map((file) => [path.join("agents", file), path.join(PLUGIN_ROOT, "agents", file)]);
+
+test("every agent that reports says its last message is the report, and forbids SendMessage", () => {
+  const files = AGENT_FILES();
+  assert.ok(files.length >= 4, `only ${files.length} agent files walked — the walk, not the rule, is what failed`);
+  const reporting = files.filter(([, full]) => /^## Output — exactly this JSON/m.test(readFileSync(full, "utf8")));
+  assert.ok(reporting.length >= 4,
+    `only ${reporting.length} agent files declare a JSON output — an empty offender list below would prove nothing`);
+  const silent = reporting
+    .filter(([, full]) => {
+      const text = readFileSync(full, "utf8");
+      return !/last message is the report/i.test(text) || !/SendMessage/.test(text);
+    })
+    .map(([rel]) => rel);
+  assert.deepEqual(silent, [],
+    "an agent whose report is collected by salvage.mjs must be told the last message IS the report, and told not to send it through SendMessage");
+});

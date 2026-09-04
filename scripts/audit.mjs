@@ -34,6 +34,7 @@ import path from "node:path";
 import { isMain } from "../hooks/lib/config.mjs";
 import { COUNTS, LABELS, OUTCOMES as MARKER_OUTCOMES, fieldsFromFlags, formatSummary, isCounted, validateMarker } from "../hooks/lib/marker.mjs";
 import { words } from "../hooks/lib/shell.mjs";
+import { readRecords, reviewFromWork } from "./findings.mjs";
 
 const DEFAULT_PROJECTS = path.join(homedir(), ".claude", "projects");
 const DEFAULT_LOG_DIR = process.env.SELF_REVIEW_LOG_DIR || path.join(homedir(), ".claude", "self-review");
@@ -124,7 +125,7 @@ function usageOf(entries) {
 // record of the agent's name and the subagent type it was spawned as. That is the
 // authority; the brief-text heuristics below are for transcripts written before
 // the sidecar existed, and for reviewers dispatched as `general-purpose`.
-const ROLE_OF_TYPE = { "self-review-finder": "finder", "self-review-verifier": "verifier" };
+const ROLE_OF_TYPE = { "self-review-finder": "finder", "self-review-verifier": "verifier", "self-review-applier": "applier" };
 
 function metaOf(file) {
   const sidecar = file.replace(/\.jsonl$/, ".meta.json");
@@ -140,6 +141,10 @@ function roleOf(entries, meta) {
   // A brief handed over as a file pointer ("Read …/round-1/briefs/r1-ab.md")
   // contains no angle text at all, so the path is the transcript's only evidence.
   const pointer = /self-review\/round-\d+\/briefs\//.test(head);
+  // A named agent's type is its name, so the declared map misses every applier
+  // the loop actually launched (`self-review-applier-r2`). The name is the
+  // evidence; its brief is a directives file, not a brief.
+  if (/(^|:)self-review-applier(-|$)/.test(String(meta?.name ?? meta?.agentType ?? ""))) return "applier";
   if (!pointer && !/self-review/i.test(head)) return null;
   if (/\bverif(y|ier)\b/i.test(head) || /\bREFUTED\b/.test(head)) return "verifier";
   if (pointer || /reviewer \d|YOUR ANGLE|round \d/i.test(head)) return "finder";
@@ -261,6 +266,131 @@ export function overlapOf(finders) {
   });
 }
 
+/**
+ * Every recorded finding, indexed by the review that filed it. One read of the
+ * whole memory directory rather than a `repoId` per session: the review id is
+ * already unique across repositories, so the repo key buys nothing here and
+ * would cost a `git remote` subprocess per session to compute.
+ */
+export function recordsByReview(logDir) {
+  const dir = path.join(logDir, "findings");
+  const index = new Map();
+  if (!existsSync(dir)) return index;
+  for (const name of readdirSync(dir).filter((file) => file.endsWith(".jsonl"))) {
+    for (const record of readRecords(path.join(dir, name)).records) {
+      if (!record?.review) continue;
+      if (!index.has(record.review)) index.set(record.review, []);
+      index.get(record.review).push(record);
+    }
+  }
+  return index;
+}
+
+/**
+ * Which audited review window each RECORDED review belongs to: the tightest
+ * window that contains all of its records.
+ *
+ * The join has to be by time — the lead passes `--work "$W"`, so the transcript
+ * holds the variable and not the path — and time alone is ambiguous, because
+ * review sessions overlap routinely here. Tightest-containing resolves it: a
+ * neighbour that merely overlaps is a longer window, and the review's own is
+ * the shortest one that still holds every record. Each recorded review is then
+ * claimed exactly once, which is what makes the counts add up; claiming by
+ * "any window that contains it" inflated the fixed total 3.5x, and then a
+ * further 6x when overlapping sessions each claimed the same round.
+ */
+export function ownerWindows(byReview, reviews) {
+  const spans = reviews.map((review) => {
+    const from = Date.parse(review.startedAt ?? "");
+    const to = review.endedAt ? Date.parse(review.endedAt) + MARKER_GRACE_MS : Infinity;
+    return { review, from, to, span: to - from };
+  }).filter((one) => Number.isFinite(one.from));
+  const owner = new Map();
+  for (const [id, records] of byReview) {
+    const stamps = records.map((record) => Date.parse(record.ts ?? "")).filter(Number.isFinite);
+    if (!stamps.length) continue;
+    const first = Math.min(...stamps), last = Math.max(...stamps);
+    let best = null;
+    for (const one of spans) {
+      if (first < one.from || last > one.to) continue;
+      if (best === null || one.span < best.span) best = one;
+    }
+    if (best) owner.set(id, best.review);
+  }
+  return owner;
+}
+
+/**
+ * Every re-flag row across every recorded review, labelled by who applied that
+ * round's fixes. Computed once, globally, for the reason `ownerWindows` gives.
+ * A review no audited window contains keeps its rows and is attributed to the
+ * lead: the session that ran it may simply not be on this disk, and dropping it
+ * would shrink the denominator of the rate this instrument exists to report.
+ */
+export function reflagRows(byReview, reviews) {
+  const owner = ownerWindows(byReview, reviews);
+  return [...byReview].flatMap(([id, records]) => {
+    const label = appliedBy(owner.get(id)?.appliers ?? []);
+    return reflagOf(records).map((row) => ({ ...row, review: id, by: label(row.round) }));
+  });
+}
+
+/**
+ * The re-flag rate: of the findings a round FIXED, how many did the next round
+ * file again? A fix that has to be re-found is a fix that did not hold, and
+ * that is the one number that says whether handing application to an agent
+ * costs quality. F10c named it; nothing computed it, which is why F10g's hold
+ * on the orchestrator waited on a measurement nobody was set up to take.
+ *
+ * The source is the findings file, not the transcripts: a `fixed` record is the
+ * lead's own verdict, and it is the only place a fix is written down. Two
+ * records are the same defect on the same rule `overlapOf` uses — same file,
+ * same class, lines the same or adjacent, and file-and-class alone when either
+ * line is unknown, because scoring an unparsed line as disagreement would read
+ * as a fix that held.
+ *
+ * A round with no round after it is not counted: nothing had the chance to
+ * re-file it, and counting it would read as a perfect record for whatever
+ * applied the last round.
+ */
+export function reflagOf(records) {
+  const same = (a, b) => a.file === b.file && a.cls === b.cls &&
+    (a.line === null || b.line === null || Math.abs(a.line - b.line) <= 1);
+  const at = (record) => ({
+    file: record.file,
+    cls: String(record.class ?? "").trim().toLowerCase(),
+    line: Number.isInteger(record.line) ? record.line : null,
+  });
+  const rounds = [...new Set(records.map((record) => record.round))].sort((a, b) => a - b);
+  return rounds.flatMap((round) => {
+    const next = records.filter((record) => record.round === round + 1).map(at);
+    if (!next.length) return [];
+    const fixed = records.filter((record) => record.round === round && record.verdict === "fixed").map(at);
+    if (!fixed.length) return [];
+    return [{
+      review: records[0]?.review ?? null,
+      round,
+      fixed: fixed.length,
+      recited: fixed.filter((one) => next.some((other) => same(one, other))).length,
+    }];
+  });
+}
+
+/**
+ * Who applied each round's fixes, from the appliers this review launched. A
+ * round with no applier was applied by the lead's own hand — which is the
+ * baseline the applier is measured against, so the absence has to be recorded
+ * rather than skipped.
+ */
+export function appliedBy(appliers) {
+  const label = new Map();
+  for (const applier of appliers) {
+    if (applier.round === null) continue;
+    label.set(applier.round, `applier@${applier.depth}`);
+  }
+  return (round) => label.get(round) ?? "lead";
+}
+
 // agent-a<name>-<hash>.jsonl is the real file name; the sidecar knows the name
 // exactly, and this strips the wrapper when there is no sidecar to ask.
 const nameFromFile = (file) =>
@@ -282,7 +412,10 @@ function agentsOf(sessionJsonl) {
       return {
         name: label,
         role,
-        round: role === "finder" ? roundOf(entries, label) : null,
+        round: role === "verifier" ? null : roundOf(entries, label),
+        // Depth 1 is the lead's own hand; a deeper applier was dispatched by
+        // something the lead spawned. `spawnDepth` is 0-based in the sidecar.
+        depth: (meta?.spawnDepth ?? 0) + 1,
         candidates: role === "finder" ? candidatesOf(entries) : null,
         startedAt: entries[0].timestamp ?? null,
         tokens: usageOf(entries),
@@ -443,7 +576,7 @@ function finish(review, agents, log = []) {
     output: sum(rows, (r) => r.tokens.output),
     billedInput: sum(rows, (r) => r.tokens.billedInput),
   });
-  const finders = byRole("finder"), verifiers = byRole("verifier");
+  const finders = byRole("finder"), verifiers = byRole("verifier"), appliers = byRole("applier");
   // Which model each role actually ran on, counted. The plan pins finders to
   // sonnet (the agent file's frontmatter, and the per-row `model` tier.mjs
   // writes), but a subagent inherits the session's model wherever that pin is
@@ -465,11 +598,18 @@ function finish(review, agents, log = []) {
     outcome: summary === null ? "unmarked" : parsed.outcome,
     turns: review.turns.length,
     agents: {
-      finders: finders.length, verifiers: verifiers.length,
+      finders: finders.length, verifiers: verifiers.length, appliers: appliers.length,
       names: mine.map((agent) => agent.name),
       models: { finders: models(finders), verifiers: models(verifiers) },
     },
     overlap: overlapOf(finders),
+    // Who applied each round, for the re-flag join `main` makes across every
+    // session at once. Computing the join HERE was wrong twice over: a window
+    // cannot see the other windows, so it labelled a concurrent review's round
+    // with its own appliers, and it counted rounds a neighbouring window had
+    // already counted. Both are the same mistake — a review belongs to one
+    // window and only a global view knows which.
+    appliers: appliers.map((agent) => ({ round: agent.round, depth: agent.depth })),
     tokens: { main: usageOf(review.turns), finders: tokensOf(finders), verifier: tokensOf(verifiers) },
     tooling: { calls: sum(mine, (r) => r.toolingCalls), ofToolCalls: sum(mine, (r) => r.toolCalls) },
     // Rounds come from the marker, decisions from the log: fewer decisions than
@@ -519,7 +659,7 @@ export function aggregate(reviews) {
   return [...byTier.values()].sort((a, b) => String(a.tier).localeCompare(String(b.tier)));
 }
 
-function report(audits) {
+function report(audits, reflagRowsIn = []) {
   const millions = (n) => (n / 1e6).toFixed(2) + "M";
   const reviews = audits.flatMap((audit) => audit.reviews.map((review) => ({ ...review, session: audit.session })));
   if (!reviews.length) return "no reviews found (a review is a reviewer spawn followed by a convergence marker)";
@@ -540,6 +680,32 @@ function report(audits) {
         ` · also filed by another finder ${row.shared}/${row.total}${share}` +
         (row.unread ? ` · ${row.unread} finder${row.unread === 1 ? "" : "s"} unread` : ""));
     }
+  }
+  // The applier's own instrument, aggregated across every review the memory
+  // file remembers — the baseline this repo never had. Split by who applied,
+  // because that is the whole question: an agent applying fixes is only cheaper
+  // if the fixes hold as well as the lead's did.
+  // One tally per applier label. The rows arrive already de-duplicated: the
+  // global join claims each recorded review once, so there is nothing here to
+  // guard against double counting any more.
+  const reflag = new Map();
+  for (const row of reflagRowsIn) {
+    const tally = reflag.get(row.by) ?? { by: row.by, reviews: new Set(), rounds: 0, fixed: 0, recited: 0 };
+    tally.reviews.add(row.review);
+    tally.rounds += 1;
+    tally.fixed += row.fixed;
+    tally.recited += row.recited;
+    reflag.set(row.by, tally);
+  }
+  if (reflag.size) {
+    lines.push("", "== RE-FLAG (fixes a later round filed again) ==");
+    for (const row of [...reflag.values()].sort((a, b) => a.by.localeCompare(b.by))) {
+      lines.push(
+        `  ${row.by.padEnd(11)} reviews=${row.reviews.size} rounds=${row.rounds}` +
+        ` fixed=${row.fixed} re-flagged=${row.recited}` +
+        ` (${row.fixed ? Math.round(100 * row.recited / row.fixed) : 0}%)`);
+    }
+    lines.push("  a round whose fixes no later round could re-file is not counted — nothing had the chance");
   }
   lines.push("", "== BY TIER ==");
   for (const row of aggregate(reviews)) {
@@ -571,7 +737,12 @@ function main(argv) {
   const audits = targets
     .map((file) => auditSession(file, { logDir }))
     .filter((audit) => audit.reviews.length);
-  process.stdout.write((asJson ? JSON.stringify(audits, null, 2) : report(audits)) + "\n");
+  // Read once, here: this walks the whole findings directory, and doing it
+  // inside auditSession re-parsed it for every one of the ~1,200 transcripts
+  // under the projects root — 6.9s of identical work whose result was then
+  // thrown away for every session that held no review.
+  const rows = reflagRows(recordsByReview(logDir), audits.flatMap((audit) => audit.reviews));
+  process.stdout.write((asJson ? JSON.stringify({ audits, reflag: rows }, null, 2) : report(audits, rows)) + "\n");
 }
 
 if (isMain(import.meta.url)) {

@@ -34,7 +34,8 @@ call budget.
    stale limit, then prints one line per reviewer and exits: `0` — all settled,
    collect now (§2c); `1` — some still active and the round's 30-minute wait
    budget is not spent, call it again as the very next tool call; `3` — budget
-   spent, treat the active ones as dead (§2f). Do not end the turn to wait, and
+   spent, treat the active ones as dead (§2f). A reviewer it lists as
+   **stalled** is neither: see §2g. Do not end the turn to wait, and
    do not check on a reviewer any other way: `ListAgents`,
    `TaskOutput(block=false)`, `Monitor`, `sleep` — every one is a full-context
    turn that tells you nothing the wait did not, and `poll-guard` denies the
@@ -246,6 +247,20 @@ keeps that tail out of your context. It exits 0 even when a check fails: the
 report is the answer. Skip checks per project with `preflight.skip` in the
 config.
 
+**`preflight.artifactRoot`** is the other pre-flight key, and it is off by
+default. Name a subdirectory (`"plugin"`) and round 1 also copies it out and
+runs its `*.test.mjs` files with that subdirectory as the root — the one shape
+a project that ships a subdirectory never tests in, where a test that walks
+upward leaves the artifact and a test naming a repo-root path finds nothing.
+`PASS`/`FAIL` lines say what happened; `SKIP` means the directory held no node
+tests, which is not a failure of the repository under review.
+
+Know the blast radius before setting it: it is **not** in `REPO_ADDITIVE` (a
+repository cannot be trusted to widen what runs on the machine reviewing it), so
+the only place it can be set is your own `~/.claude/self-review/config.json`,
+which is global to you. Setting it for one project names that subdirectory in
+**every** project you review afterwards.
+
 `round.sh` runs it against a **copy** of the tree at
 `<work>/round-1/cold run – ü/install`, not against the repository — same checks,
 same cost, run from a path that is not the developer's, with an empty HOME. That
@@ -340,11 +355,13 @@ nothing in between, and no edits to the files in scope while it runs. Finders
 run in the background: in current builds the
 main session's Agent tool always launches them that way (pass
 `run_in_background: true` where a build exposes it); their completion
-notifications are not the signal — `wait.mjs` is. If
-your Agent tool says only synchronous subagents are supported, you are inside
-a subagent — the results come back in the same call and there is nothing to
-wait for. While they read, do not edit, commit, or rebase the
-files in scope — a finder reviewing a tree that moved returns line numbers
+notifications are not the signal — `wait.mjs` is. That holds if you are
+yourself a subagent: measured 2026-09-03, an Agent call made from inside one
+returns a pending handle exactly as it does for the main session, and a
+depth-2 reviewer's transcript lands in the same flat
+`<project>/<session-id>/subagents/` directory under the same name, so
+`wait.mjs` reads it with no change. While they read, do not edit, commit,
+or rebase the files in scope — a finder reviewing a tree that moved returns line numbers
 that point nowhere.
 
 Never use a fork for a reviewer and never review inline "to save time": a fork
@@ -360,8 +377,9 @@ so in the report rather than waiting.
 
 ### 2c · Collect and deduplicate
 
-When `wait.mjs` exits 0, its table says which reviewers finished and which
-died; a dead one goes to §2f before anything else. A finder's report is its
+When `wait.mjs` exits 0, its table says which reviewers finished, which died,
+and which stalled; a dead one goes to §2f before anything else, and a stalled
+one to §2g. A finder's report is its
 last message, which the wake-up does not carry. Read every finished report in
 one call: `scripts/salvage.mjs <session-id> <name> <name>…`
 prints each named agent's report (no names: lists the agents; the session id
@@ -515,7 +533,7 @@ exactly that way. So when a reviewer dies, goes idle without a report,
 `wait.mjs` lists it as dead, or you resume after a reset:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id>            # each agent: finished/active/dead, calls, context
+"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id>            # each agent: finished/stalled/active/dead, calls, context
 "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id> <name>     # its last message (--all-text: every text block)
 ```
 
@@ -545,6 +563,31 @@ the original: an applier told again to make an edit that is already there comes
 back `blocked` on a file that is in fact correct, and the round spends itself
 arguing with its own fixes. Its state file and salvaged transcript say what it
 believed it applied; the tree says what it did, and the tree wins.
+
+### 2g · A stalled reviewer is resumed, never re-spawned
+
+`wait.mjs` says **stalled** when a reviewer's transcript ends on the harness's
+own API-error notice. That is a third thing, and both of the reflexes above are
+wrong for it: it is not finished (there is no report) and it is not dead (its
+context is live and every tool call it made is still paid for). Measured
+2026-09-04 over 894 subagent transcripts: 93 ended this way and **not one ever
+continued on its own**. Before the status existed each of those read `active`
+until the 30-minute budget burned and was then treated as dead — the same idle
+lead, arriving by a different door.
+
+`wait.mjs` prints the error text and, from it, which of the two kinds it is:
+
+- **resumable** (a dropped connection, a 5xx) — send the agent one message:
+  `SendMessage` to its name with `resume`. Then call `wait.mjs` again as the
+  very next call, exactly as after an exit 1. Do not re-spawn it and do not
+  paste its brief again; it still has both.
+- **a quota refusal** — the text carries the reset time. A nudge before then
+  only spends another refusal. Wait for the reset and resume, or, if the round
+  cannot wait, treat that angle as uncovered and say so in the report (§4) —
+  never silently.
+
+If a resumed reviewer stalls a second time on the same error, stop resuming it
+and salvage it as §2f says; two identical stalls is an outage, not a blip.
 
 ## 3 · Converge or go again
 
@@ -620,6 +663,43 @@ trend:
   they are dropped where the file is read, so nothing in them reaches `W`, the
   angle sets or the verdict — but a dropped row is a finding this loop has
   forgotten, so read them before trusting a `CONTINUE`.
+
+  **Its last line is the tree-guard audit, and it is about the plugin, not
+  about your change.** `round.sh` opens an engagement log for the round; the
+  guard appends one row per subagent shell call saying whether it recognised
+  the agent as a reviewer; `converge` reports what the round proved. It exists
+  because the guard was inert for roughly ninety named finders while every
+  review round read the file and correctly found it correct — a mechanism whose
+  working and inert behaviours are identical. Nothing reads it to decide
+  anything, so it never changes `CONTINUE`/`ESCALATE`. What it can say, and what
+  each one asks of you:
+
+  - `tree-guard engaged: N/M …` — the guard was watching. Nothing to do.
+  - `tree-guard did NOT match …` — it failed to recognise a name this plugin
+    itself generated, so those agents held an unguarded shell in the working
+    tree. **Report it to the user**; it is a defect in the plugin, and a review
+    in progress cannot fix its own installed guard.
+  - `tree-guard matched none of the N …` — the same defect from the other side.
+    Same action.
+  - `N shell calls under <name>, a name the guard does not cover` — an agent
+    whose `tools:` list declares no Bash ran one anyway. The frontmatter is not
+    enforced by the harness: measured 2026-09-03, nine agents declared without
+    Bash made sixty successful Bash calls. **Report it to the user**; the defect
+    is in the tool list, not in the guard.
+  - `recorded N shell calls this round and none carried a session id` — the
+    payload's shape changed, or something ran the hook by hand. The guard proved
+    nothing. Same action as an unopened log.
+  - `was asked about no subagent shell call this round` — the log was open and
+    nothing reached it. Measured 2026-09-04, every reviewer type in this plugin
+    runs a shell, so this is an anomaly, not an idle round: it means the guard
+    was not consulted. Same action as an unopened log.
+  - `no engagement log was opened for this round` — the audit ran and proved
+    nothing, which is not a pass. Say so in the report rather than reading the
+    absence of an alarm as an all-clear.
+
+  Nothing here blocks convergence, and the line is never absent: a round that
+  opened no log, or opened one nothing reached, says so in words. Silence would
+  read the same as a pass, which is the failure this instrument was built for.
 
   **Stop and escalate to the user** — surface the state, do not declare done —
   when any of:

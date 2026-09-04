@@ -55,6 +55,12 @@ const spawn = ({ subagents, name, entries, hash = "0123456789abcdef", ageSeconds
 
 const report = (baseMs) => [said([text("reading"), uses("Read")], "tool_use", baseMs), said([text('```json\n[]\n```')], "end_turn", baseMs)];
 const working = (baseMs) => [said([text("reading"), uses("Read")], "tool_use", baseMs)];
+// The harness's terminal API-error notice — the shape measured on 2026-09-04.
+const stalledOn = (body, quotaLimits, baseMs = Date.now()) => [
+  said([text("reading"), uses("Read")], "tool_use", baseMs),
+  { type: "assistant", timestamp: stamp(baseMs), isApiErrorMessage: true, error: body, ...(quotaLimits ? { quotaLimits } : {}),
+    message: { role: "assistant", model: "<synthetic>", stop_reason: "stop_sequence", usage: { input_tokens: 0, output_tokens: 0 }, content: [text(body)] } },
+];
 
 // Runs main with a clock that only moves when the script sleeps, so a call that
 // blocks for its full ceiling costs no wall-clock time here.
@@ -91,7 +97,7 @@ test("every reviewer finished: exits 0 at once, names them, and points at the co
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /f-ab\s+finished\s+.*2 calls\s+2 filed/);
   assert.match(r.out, /f-cd\s+finished\s+.*0 filed/);
-  assert.match(r.out, /# settled — 2 finished, 0 dead/);
+  assert.match(r.out, /# settled — 2 finished, 0 stalled, 0 dead/);
   assert.equal(r.elapsed, 0, "a settled round does not sleep");
 });
 
@@ -131,7 +137,7 @@ test("a reviewer silent past the stale limit is dead, and the round settles with
   const r = await run(["--work", work, "--round", "1", "--session", subagents]);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /f-cd\s+dead/);
-  assert.match(r.out, /# settled — 1 finished, 1 dead/);
+  assert.match(r.out, /# settled — 1 finished, 0 stalled, 1 dead/);
 });
 
 test("the round's wait budget is spent: exit 3, and the active ones are to be treated as dead", async () => {
@@ -280,5 +286,53 @@ test("a SIGTERM prints the table rather than losing it", async () => {
   child.kill("SIGTERM");
   assert.equal(await done, 1);
   assert.match(out, /f-ab\s+active/);
-  assert.match(out, /# interrupted — 0 finished, 0 dead, 1 active/);
+  assert.match(out, /# interrupted — 0 finished, 0 stalled, 0 dead, 1 active/);
+});
+
+test("a reviewer stalled on a transient API error settles the round at once and is told to resume", async () => {
+  // The owner hit this by hand: a reviewer stopped on an API error and sat
+  // there until they nudged it. Before this, it read `active` for the whole
+  // 30-minute budget and was then reported dead — losing intact work.
+  const { work, subagents } = layout({ names: ["f-ab", "f-cd"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  spawn({ subagents, name: "f-cd", entries: stalledOn("API Error: Connection lost mid-response. The response above may be incomplete."), hash: "fedcba9876543210" });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.elapsed, 0, "a stalled agent will never write again, so waiting on it is dead time");
+  assert.match(r.out, /f-cd\s+stalled/);
+  assert.match(r.out, /# settled — 1 finished, 1 stalled, 0 dead/);
+  assert.match(r.out, /Connection lost mid-response/, "the error text decides the remedy, so it is quoted");
+  assert.match(r.out, /resume it: SendMessage to "f-cd"/);
+  assert.doesNotMatch(r.out, /f-cd.*→ a quota refusal/s);
+});
+
+test("a reviewer stalled on a quota refusal is told to wait for the reset, not to nudge", async () => {
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: stalledOn("You've hit your session limit · resets 6:20pm (Africa/Algiers)", { status: "rejected" }) });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /f-ab\s+stalled/);
+  assert.match(r.out, /resets 6:20pm/);
+  assert.match(r.out, /a quota refusal: a nudge now only spends another one/);
+  assert.doesNotMatch(r.out, /SendMessage/, "nudging a refused quota just spends another refusal");
+});
+
+test("no stalled reviewer means no stall advice at all", async () => {
+  // The mirror assertion: advice that prints unconditionally is noise, and an
+  // empty advice block reads the same whether the rule holds or the status was
+  // never computed. The two tests above prove it engages.
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.doesNotMatch(r.out, /stalled reviewer is NOT a dead one/);
+});
+
+test("an unmeasured stall shape tells the lead to read the error, not which way to act", async () => {
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: stalledOn("Request throttled by the upstream gateway", { status: "throttled" }) });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /f-ab\s+stalled/);
+  assert.match(r.out, /shape this plugin has not measured: READ the error above/);
+  assert.doesNotMatch(r.out, /resume it: SendMessage/, "the safe default is not a guess in either direction");
 });

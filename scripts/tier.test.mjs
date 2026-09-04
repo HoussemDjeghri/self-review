@@ -620,7 +620,8 @@ test("the plan brief.mjs is handed carries every field brief.mjs requires", () =
     "--plan", path.join(result.dir, "tier.json"), "--intent", intent, "--scope", result.scope, "--out", briefs,
   ], { encoding: "utf8" });
   assert.equal(brief.status, 0, brief.stderr);
-  assert.equal(brief.stdout.trim().split("\n").length, written.finders.length + 1);
+  // header + one row per finder + the line saying what the ledger carried
+  assert.equal(brief.stdout.trim().split("\n").length, written.finders.length + 2);
   for (const row of written.finders) {
     assert.match(readFileSync(path.join(briefs, `${row.name}.md`), "utf8"), /YOUR ANGLE/);
   }

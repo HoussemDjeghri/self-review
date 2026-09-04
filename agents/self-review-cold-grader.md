@@ -68,6 +68,8 @@ without saying so.
 - Budget: about 20 tool calls. The transcript is the work; the repository is context for it. At the budget, stop reading and write the JSON with what you have.
 - Be specific: `file` is a path from the scope file, `line` is a real line number in the current file. When a finding comes from the transcript rather than a line, cite the transcript path and quote the invocation and its output in `evidence`.
 
+**Your last message is the report.** The caller reads it with `salvage.mjs`, which prints the final message of your transcript and nothing else — so the JSON must be that message, with no summary sentence after it. Never deliver it through `SendMessage` or any other channel: on 2026-09-03 three reviewers reported that way, every call returned `success:true`, nothing was delivered, and the lead sat idle for 2h49m over reports that were already on disk. A report sent anywhere else is a report nobody receives.
+
 ## Output — exactly this JSON (plus `omitted` on a sixth candidate when the cap cut more), nothing after it
 
 ```json

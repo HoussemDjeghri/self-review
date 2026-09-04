@@ -35,6 +35,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { LOG_DIR, isMain, loadConfig, realpathOr } from "../hooks/lib/config.mjs";
+import { auditEngagement, engagementFile, engagementLine, openEngagement } from "../hooks/lib/engagement.mjs";
 import { parseDiff } from "./lib/diff.mjs";
 import { classifyPath } from "./lib/paths.mjs";
 import { gitRoot } from "./lib/repo.mjs";
@@ -604,6 +605,10 @@ const FLAGS = {
   record: ["work", "review", "round", "in", "repo", "log-dir"],
   prior: ["scope", "out", "max", "work", "review", "repo", "log-dir"],
   converge: ["work", "review", "round", "budget", "repo", "log-dir"],
+  // Ruling 1's item 2: tree-guard proves it engaged, and this opens the log it
+  // proves it into. `round.sh` runs it before any reviewer starts; `converge`
+  // reads it back.
+  engagement: ["work", "review", "round", "repo", "log-dir"],
 };
 
 // Rows the memory file holds but no reader can use. Said on stderr, never
@@ -645,7 +650,7 @@ const tally = (records) =>
 export function main(argv, { log = console.log, stdin } = {}) {
   const [command, ...rest] = argv;
   if (!command || !Object.hasOwn(FLAGS, command)) {
-    throw usage(`pass a command: record, prior or converge${command ? ` (not ${command})` : ""}`);
+    throw usage(`pass a command: record, prior, converge or engagement${command ? ` (not ${command})` : ""}`);
   }
   const options = parseArgs(rest, FLAGS[command]);
   // One way to say it per call: two spellings of one identity is what this
@@ -671,6 +676,14 @@ export function main(argv, { log = console.log, stdin } = {}) {
     return result;
   }
 
+  if (command === "engagement") {
+    const round = Number(options.round ?? 1);
+    if (!Number.isInteger(round) || round < 1) throw usage(`--round needs a positive integer, not ${JSON.stringify(options.round)}`);
+    const file = openEngagement(repoRoot, round, { logDir });
+    log(`# tree-guard engagement log open for round ${round} → ${file}`);
+    return { file, round };
+  }
+
   if (command === "converge") {
     const { records, skipped, malformed } = readRecords(findingsFile(repoRoot, { logDir }));
     warnUnusable(skipped, malformed);
@@ -689,6 +702,16 @@ export function main(argv, { log = console.log, stdin } = {}) {
     if (result.earned) log(`# round ${round} closed a ${result.tail}: one more round, then the budget is spent whatever it finds`);
     log(`${result.verdict} — ${result.reason}`);
     log(`# the W rule and the round budget${budget === null ? " (none given: W only)" : ""}; the oscillation check and the ledger's open items stay with you (SKILL §3)`);
+    // Did the guard that protects the author's tree actually watch this round?
+    // Silence here used to be indistinguishable from "watching nothing".
+    let engagement = "";
+    try { engagement = readFileSync(engagementFile(repoRoot, logDir), "utf8"); } catch { /* no log here: auditEngagement reports the absence */ }
+    // Unconditionally, including for the empty string: a missing log is
+    // `opened: false`, which has a line of its own, and gating on truthiness
+    // made that line — the one for the case SKILL.md §3 names — unreachable
+    // from the only caller. An audit that goes silent when it has nothing to
+    // read is the shape this instrument exists to abolish.
+    log(engagementLine(auditEngagement(engagement, { round })));
     return result;
   }
 

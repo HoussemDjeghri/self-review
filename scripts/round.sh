@@ -184,6 +184,75 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # "pre-flight ran and this project defines nothing to run" from "pre-flight
   # never ran", and those call for opposite reactions.
   pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
+
+  # Ruling 1, item 3: the shipped suite, run in the shape it SHIPS in.
+  #
+  # The staged copy above is the repository at a foreign path, which is a
+  # different property: the tests there still walk up to a repository root that
+  # is present. In an install this project's `plugin/` contents ARE the root, so
+  # a test that walks upward reaches the plugin cache and a test that names a
+  # repo-root path finds nothing. Ten tests were in that state when release.sh
+  # gained the same check; four failed and the rest passed over a tree that was
+  # not the tree they meant, which is the worse half. That check runs at release
+  # time, which is the last moment to learn it — this one runs in round 1.
+  #
+  # Off unless a project names its artifact root, because only the project knows
+  # which subdirectory becomes the root of the thing it ships.
+  #
+  # `preflight.artifactRoot` is deliberately NOT in REPO_ADDITIVE — a repository
+  # is the attacker in that threat model — so the only place that can set it is
+  # the reviewing user's own `~/.claude/self-review/config.json`, which is
+  # global to them and not scoped to a repository. That is the blast radius:
+  # setting it for one project also names that subdirectory in every other
+  # project reviewed afterwards. Hence the SKIP below rather than a FAIL, and
+  # hence SKILL.md §1 documenting the key beside `preflight.skip`.
+  #
+  # Same three failure modes as release.sh's, for the same reasons: an empty
+  # walk is a failure, a non-zero exit is a failure, and a ZERO exit is believed
+  # only when the runner's own TAP plan says a suite ran and none of it failed —
+  # `node --test` writes no TAP at all when NODE_TEST_CONTEXT is set, and exits
+  # 0 while doing it.
+  artifact_root="$(SELF_REVIEW_LIB="$here/../hooks/lib/config.mjs" SELF_REVIEW_ROOT="${repo_root:-$(pwd)}" node -e '
+    import(process.env.SELF_REVIEW_LIB)
+      .then((m) => process.stdout.write(String(m.loadConfig(process.env.SELF_REVIEW_ROOT).preflight?.artifactRoot ?? "")))
+      .catch(() => {});' 2>/dev/null || true)"
+  if [ -n "$artifact_root" ] && [ -d "${repo_root:-$(pwd)}/$artifact_root" ]; then
+    ship_root="$dir/artifact-root"
+    rm -rf "$ship_root"
+    if cp -R "${repo_root:-$(pwd)}/$artifact_root" "$ship_root" 2>"$dir/artifact.err"; then
+      ship_tests=()
+      while IFS= read -r -d "" f; do ship_tests+=("$f"); done < <(
+        find "$ship_root" -name '.*' -prune -o -name '*.test.mjs' -print0 2>/dev/null | sort -z)
+      if [ "${#ship_tests[@]}" -eq 0 ]; then
+        # SKIP, not FAIL. The key is global to the user (see the comment above),
+        # so this directory may belong to a project that never asked for the
+        # check — and a project whose shipped suite is pytest, go test or vitest
+        # has no *.test.mjs to find either. SKILL.md §1 tells the lead to fix
+        # what pre-flight fails before spending reviewers, and a failure that is
+        # not the reviewed repo's failure spends the round arguing with itself.
+        # The suite being RED is still a FAIL; only "there was nothing here to
+        # run" is a skip, and it says so rather than staying silent.
+        pf="$pf
+SKIP artifact-suite  no *.test.mjs under $artifact_root/ — nothing to run as the installed root"
+      else
+        ship_rc=0
+        ( cd "$ship_root" && env -u NODE_TEST_CONTEXT -u NODE_OPTIONS \
+            SELF_REVIEW_LOG_DIR="$dir/artifact-log" HOME="${pf_home:-$HOME}" \
+            node --test --test-reporter tap "${ship_tests[@]}" ) >"$dir/artifact-suite.txt" 2>&1 || ship_rc=$?
+        ship_plan="$(awk '/^# tests [1-9]/{t=1} /^# fail 0$/{f=1} END{print (t && f) ? "yes" : "no"}' "$dir/artifact-suite.txt" 2>/dev/null)"
+        ship_count="$(awk '/^# tests [0-9]+$/{print $3}' "$dir/artifact-suite.txt" 2>/dev/null | tail -1)"
+        if [ "$ship_rc" -eq 0 ] && [ "$ship_plan" = "yes" ]; then
+          pf="$pf
+PASS artifact-suite  ${ship_count:-?} tests green with $artifact_root/ as the root"
+        else
+          pf="$pf
+FAIL artifact-suite  the suite is not green with $artifact_root/ as the root (exit $ship_rc) — see $dir/artifact-suite.txt"
+        fi
+      fi
+    else
+      echo "round.sh: could not copy $artifact_root/ for the artifact-root suite (${dir}/artifact.err) — angle-blind to install-shape failures this round" >&2
+    fi
+  fi
 fi
 
 # Guarded like pre-flight, and unlike tier.mjs below: a missing impact.json is
@@ -247,6 +316,14 @@ printf '%s\n' "$plan_out"
 
 # Written even when empty, so the chain does not break on a repo with no memory.
 "$here/findings.mjs" prior --scope "$scope" --out "$dir/prior.md" --work "$work" >/dev/null
+
+# Ruling 1, item 2. tree-guard's allow path and its inert path are the same
+# silence, which is how it went unnoticed that a named agent's `agent_type` is
+# its NAME and the guard had therefore matched none of roughly ninety finders.
+# Opening the log here is what scopes the guard's writes to a repository with a
+# review in progress; `findings.mjs converge` reads it back at the end of the
+# round and says whether the guard watched anything.
+"$here/findings.mjs" engagement --work "$work" --round "$round" ${repo_root:+--repo "$repo_root"} >/dev/null || true
 
 ledger="$work/ledger.md"
 [ -f "$ledger" ] || echo "_No dismissals yet._" > "$ledger"

@@ -109,6 +109,10 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
     return {
       name, stateLines, calls: agent.calls, lastAt: agent.lastAt,
       status: agentStatus(agent, now, config),
+      // The row carries the error itself, because which KIND it is decides the
+      // remedy and only the transcript knows: a nudge resumes a dropped
+      // connection and merely spends another refusal against a quota limit.
+      stall: agent.apiError,
       note: "",
     };
   });
@@ -119,7 +123,30 @@ export function render(rows, verdict) {
   const lines = rows.map((r) =>
     `${r.name.padEnd(width)}  ${r.status.padEnd(8)}  last ${r.lastAt.padEnd(19)}  ${String(r.calls).padStart(3)} calls  ` +
     `${r.stateLines} filed${r.note ? `  (${r.note})` : ""}`);
-  return [...lines, verdict].join("\n");
+  return [...lines, verdict, ...stallAdvice(rows)].join("\n");
+}
+
+// A stalled reviewer is the one status whose remedy is neither "collect it"
+// nor "give up on it", so the table alone would not be actionable: the caller
+// has to be told, per agent, that the work is intact and what to send. The
+// error text is quoted rather than classified away — a 522 and a reset time
+// are different facts and the lead is the one acting on them.
+export function stallAdvice(rows) {
+  const stalled = rows.filter((r) => r.status === "stalled");
+  if (stalled.length === 0) return [];
+  return [
+    "# A stalled reviewer is NOT a dead one: it stopped on an API error with its work and",
+    "# its context intact, so it is resumed, never re-spawned from zero (§2f is for dead).",
+    ...stalled.flatMap((r) => [
+      `#   ${r.name}: ${(r.stall?.text ?? "an API error").split("\n")[0].slice(0, 100)}`,
+      {
+        quota: "#     → a quota refusal: a nudge now only spends another one. Resume after the reset above.",
+        transient: `#     → resume it: SendMessage to "${r.name}" with "resume", then call wait.mjs again.`,
+      }[r.stall?.kind] ??
+        "#     → an API-error shape this plugin has not measured: READ the error above before acting. " +
+        "Resume only if it is transient; if it is a limit, waiting is the only thing that works.",
+    ]),
+  ];
 }
 
 const count = (rows, status) => rows.filter((r) => r.status === status).length;
@@ -195,7 +222,7 @@ export async function main(argv, {
   // The table is worth printing even when the tool timeout, not this script,
   // ends the call — otherwise a wait that ran too long tells the lead nothing.
   const onSignal = () => {
-    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "dead")} dead, ${count(rows, "active")} active`));
+    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`));
     process.exit(1);
   };
   process.on("SIGTERM", onSignal);
@@ -219,7 +246,7 @@ export async function main(argv, {
 
     const active = count(rows, "active");
     const verdict = {
-      0: `# settled — ${count(rows, "finished")} finished, ${count(rows, "dead")} dead. Collect the finished reports (§2c); a dead one goes to §2f.`,
+      0: `# settled — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead. Collect the finished reports (§2c); a dead one goes to §2f.`,
       1: `# ${active} still active, ${Math.max(0, Math.round((budgetEndsMs - now()) / 60_000))}m of budget left — call wait.mjs again as the very next tool call.`,
       3: `# budget spent after ${config.budgetMinutes}m — treat the ${active} still active as dead (§2f).`,
     }[exitCode];

@@ -470,6 +470,32 @@ test("CLI: converge reads this review's own records and names the rule it did no
   assert.match(after.stdout, /round 2  W=1/, "and does not inflate the round's own score");
 });
 
+// The call site, not the pure function. `auditEngagement("")` was already
+// covered in engagement.test.mjs and already returned `opened: false` — but
+// converge gated the whole audit behind `engagement ? … : null`, so the line
+// for the case SKILL.md §3 names could not be reached from the only caller
+// that has one. A unit test on the function passes either way; that is the
+// gap this closes.
+test("CLI: converge says the guard proved nothing when no engagement log was opened", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = path.join(workdir(), "scratchpad", "self-review");
+  mkdirSync(work, { recursive: true });
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+
+  const silent = run(["converge", "--work", work, "--round", "1", "--log-dir", logDir]);
+  assert.equal(silent.status, 0, silent.stderr);
+  assert.match(silent.stdout, /no engagement log was opened for this round/,
+    "an absent log is the absence, not a pass — and converge is the only place that says so");
+
+  // And with one open, the same call site reports what the round proved,
+  // which is what makes the assertion above about the branch and not the CLI.
+  assert.equal(run(["engagement", "--work", work, "--round", "1", "--log-dir", logDir]).status, 0);
+  const opened = run(["converge", "--work", work, "--round", "1", "--log-dir", logDir]);
+  assert.doesNotMatch(opened.stdout, /no engagement log was opened/);
+  assert.match(opened.stdout, /# tree-guard/, "an open log still gets a line of its own");
+});
+
 test("CLI: converge logs its decision, so a granted round leaves a trace", () => {
   // `earned` is the one rule that grants a round past the budget, and it was
   // only ever printed: afterwards, a review that ran round budget+1 looked

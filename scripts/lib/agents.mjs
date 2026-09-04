@@ -2,8 +2,8 @@
 //
 // Two scripts need this and they used to disagree. `salvage.mjs` recovers a
 // dead reviewer's work; `wait.mjs` blocks until a round's reviewers are done.
-// Both answer the same question — is this agent finished, dead, or still
-// going — from the same file, so the answer lives here once.
+// Both answer the same question — is this agent finished, stalled, dead or
+// still going — from the same file, so the answer lives here once.
 //
 // The harness appends a subagent's transcript live to
 // <project>/<session-id>/subagents/agent-a<name>-<hash>.jsonl, one entry per
@@ -41,6 +41,38 @@ export function resolveSubagentsDir(place) {
   return hits[0]?.[0] ?? place;
 }
 
+// The harness writes a terminal notice as an assistant entry flagged
+// `isApiErrorMessage`, with a `<synthetic>` model and zeroed usage. It is
+// terminal: measured over 894 subagent transcripts on 2026-09-04, 93 carried
+// one and in every single case it was the LAST entry — no transcript ever
+// continued past it. So an agent that has one is neither active (it will never
+// write again) nor dead in the sense §2f means (its work is intact and it can
+// be resumed); it is stalled, and the caller has to be told which of the two
+// kinds it is, because the remedy is opposite:
+//
+//   - `quota` (89 of the 93) carries `quotaLimits.status: "rejected"` and a
+//     reset time in its text. Nudging it now just spends another refusal. Both
+//     tests are needed and OR'd: two of the 89 said "session limit" in the text
+//     with no `quotaLimits` block at all.
+//   - `transient` (4 of the 93: "Connection lost mid-response", a 522) resumes
+//     on a nudge, which is how this was found — the owner had to send one by
+//     hand to a reviewer that had sat stalled.
+//   - `unknown` is anything else, and it exists because the two above are a
+//     closed list taken from one machine on one day. A shape this has not seen —
+//     a reworded refusal, another `quotaLimits.status` — must not be guessed at
+//     in the expensive direction: defaulting it to resumable would nudge a live
+//     quota refusal and spend it. The caller is told to read the error instead.
+const apiErrorOf = (last) => {
+  if (last?.isApiErrorMessage !== true) return null;
+  const text = (Array.isArray(last.message?.content) ? last.message.content : [])
+    .filter((b) => b?.type === "text" && b.text).map((b) => b.text).join(" ").trim();
+  const body = text || String(last.error ?? "an API error with no text");
+  if (last.quotaLimits?.status === "rejected" || /hit your (session|usage|weekly) limit/i.test(body)) {
+    return { text: body, kind: "quota" };
+  }
+  return { text: body, kind: /^API Error\b/i.test(body) ? "transient" : "unknown" };
+};
+
 export function readAgent(file) {
   const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((line) => {
     try { return [JSON.parse(line)]; } catch { return []; } // a torn final line is expected in a killed transcript
@@ -68,6 +100,7 @@ export function readAgent(file) {
       content.some((b) => b?.type === "text" && b.text?.trim()) &&
       !content.some((b) => b?.type === "tool_use"),
     stopReason: last?.message?.stop_reason ?? null,
+    apiError: apiErrorOf(last),
     mtimeMs: statSync(file).mtimeMs,
     calls: model.length,
     ctx: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
@@ -79,7 +112,7 @@ export function readAgent(file) {
   };
 }
 
-// finished | dead | active. `now` and the thresholds are injected so this is
+// finished | stalled | dead | active. `now` and the thresholds are injected so
 // testable without sleeping.
 //
 // `stop_reason` alone cannot decide it: across 119 transcripts sampled on
@@ -94,6 +127,12 @@ export function agentStatus(agent, now, config = {}) {
   const stale = (config.staleSeconds ?? 660) * 1000;
   const quiet = now - agent.mtimeMs;
   if (agent.endsWithReport && (agent.stopReason === "end_turn" || quiet > settle)) return "finished";
+  // Before the staleness clock, because a stalled agent would otherwise spend
+  // the whole round budget reading as `active` and then be called dead — which
+  // is the 2h49m idle shape this file exists to end, arriving by another door.
+  // No settle window: the error is terminal in all 93 measured cases, so
+  // waiting to confirm it would only add latency to a verdict that cannot change.
+  if (agent.apiError) return "stalled";
   if (quiet > stale) return "dead";
   return "active";
 }

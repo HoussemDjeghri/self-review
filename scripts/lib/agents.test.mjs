@@ -27,6 +27,18 @@ const banner = () => ({
   message: { role: "assistant", stop_reason: "stop_sequence", usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 }, content: [text("You've hit your session limit")] },
 });
 
+// The harness's terminal notice, in the shape measured on 2026-09-04 across
+// 894 subagent transcripts: an assistant entry flagged `isApiErrorMessage`,
+// `<synthetic>` model, zeroed usage, and — for the 89 quota refusals of the 93
+// — a `quotaLimits` block. Two of those 89 carried the reset text with no
+// block, which is why the classifier ORs the two tests and why this builder
+// can produce that combination.
+const apiError = (body, quotaLimits) => ({
+  type: "assistant", timestamp: stamp(), isApiErrorMessage: true, error: body,
+  ...(quotaLimits ? { quotaLimits } : {}),
+  message: { role: "assistant", model: "<synthetic>", stop_reason: "stop_sequence", usage: { input_tokens: 0, output_tokens: 0 }, content: [text(body)] },
+});
+
 let dir = null;
 const transcript = (name, entries, ageSeconds = 0) => {
   dir ??= mkdtempSync(path.join(tmpdir(), "agents-"));
@@ -143,4 +155,57 @@ test("a name the harness itself renamed still resolves, because ranking does not
   writeFileSync(file, JSON.stringify(said([text("x")], "end_turn")) + "\n");
   assert.deepEqual(findAgentFiles(home, "finder-r1-gqv", 0), [file],
     "four of six agents in the round that found this were renamed this way");
+});
+
+test("a transcript ending on an API error is stalled, not active and not dead", () => {
+  // Measured 2026-09-04: 93 of 894 transcripts end on one of these and NONE
+  // ever continued past it. Before this, all 93 read `active` until the round
+  // budget burned and were then called dead — a reviewer whose work and context
+  // were intact, thrown away after 30 minutes of an idle lead.
+  const agent = transcript("stalled-1", [said([text("reading"), uses("Read")]), apiError("API Error: Connection lost mid-response. The response above may be incomplete.")]);
+  assert.equal(at(agent, 0), "stalled");
+  assert.equal(at(agent, 5), "stalled");      // immediately, with no settle window
+  assert.equal(at(agent, 100_000), "stalled"); // and it never decays into `dead`
+  assert.equal(agent.apiError.kind, "transient");
+});
+
+test("a quota refusal is stalled but NOT resumable, because a nudge spends another one", () => {
+  const agent = transcript("stalled-2", [said([text("reading"), uses("Read")]),
+    apiError("You've hit your session limit · resets 6:20pm (Africa/Algiers)", { status: "rejected", resetsAt: 1787327400 })]);
+  assert.equal(at(agent, 0), "stalled");
+  assert.equal(agent.apiError.kind, "quota");
+  assert.match(agent.apiError.text, /resets 6:20pm/, "the reset time is the one fact the caller needs, so it is carried verbatim");
+});
+
+test("a quota refusal with no quotaLimits block is still a quota refusal", () => {
+  // Two of the 89 measured refusals had the text and no block. Either test
+  // alone would have called those resumable and sent a nudge into a rejection.
+  const agent = transcript("stalled-3", [said([text("x"), uses("Read")]), apiError("You've hit your session limit · resets 3:30pm (Africa/Algiers)")]);
+  assert.equal(agent.apiError.kind, "quota");
+});
+
+test("an API error entry is not mistaken for the agent's report", () => {
+  // It is an assistant entry carrying text and no tool_use — the report shape
+  // exactly — and only the billing check keeps it out. If that check is ever
+  // relaxed, this fails rather than a stalled agent being collected as done.
+  const agent = transcript("stalled-4", [said([text("x"), uses("Read")]), apiError("API Error: 522")]);
+  assert.equal(agent.endsWithReport, false);
+  assert.equal(at(agent, 100_000), "stalled");
+});
+
+test("a healthy transcript has no apiError, so the status logic is untouched by this", () => {
+  const agent = transcript("healthy-1", [said([text("done")], "end_turn")]);
+  assert.equal(agent.apiError, null);
+  assert.equal(at(agent, 0), "finished");
+});
+
+test("an API-error shape this plugin has not measured is `unknown`, never assumed resumable", () => {
+  // The two kinds above are a closed list, taken from one machine on one day. A
+  // reworded refusal or another quotaLimits.status falls through both — and
+  // guessing `transient` there tells the lead to nudge a live quota refusal,
+  // spending the very thing the classification exists to protect.
+  const agent = transcript("stalled-5", [said([text("x"), uses("Read")]),
+    apiError("Request throttled by the upstream gateway", { status: "throttled" })]);
+  assert.equal(at(agent, 0), "stalled");
+  assert.equal(agent.apiError.kind, "unknown");
 });

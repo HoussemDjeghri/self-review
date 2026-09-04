@@ -445,3 +445,54 @@ test("--force without --reason dies before any script runs", () => {
   assert.match(done.stderr, /^round\.sh: --force needs --reason/);
   assert.doesNotMatch(done.stderr, /tier\.mjs/);
 });
+
+// The installed-root suite (ruling 1, item 3). `preflight.artifactRoot` names
+// the subdirectory that becomes the root of what the project ships, and round 1
+// runs that subdirectory's tests with it AS the root — the shape an installed
+// copy has and the repository never does.
+const withArtifactRoot = (repo, artifactRoot) => {
+  const cfg = path.join(mkdtempSync(path.join(tmpdir(), "round-cfg-")), "config.json");
+  writeFileSync(cfg, JSON.stringify({ preflight: { skip: ["*"], artifactRoot } }));
+  return (args) => spawnSync("bash", [ROUND, ...args], { cwd: repo, encoding: "utf8", env: { ...process.env, SELF_REVIEW_CONFIG: cfg } });
+};
+
+test("the shipped subdirectory's suite runs with that subdirectory as the root", () => {
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "ship"), { recursive: true });
+  // A test that resolves a path against ITS OWN root — green from the artifact
+  // root, and the whole reason this check exists.
+  writeFileSync(path.join(repo, "ship", "a.test.mjs"),
+    'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { existsSync } from "node:fs";\nimport path from "node:path";\nimport { fileURLToPath } from "node:url";\ntest("ships its own manifest", () => { assert.ok(existsSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "marker.txt"))); });\n');
+  writeFileSync(path.join(repo, "ship", "marker.txt"), "here\n");
+  const r = withArtifactRoot(repo, "ship")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.match(r.stdout, /PASS artifact-suite\s+1 tests green with ship\/ as the root/, r.stdout + r.stderr);
+});
+
+test("a red suite under the artifact root is a FAIL, and names where to read it", () => {
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "ship"), { recursive: true });
+  writeFileSync(path.join(repo, "ship", "a.test.mjs"),
+    'import { test } from "node:test";\nimport assert from "node:assert/strict";\ntest("red", () => assert.equal(1, 2));\n');
+  const r = withArtifactRoot(repo, "ship")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.match(r.stdout, /FAIL artifact-suite/, r.stdout + r.stderr);
+});
+
+test("a named root with no node tests is a SKIP, not a failure of the repository under review", () => {
+  // The key can only be set in the reviewing USER's global config — it is not
+  // in REPO_ADDITIVE — so the named directory may belong to a project that
+  // never asked for this, or to one whose suite is pytest or go test. SKILL.md
+  // §1 tells the lead to fix what pre-flight fails before spending reviewers,
+  // and a FAIL here would send it to fix a failure that is not the repo's.
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "ship"), { recursive: true });
+  writeFileSync(path.join(repo, "ship", "test_thing.py"), "def test_thing():\n    assert True\n");
+  const r = withArtifactRoot(repo, "ship")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.match(r.stdout, /SKIP artifact-suite\s+no \*\.test\.mjs under ship\//, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /FAIL artifact-suite/);
+});
+
+test("no artifactRoot means the check does not run at all", () => {
+  const { repo, work } = fixture();
+  const r = withArtifactRoot(repo, "")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.doesNotMatch(r.stdout, /artifact-suite/, r.stdout + r.stderr);
+});

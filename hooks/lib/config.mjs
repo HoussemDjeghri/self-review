@@ -36,7 +36,7 @@ export const FALLBACK = {
   gate: { maxReminders: 2 },
   pollGuard: { maxChecks: 2 },
   brief: { maxTokens: 2800, impactMaxLines: 80, priorMaxLines: 10 },
-  preflight: { skip: [] },
+  preflight: { skip: [], artifactRoot: "" },
   // wait.mjs's clocks, all seconds but the last. `callSeconds` is under the
   // Bash tool's 600 s ceiling so the script, not the tool, ends the call and
   // the table still gets printed. `settleSeconds` is longer than the largest
