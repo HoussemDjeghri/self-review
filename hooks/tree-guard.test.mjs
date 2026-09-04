@@ -237,7 +237,7 @@ test("a shell wrapper is not a hiding place: the gate saw through these, the gua
     `sudo -u root bash -c "git clean -fd"`, `env FOO=1 git add -A`, `command git rm f`, `exec git commit -m x`]) {
     assert.ok(denied(command), command);
   }
-  assert.ok(denied(`bash -c "rm -rf ./build"`), "the rm rule reads command position the same way");
+  assert.ok(denied(`bash -c "git clean -fd"`), "the git rule reads command position the same way");
   assert.equal(denied(`bash -c "git log --oneline"`), false, "unwrapping does not make a read into a write");
 });
 
@@ -256,105 +256,34 @@ test("recursion into an inline shell is bounded", () => {
   // `sh -c`); past the cap the hook stops unwrapping rather than recursing on
   // adversarial input, because a stack overflow fails open.
   assert.ok(denied(`sudo -u root bash -c "sh -c 'git reset --hard'"`), "the depth a real wrapper reaches");
-  assert.equal(offence(`bash -c 'git reset --hard'`, "/repo", 4), null, "at the cap it stops unwrapping");
-});
-
-test("a recursive rm is judged by where it points", () => {
-  assert.ok(denied("rm -rf build"), "relative: inside the working directory");
-  assert.ok(denied("rm -rf /repo/build"));
-  assert.equal(denied("rm -rf /tmp/scratch/probe"), false, "the scratchpad is where a reviewer may write");
-  assert.equal(denied("rm /repo/build/one.o"), false, "not recursive");
-  assert.equal(denied("rm -rf"), false, "no operand, nothing to judge");
+  assert.equal(offence(`bash -c 'git reset --hard'`, 4), null, "at the cap it stops unwrapping");
 });
 
 test("a backslash does not hide the command name from the guard", () => {
   // `words()` already stripped ONE escaping mechanism and not the other, so
-  // `r"m"` was caught and `r\m` walked straight through — a reviewer could
-  // recursively delete the author's uncommitted work past the guard whose only
-  // job is to stop exactly that. Bash's top-level rule is the same for both:
-  // drop the backslash, take the next character literally.
-  assert.ok(denied("r\\m -rf ."), "the reported bypass");
-  assert.ok(denied("r\\m -rf /repo/build"));
-  assert.ok(denied("\\rm -rf ."), "the idiom that skips an alias is still rm");
-  assert.ok(denied("rm -r\\f ."), "an escaped flag is still the flag");
-  assert.ok(denied('r"m" -rf .'), "quotes were always stripped; this is the pair");
-  assert.equal(denied("r\\m -rf /tmp/scratch/probe"), false, "the scratchpad exemption survives normalising");
+  // `g"it"` was caught and `g\\it` walked straight through — a reviewer could
+  // revert the author's uncommitted work past the guard whose only job is to
+  // stop exactly that. Bash's top-level rule is the same for both: drop the
+  // backslash, take the next character literally.
+  assert.ok(denied("g\\it checkout -- ."), "the reported bypass");
+  assert.ok(denied("\\git reset --hard"), "the idiom that skips an alias is still git");
+  // Not `git re\\set --hard`: an unrecognised verb is denied anyway, so that
+  // assertion stays green with the stripping reverted and tests nothing. The
+  // direction that flips is a READING verb, which is only allowed once the
+  // backslash is gone — unstripped, `st\\atus` is not a verb this rule knows.
+  assert.equal(denied("git st\\atus"), false, "an escaped reading verb is still readable");
+  assert.ok(denied('g"it" checkout -- .'), "quotes were always stripped; this is the pair");
+  assert.equal(denied("g\\it status"), false, "normalising does not make a reading verb a write");
 });
 
 test("a line continuation is not a command separator", () => {
   // Splitting on the raw newline left the verb alone in one segment and its
   // flags and operand in the next, so neither segment alone tripped anything.
   // Wrapping a long command across two lines is ordinary style, not evasion.
-  assert.ok(denied("rm \\\n-rf /repo/build"), "the verb and its flags rejoin");
-  assert.ok(denied("git\\\n reset --hard"));
-  assert.ok(denied("rm -rf \\\n/repo/build"), "continuation before the operand");
-  assert.equal(denied("rm \\\n-rf /tmp/scratch/probe"), false, "rejoining does not over-deny");
+  assert.ok(denied("git\\\n reset --hard"), "the verb and its flags rejoin");
+  assert.ok(denied("git \\\ncheckout -- ."));
+  assert.equal(denied("git \\\nstatus"), false, "rejoining does not over-deny");
   assert.equal(denied("echo one\ntwo"), false, "a bare newline still separates");
-});
-
-test("a removal is judged by where the path resolves, not by how it is spelled", () => {
-  // This compared strings, so an operand that merely STARTED with an exempt
-  // prefix was exempt wherever it actually pointed. No escaping required.
-  assert.ok(denied("rm -rf /tmp/scratch/../../repo/build"), "traversal back into the tree");
-  assert.ok(denied("rm -rf /repo/../repo/build"), "a detour that lands inside");
-  assert.ok(denied("rm -rf ."), "cwd itself");
-  assert.ok(denied("rm -rf /repo/x/../y"), "resolves to a path inside");
-  assert.equal(denied("rm -rf /tmp/scratch/probe/../other"), false, "still outside after resolving");
-  assert.equal(denied("rm -rf /repo/../elsewhere"), false, "leaves the tree, and is not ours to deny");
-});
-
-test("how cwd is spelled does not change what is inside it", () => {
-  // The first version of the resolve fix compared `resolved.startsWith(cwd + sep)`,
-  // which builds a doubled separator when cwd already ends in one — and no
-  // resolved path starts with `//`, so the check went silently false for the
-  // whole call. Nothing sanitises `payload.cwd`, and every existing test used
-  // `/repo` with no trailing slash, so the bug was invisible.
-  for (const cwd of ["/repo", "/repo/", "/repo//"]) {
-    assert.ok(offence("rm -rf build", cwd), `relative operand, cwd ${cwd}`);
-    assert.ok(offence("rm -rf .", cwd), `cwd itself, cwd ${cwd}`);
-    assert.ok(offence("rm -rf /repo/build", cwd), `absolute operand inside, cwd ${cwd}`);
-    assert.equal(offence("rm -rf /tmp/scratch/probe", cwd), null, `outside stays allowed, cwd ${cwd}`);
-  }
-  // A reviewer whose cwd is the filesystem root has everything inside it, so
-  // everything is denied. Fail closed: that is the safe direction here.
-  assert.ok(offence("rm -rf /repo", "/"), "cwd is root: the repo is inside it");
-  assert.ok(offence("rm -rf build", "/"), "cwd is root: a relative operand too");
-});
-
-test("deleting an ancestor deletes the working directory with it", () => {
-  // `..` and `../sibling` both spell their relative path with a leading `..`,
-  // and reading them as one case allowed the ancestor. Removing `..` removes
-  // cwd as collateral, which is the whole harm this guard exists to prevent.
-  for (const operand of ["..", "../..", "../../..", "sub/../..", "/repo/.."]) {
-    assert.ok(offence(`rm -rf ${operand}`, "/repo"), `ancestor: ${operand}`);
-  }
-  // A disjoint sibling is genuinely outside and cannot touch the author's work.
-  // Denying it is not this guard's business — a deliberate narrowing of the
-  // original check, which denied every relative operand indiscriminately.
-  assert.equal(offence("rm -rf ../sibling", "/repo"), null, "disjoint sibling stays allowed");
-  assert.equal(offence("rm -rf ../repotypo", "/repo"), null, "a sibling whose name shares a prefix");
-});
-
-test("with no cwd to compare against, a recursive rm is denied outright", () => {
-  // This denied a relative operand and allowed every absolute one, having
-  // compared it against nothing — fail-open at the moment the guard knows
-  // least. `evaluate()` always passes a string, so it should be unreachable.
-  for (const cwd of ["", undefined, null]) {
-    assert.ok(offence("rm -rf /repo/build", cwd), `absolute operand, cwd ${cwd}`);
-    assert.ok(offence("rm -rf build", cwd), `relative operand, cwd ${cwd}`);
-  }
-});
-
-test("a prefix's own words are not rm's operands or rm's flags", () => {
-  // The command-position fix moved where `rm` is looked for and left the
-  // operand slice at token 1, so `"rm"` itself scored as a relative operand and
-  // the guard denied the very cleanup its docstring allows.
-  for (const command of ["sudo rm -rf /tmp/scratch/probe", "sudo -u root rm -rf /tmp/scratch/probe",
-    "env FOO=1 rm -rf /tmp/scratch/probe", "time rm -rf /tmp/scratch/probe"]) {
-    assert.equal(denied(command), false, command);
-  }
-  assert.equal(denied("xargs -r rm /repo/build/one.o"), false, "xargs' own -r is not rm's --recursive");
-  assert.ok(denied("sudo rm -rf ./build"), "and the wrapped removal inside the tree is still denied");
 });
 
 test("the lead is untouched: without agent_id the hook says nothing", () => {
@@ -375,7 +304,6 @@ test("a bare agent type with no plugin prefix is still a reviewer", () => {
 
 test("offence() reports the verb it found, for the message", () => {
   assert.match(offence("git reset --hard"), /`git reset`.*only read/);
-  assert.match(offence("rm -r x", "/repo"), /recursive/);
   assert.equal(offence("node --test x.test.mjs"), null);
 });
 
@@ -421,4 +349,22 @@ test("every shipped agent that has a shell is inside tree-guard", () => {
     assert.ok(denied("git stash", { agent_type: type }),
       `${file} carries Bash and is outside tree-guard: its shell can reach git`);
   }
+});
+
+test("the rm rule is deliberately gone, and this is what keeps it gone", () => {
+  // Six patches in one day, three of them repairing the previous patch, and the
+  // round after the sixth still found `nice rm -rf build` plus every other
+  // wrapper word nobody enumerated. Counted rather than argued: across every
+  // transcript on the machine the rule had saved zero lines of uncommitted work
+  // and denied three legitimate reviewer actions. A prose freeze did not hold —
+  // it was overridden six times by rounds that each felt like the exception —
+  // so the decision is a test now. If you are here because you want the rm rule
+  // back, the thing to bring is a treecheck line from a real round naming work
+  // a reviewer's `rm` destroyed that the snapshot could not restore. Today that
+  // count is zero, and until it isn't, this guard does not model `rm` at all.
+  for (const command of ["rm -rf .", "rm -rf /repo/build", "rm -rf ..",
+    "nice rm -rf build", "rm -rf -", "rm -rf . --", "\\rm -rf ."]) {
+    assert.equal(denied(command, { cwd: "/repo" }), false, command);
+  }
+  assert.equal(offence("rm -rf ."), null, "offence() has no rm opinion left");
 });

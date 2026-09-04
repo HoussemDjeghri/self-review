@@ -41,9 +41,26 @@
  * above, and is F9 in `docs/design-notes/orchestration-cost.md`. Do not read a
  * passing command here as a safe one.
  *
+ * THE `rm` HALF IS GONE, and its removal is the freeze note above finally being
+ * obeyed rather than restated. It was patched six times in one day — three of
+ * those repairing damage the previous patch caused — and the round after the
+ * sixth still found two more (`nice rm -rf build`, and every other wrapper word
+ * absent from COMMAND_PREFIXES: ionice, stdbuf, setsid, caffeinate). Then the
+ * field record was counted instead of argued: across every transcript on the
+ * machine, the rm rule had saved **zero** lines of uncommitted work and denied
+ * **three** legitimate reviewer actions, all of them a finder resetting its own
+ * scratchpad through a variable this hook cannot resolve. It was costing review
+ * coverage — the product — to protect nothing measurable. What a careless
+ * reviewer's `rm` can still destroy is recoverable from the snapshot ref, which
+ * is tested end to end including the untracked case; what the snapshot cannot
+ * undo (a recursive delete of `.git`, or of a precious *ignored* file) was
+ * already outside this hook's threat model. The git half stays: it is an
+ * allowlist of reading verbs, closed by construction, and unlike rm it has a
+ * real field record — `git stash` and `git tag` denials, the exact tidying-up
+ * class it was built for. Ruled by a headless Fable session, 2026-09-04.
+ *
  * Fails open (silent exit 0) on anything unexpected; TREE_GUARD=off disables.
  */
-import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
 import { isMain } from "./lib/config.mjs";
 import { afterPrefixes, inlineShell, words } from "./lib/shell.mjs";
@@ -160,65 +177,6 @@ function readsOnly(git) {
 }
 
 /**
- * A recursive `rm` whose operands are not all safely outside the working
- * directory. "Tracked" is not a question a hook can answer without running
- * git in the reviewer's own repo, so the rule is the one it can: absolute
- * paths outside `cwd` are the reviewer's scratchpad and are allowed.
- */
-function recursiveRemoval(tokens, cwd) {
-  const at = afterPrefixes(tokens);
-  if (tokens[at] !== "rm") return false;
-  // Everything after `rm`, not after token 0: a prefix's own words are not
-  // rm's. Left at `slice(1)`, `sudo rm -rf <scratchpad>` scored `"rm"` itself as
-  // a relative operand and denied the reviewer's legitimate cleanup, and
-  // `xargs -r rm f` matched xargs' `-r` as rm's `--recursive`.
-  const rest = tokens.slice(at + 1);
-  const flags = rest.filter((token) => token.startsWith("-"));
-  if (!flags.some((flag) => flag === "--recursive" || /^-[^-]*r/i.test(flag))) return false;
-  const operands = rest.filter((token) => !token.startsWith("-"));
-  if (!operands.length) return false;
-  // Resolve before comparing. This compared STRINGS, so an operand that merely
-  // started with an exempt prefix was exempt wherever it actually pointed:
-  // `rm -rf /tmp/scratch/../../repo/build` deletes inside the tree and was
-  // ALLOWED. That needed no escaping and no intent to evade — it is the plainly
-  // spelled removal this guard's own threat model is about, written with a `..`
-  // in it. `path.resolve` also subsumes the relative case the old check handled
-  // separately, since a relative operand resolves against `cwd` by definition.
-  return operands.some((operand) => {
-    // No cwd is nothing to compare against, so nothing can be placed — deny
-    // everything. This read `!path.isAbsolute(operand)`, which denied a
-    // relative operand and allowed every absolute one with no comparison
-    // performed at all, so `rm -rf <absolute path to the repo>` passed at
-    // exactly the moment the guard knew least. `evaluate()` always passes a
-    // string, so this should be unreachable; a branch that is unreachable and
-    // fails OPEN is the wrong pair.
-    if (!cwd) return true;
-    // `path.relative`, not a string prefix — it normalises BOTH sides, and the
-    // first version of this fix did not. `resolved.startsWith(cwd + sep)` built
-    // a doubled separator whenever `cwd` arrived with a trailing one (`/repo/`,
-    // or a cwd of `/`, which ends in one already), and no resolved path can
-    // start with `//`. The whole check went false: with cwd `/repo/`, both
-    // `rm -rf build` and `rm -rf /repo/build` were allowed. Nothing sanitises
-    // `payload.cwd`, and every test used the one spelling without a trailing
-    // slash — so the check read as correct and was off.
-    const rel = path.relative(cwd, path.resolve(cwd, operand));
-    if (rel === "") return true; // the operand IS the working directory
-    // "Outside cwd" is two different relationships and only one of them is
-    // safe. `../sibling` is disjoint — deleting it cannot touch the author's
-    // work, and it is not this guard's business. `..` and `../..` are
-    // ANCESTORS, and cwd sits inside them: deleting one deletes the working
-    // directory as collateral, which is precisely the harm here. Both spell
-    // their `rel` with a leading `..`, so the first version of this fix read
-    // them as one case and allowed the ancestor. An ancestor is exactly a rel
-    // made of nothing BUT `..` segments, whatever the operand's spelling —
-    // `sub/../..` resolves to the same place and collapses to the same rel.
-    const segments = rel.split(path.sep);
-    if (segments.every((segment) => segment === "..")) return true;
-    return segments[0] !== "..";
-  });
-}
-
-/**
  * The reason to deny this command, or null.
  *
  * `depth` bounds the recursion into `bash -c "…"` bodies: a wrapper nests in
@@ -227,7 +185,7 @@ function recursiveRemoval(tokens, cwd) {
  * failing open on a stack overflow is exactly the outcome the guard exists to
  * prevent.
  */
-export function offence(command, cwd = "", depth = 0) {
+export function offence(command, depth = 0) {
   // A line continuation is not a separator. Bash removes the backslash and the
   // newline and joins the lines into one command; splitting on that raw newline
   // left `rm` alone in one segment and `-rf /repo/build` in the next, and
@@ -239,14 +197,13 @@ export function offence(command, cwd = "", depth = 0) {
     if (!tokens.length) continue;
     const inline = inlineShell(tokens);
     if (inline !== null && depth < 4) {
-      const nested = offence(inline, cwd, depth + 1);
+      const nested = offence(inline, depth + 1);
       if (nested) return nested;
     }
     const git = gitVerb(tokens);
     if (git && !readsOnly(git)) {
       return `\`git ${git.verb}\` is not one of the git verbs that only read`;
     }
-    if (recursiveRemoval(tokens, cwd)) return "a recursive `rm` inside the working directory";
   }
   return null;
 }
@@ -267,7 +224,7 @@ export function evaluate(payload) {
   // that cannot write its audit line from holding a turn hostage.
   noteEngagement(typeof payload.cwd === "string" ? payload.cwd : "", agentType, matched, { session: payload.session_id });
   if (!matched) return null;
-  const reason = offence(payload.tool_input?.command ?? "", typeof payload.cwd === "string" ? payload.cwd : "");
+  const reason = offence(payload.tool_input?.command ?? "");
   if (!reason) return null;
   return {
     hookSpecificOutput: {
