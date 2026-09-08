@@ -742,3 +742,58 @@ test("every class the shipped reviewers can emit is one `record` accepts", () =>
       `class "${cls}" is emitted by a shipped reviewer and refused by record`);
   }
 });
+
+// Severity had no such test, and it drifted further than class ever did.
+// Measured across 76 field candidates from three days of use: `blocker`,
+// `blocking`, `major`, `high`, `moderate`, `medium`, `minor` and `low` — eight
+// spellings of three ranks, four synonym pairs, none of them collapsed by
+// anything. The ledger refuses the synonyms, which means the lead retypes each
+// one by hand and picks the rank itself; the whole point of the reviewer being
+// a fresh reader is lost at the moment the author re-grades its severity.
+// Same derivation as the class test above, for the same reason: the vocabulary
+// is stated in the shipped agent files, so a rank added there fails HERE.
+test("every severity the shipped reviewers can emit is one `record` accepts", () => {
+  const agentDir = path.join(HERE, "..", "agents");
+  const emitted = new Set();
+  for (const file of ["self-review-finder.md", "self-review-cold-grader.md"]) {
+    const text = readFileSync(path.join(agentDir, file), "utf8");
+    const line = text.split("\n").find((l) => l.includes('"severity":'));
+    assert.ok(line, `${file}: no "severity" line — the output block moved, and this test is now blind`);
+    for (const value of line.replace(/.*"severity":\s*"/, "").replace(/",?\s*$/, "").split("|")) {
+      emitted.add(value.trim());
+    }
+  }
+  assert.equal(emitted.size, 3, `expected the three ranks, parsed ${[...emitted].join(", ")}`);
+  for (const severity of emitted) {
+    assert.equal(recordProblem({ round: 1, verdict: "fixed", severity, class: "correctness", angle: "X", summary: "s", review: "r", file: "a.mjs" }), null,
+      `severity "${severity}" is emitted by a shipped reviewer and refused by record`);
+  }
+});
+
+test("a dismissal without a quoted counter-proof is refused at the ledger", () => {
+  const logDir = workdir(), repo = gitRepo();
+  const dismissal = (over = {}) => candidate({ verdict: "dismissed", ...over });
+  // Measured 2026-09-07 over 8 loops: 76 candidates, 3 verifiers. SKILL.md §2d
+  // has said "a dismissal without a quoted counter-proof is not a dismissal"
+  // since the loop shipped, and nothing checked it — so the field the whole
+  // rule rests on could be absent.
+  assert.throws(() => recordFindings([dismissal({ proof: "" })], { review: "r", round: 1, repoRoot: repo, logDir }),
+    /proof — a dismissal needs the counter-proof quoted/);
+  assert.throws(() => recordFindings([dismissal({ proof: "   \t " })], { review: "r", round: 1, repoRoot: repo, logDir }),
+    /proof — a dismissal needs the counter-proof quoted/, "whitespace is not a proof");
+  // The other two verdicts are untouched: an `open` finding has nothing to
+  // quote yet, and a `fixed` one is proved by the diff.
+  recordFindings([candidate({ verdict: "open", proof: "" }), candidate({ verdict: "fixed", proof: "" })],
+    { review: "r", round: 1, repoRoot: repo, logDir });
+  recordFindings([dismissal({ proof: "line 46 already guards it" })], { review: "r", round: 2, repoRoot: repo, logDir });
+  assert.deepEqual(stored(logDir, repo).map((row) => [row.verdict, row.proof]),
+    [["open", ""], ["fixed", ""], ["dismissed", "line 46 already guards it"]]);
+});
+
+test("`recordProblem` does NOT apply the dismissal-proof rule to stored rows", () => {
+  // Write-time only. Rows written before 2026-09-07 carry no proof, and
+  // failing them here would make `convergence`, `rankPrior` and `priorLines`
+  // drop them — the loop forgetting what it once found, which is the thing the
+  // rule exists to prevent.
+  assert.equal(recordProblem(kept({ verdict: "dismissed", proof: "" })), null);
+});

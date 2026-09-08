@@ -17,6 +17,10 @@
 # SELF_REVIEW_PREFLIGHT_TIMEOUT seconds (default 300); the kill reaches the
 # command's own shell, not always its grandchildren.
 #
+# A check is PASS, FAIL, INFRA or SKIP. INFRA is "the command could not be run
+# at all" (exit 126/127) and is counted apart from FAIL on purpose, so that a
+# genuine red still stands out against an environment that is broken.
+#
 # Exit 0 even when checks fail — a failing check is the report, not an error, so
 # the caller reads the report instead of branching on $?. Exit 2 is usage.
 set -uo pipefail
@@ -43,7 +47,13 @@ while [ $# -gt 0 ]; do
     --root) [ $# -ge 2 ] || { echo "preflight.sh: --root needs a directory" >&2; exit 2; }
             root="$2"; shift 2 ;;
     --root=*) root="${1#--root=}"; shift ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    # Derived, not a line range: the range was '2,21p' and this header grew by
+    # four lines, so --help silently stopped printing its last paragraph. The
+    # header runs from the shebang to the first `set -`, which is the same form
+    # round.sh, treecheck.sh, coldrun.sh and scope.sh use — and unlike a
+    # stop-at-the-first-non-comment scan it survives a blank line inside the
+    # header, which is the same truncation with a different trigger.
+    -h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0"; exit 0 ;;
     --*) echo "preflight.sh: unknown option $1" >&2; exit 2 ;;
     *) paths+=("$1"); shift ;;
   esac
@@ -166,7 +176,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX") || { echo "preflight.sh: ca
 trap 'rm -rf "$work"' EXIT
 status="$work/status"; details="$work/details"
 : >"$status"; : >"$details"
-ran=0 failed=0 skipped=0
+ran=0 failed=0 skipped=0 infra=0
 
 for kind in format lint types test; do
   has_kind "$kind" || continue
@@ -180,6 +190,19 @@ for kind in format lint types test; do
   ran=$((ran + 1))
   if [ "$rc" -eq 0 ]; then
     printf 'PASS  %-7s %s\n' "$kind" "$cmd" >>"$status"
+  elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    # A check that could not START is not a check that failed, and reporting it
+    # as FAIL is worse than reporting nothing: measured over three days of use,
+    # a pre-flight that false-failed in 8 of 8 rounds taught its operator to
+    # skip the section entirely, so the round where it was finally right was
+    # skipped with the rest. 126 is "found but not executable", 127 is "not
+    # found" — the shell's own answer to "did this ever run", which is why they
+    # are the whole test. A per-tool error-string list (`ERR_PNPM_…`,
+    # `npm ERR! code E…`) would catch more and rot silently, and a check that
+    # rots is the thing being fixed here. A TIMEOUT stays FAIL: a hang can be
+    # real, and a suite that never terminates is a finding.
+    infra=$((infra + 1))
+    printf 'INFRA %-7s %s   (exit %s — the command could not be run; the check never started)\n' "$kind" "$cmd" "$rc" >>"$status"
   else
     failed=$((failed + 1))
     case "$rc" in
@@ -201,7 +224,11 @@ report="$work/report"
   if [ "$ran" -eq 0 ] && [ "$skipped" -eq 0 ]; then
     echo "# no checks detected — this project defines no formatter, linter, type-checker or test command that preflight recognises"
   else
-    echo "# $ran run, $failed failed, $skipped skipped"
+    echo "# $ran run, $failed failed, $infra could not start, $skipped skipped"
+    if [ "$ran" -gt 0 ] && [ "$infra" -eq "$ran" ]; then
+      echo "# EVERY check failed to start. This is a defect in the review, not in the project:"
+      echo "# nothing here is a verdict on the code, and the reviewers still need a real one."
+    fi
   fi
   cat "$status"
   cat "$details"

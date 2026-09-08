@@ -27,7 +27,7 @@ every turn that changed code, and on demand for anything else. It is
    collect now (§2c); `1` — some still active and the round's 30-minute wait
    budget is not spent, call it again as the very next tool call; `3` — budget
    spent, treat the active ones as dead (§2f). A reviewer it lists as
-   **stalled** is neither: see §2g. Do not end the turn to wait, and
+   **stalled** is neither: see §2f. Do not end the turn to wait, and
    do not check on a reviewer any other way: `ListAgents`,
    `TaskOutput(block=false)`, `Monitor`, `sleep` — every one is a full-context
    turn that tells you nothing the wait did not, and `poll-guard` denies the
@@ -281,24 +281,14 @@ real results — they go in the final report.
 
 `tier.json`'s `finders[]` is the round's plan: one row per finder, with its
 angles, agent type, model, call budget and impact depth. Use it as written — it
-encodes the groups below. When the round exceeded the cap of 6, `merged[]` says
+encodes the groups `references/angles.md` documents. When the round exceeded the cap of 6, `merged[]` says
 which group was folded into which; name those in the final report, because a
 merged angle got less attention than a whole finder.
 
-The groups it encodes, for tier M — one finder each, launched in the same message:
-
-- **code**: `A+B+D` (line scan, removed behaviour, pitfalls) · `C+E+F` (cross-file, intent fidelity, verification audit; add `H` if async/IO/shared state) · `Q+V` (quality + conventions). Add `G` security as a fourth finder when the change touches input, auth, files, network, shell, secrets, or HTML, and `X` as its own finder when the change touches something a user runs.
-- **docs/prose**: `P1+P3` (accuracy + consistency) · `P2+V` (completeness, reader fit, conventions). Add `P4` for skills, prompts, agent files, CLAUDE.md, runbooks.
-- **config/infra**: `K1+K2` in one finder.
-- **shape**: `S`, added automatically from round 3 (and by hand whenever one unit takes findings in two rounds running). It is the only angle that may answer "delete it", so its input is the fix history and not the diff alone — `brief.mjs` puts the ledger's `## fixed` lines in the S row's brief, and in no other.
-- **cold run**: at tiers M and L, `X` is always its own finder and is never merged into another (at tier S the one compact finder grades the transcript itself, and has a shell for the rest of its angles). Its reviewer is `self-review-cold-grader`, whose tool list has **no Bash**: `round.sh` runs `coldrun.sh` before the round, inside a sandbox that denies the network and confines writes, and the grader reads the transcript. That costs a whole finder wherever the change ships something runnable — including a third one in round 2 — and the alternative was a reviewer deciding for itself which invocation of possibly-broken code was safe to execute, which two shape reviewers running rejected as wrong-layer.
-- **mixed**: take the union, but the cap (6 per round, at every tier) is per round, not per kind — merge groups within a kind to fit (e.g. code `A+B+D` · `C+E+F+H` · `G+Q+V`, docs `P1+P3` · `P2+P4+V`, config `K1+K2`), never drop a kind, and name in the report any angle that did not get its own finder. A finder still reviews one kind. `tier.mjs` applies this merge order itself and records it in `merged[]`.
-
-Tier L splits the groups: code `A+B` · `C+D` · `E+F` · `Q+V` · `X` · `G` · `H`
-(the last three only when applicable — `X` when the change touches an entry
-point); docs `P1` · `P2+V` · `P3` · `P4` (P4 only for
-skills, prompts, agent files, CLAUDE.md, runbooks); config `K1` · `K2`. Tier S
-uses the compact brief.
+The groups, the tier splits and the merge order are in
+`references/angles.md` → **Angle groups per tier**. You do not need them to run
+the round — `tier.mjs` applied them and `finders[]` is the result — read them
+only when you are overriding the plan.
 
 ### 2b · Spawn finders — fresh agents, in parallel, then wait in one call
 
@@ -360,8 +350,7 @@ so in the report rather than waiting.
 ### 2c · Collect and deduplicate
 
 When `wait.mjs` exits 0, its table says which reviewers finished, which died,
-and which stalled; a dead one goes to §2f before anything else, and a stalled
-one to §2g. A finder's report is its
+and which stalled; both go to §2f before anything else. A finder's report is its
 last message, which the wake-up does not carry. Read every finished report in
 one call: `scripts/salvage.mjs <session-id> <name> <name>…`
 prints each named agent's report (no names: lists the agents; the session id
@@ -393,12 +382,36 @@ it gets a verifier.
 Spawn `self-review-verifier` agents (one per batch of ≤ 8 candidates, in one
 message, then `wait.mjs` on their names) when:
 
+- **you dismissed anything at all** — one dismissal, not three. The Stop gate
+  enforces this: a `converged` marker reporting `dismissed >= 1` with no
+  verifier completion behind it is refused. A wrong *fix* is visible in the
+  diff; a wrong *dismissal* is invisible, and it enters the dismissed ledger
+  that briefs every later finder not to refile it, so it suppresses
+  rediscovery in this loop and in future loops over the same files. Verify at
+  least the dismissed candidates, and give the verifier the earlier ones too
+  when a pass already dismissed some;
+- **this loop's candidates exceed four** — `fixed + dismissed + open` on the
+  marker, which are the totals for the whole loop and not for one round, so a
+  three-round loop with two candidates each trips it. That is wider than the
+  per-round rule this section otherwise speaks in, deliberately: the marker is
+  the only count the gate can read without guessing at a work dir. The trigger
+  is the candidate count and not the verdicts, because it is fixed before you
+  choose any of them — there is no way to get under it by fixing what you
+  would have dismissed;
 - the tier is L;
-- dismissals in the round reach three in total — counted across every
-  verification pass, not per batch — that is the author's bias the loop exists
-  to counter, so an outsider rules on all of them, the earlier ones included;
 - a candidate's fix would change behaviour, a contract, or a stated decision,
   and you are not certain.
+
+The first two were prose until 2026-09-07, and the field report measured what
+prose bought: 3 verifiers across 8 loops, 24 rounds and 76 candidates. The old
+threshold — three dismissals in one round — also sat above the ceiling of a
+round that averaged 3.2 candidates, so the clause that was supposed to catch
+author bias could barely fire. Both are now conditions the gate reads off the
+marker's own counts.
+
+`findings.mjs record` enforces the other half: a `dismissed` record with an
+empty `proof` is refused outright. A dismissal you cannot quote a counter-proof
+for is an open finding, not a dismissed one.
 
 **Name the verifier, and the name must start with `self-review-verifier`** —
 `self-review-verifier-r2-b1`, not `r2-verify`. This is containment, not
@@ -508,71 +521,16 @@ tree would be a changed file the next review has to review. It validates every
 record before it writes any, so a rejected call costs a retry, not half a
 round.
 
-### 2f · If an agent dies, salvage before you re-spawn
+### 2f · A dead, stalled or silent agent — recovery is in `references/recovery.md`
 
-Sessions get killed mid-round — the usage-limit reset is the common case — and
-the reflex of re-spawning every silent reviewer re-pays 90–150k of context per
-agent for work that already happened: a subagent's transcript survives on disk
-even when its delivery did not, and this session's own round 3 was recovered
-exactly that way. So when a reviewer dies, goes idle without a report,
-`wait.mjs` lists it as dead, or you resume after a reset:
-
-```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id>            # each agent: finished/stalled/active/dead, calls, context
-"${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id> <name>     # its last message (--all-text: every text block)
-```
-
-The session id is the UUID in your scratchpad path; the briefs in
-`round-<r>/briefs/` say who was launched. Then:
-
-- **finished** — its last message is the report. Use it as delivered; never
-  re-spawn an agent whose report already exists. A reviewer `wait.mjs` listed
-  as dead that reports afterwards is not collected twice: use whichever report
-  exists.
-- **dead** (or **active**, when you are salvaging one `wait.mjs` gave up on) —
-  read its state file (`round-<r>/state/<name>.jsonl`): the
-  findings it had confirmed before dying. Re-spawn the angle only when the
-  state file and the transcript's salvaged text are both empty — an unfinished
-  agent's informal notes count as salvage too — and paste whatever survived into the
-  new brief marked "already found — verify, do not re-derive, continue from
-  here", so the dead agent's tokens still bought something.
-
-**An applier that dies is the other case, and the reflex above is wrong for
-it.** A dead reviewer costs re-paid context; a dead applier leaves the working
-tree in a state nobody has read, because its edits are already on disk and what
-died was the report saying which directive reached which file. So look at the
-tree first — `git diff`, and `git status` for files a directive told it to
-create — and read that against the directives you dispatched. Then dispatch a
-**rewritten** directives file covering only what is still undone. Never re-send
-the original: an applier told again to make an edit that is already there comes
-back `blocked` on a file that is in fact correct, and the round spends itself
-arguing with its own fixes. Its state file and salvaged transcript say what it
-believed it applied; the tree says what it did, and the tree wins.
-
-### 2g · A stalled reviewer is resumed, never re-spawned
-
-`wait.mjs` says **stalled** when a reviewer's transcript ends on the harness's
-own API-error notice. That is a third thing, and both of the reflexes above are
-wrong for it: it is not finished (there is no report) and it is not dead (its
-context is live and every tool call it made is still paid for). Measured
-2026-09-04 over 894 subagent transcripts: 93 ended this way and **not one ever
-continued on its own**. Before the status existed each of those read `active`
-until the 30-minute budget burned and was then treated as dead — the same idle
-lead, arriving by a different door.
-
-`wait.mjs` prints the error text and, from it, which of the two kinds it is:
-
-- **resumable** (a dropped connection, a 5xx) — send the agent one message:
-  `SendMessage` to its name with `resume`. Then call `wait.mjs` again as the
-  very next call, exactly as after an exit 1. Do not re-spawn it and do not
-  paste its brief again; it still has both.
-- **a quota refusal** — the text carries the reset time. A nudge before then
-  only spends another refusal. Wait for the reset and resume, or, if the round
-  cannot wait, treat that angle as uncovered and say so in the report (§4) —
-  never silently.
-
-If a resumed reviewer stalls a second time on the same error, stop resuming it
-and salvage it as §2f says; two identical stalls is an outage, not a blip.
+`wait.mjs` names which of the three you have and prints the next action with the
+agent's name already substituted. Follow what it printed; open
+`references/recovery.md` for the reasoning and the salvage commands. Three rules
+are worth holding without opening it, because getting them wrong costs a round:
+**never re-spawn an agent whose report already exists**, salvage a dead agent's
+state file into the replacement's brief rather than re-deriving it, and **a dead
+*applier* is the opposite case — read the tree first and dispatch a rewritten
+directives file, never the original.**
 
 ## 3 · Converge or go again
 
@@ -621,46 +579,17 @@ trend:
 "${CLAUDE_PLUGIN_ROOT}/scripts/findings.mjs" converge --work <work> --round <N>
 ```
 
-  It prints each round's `W = 3·blockers + 2·majors + 1·minors` over what that
-  round **fixed**, compares the two rounds over the angles they share, and says
-  `CONTINUE` or `ESCALATE`. The restriction is what "compare like with like"
-  means: angle S arrives by rule at round 3 (§2a) and files every non-`sound`
-  verdict as a `blocker` by construction, so an unrestricted `W` reads as an
-  increase and stops a loop that is converging — it did exactly that to this
-  tool's own review, 11 → 4 → 9. A round still fixes everything
-  it finds; a newly-arrived angle's findings are the baseline the *next* round
-  is compared against. A finder that merged angles (`A+B+D`) counts as having
-  run every one of them, and its weight joins the comparison only when all of
-  them are shared — without that, the taper in §2a would make consecutive rounds
-  permanently incomparable and leave the round cap as the only thing that can
-  stop the loop. `converge` decides the `W` rule and nothing else — the round
-  cap and the oscillation check below are yours. If it writes `N records did not
-  match the record schema` on stderr, the findings file holds corrupted rows:
-  they are dropped where the file is read, so nothing in them reaches `W`, the
-  angle sets or the verdict — but a dropped row is a finding this loop has
-  forgotten, so read them before trusting a `CONTINUE`.
+  It prints each round's `W`, compares the rounds over the angles they share,
+  and says `CONTINUE`, `ESCALATE` or `STOP`. Act on what it printed. The
+  arithmetic, the shared-angle restriction and what a corrupted row does are in
+  `references/converge.md`; you need them only to argue with the verdict.
 
-  **Its last line is the tree-guard audit, and it is about the plugin, not
-  about your change.** `round.sh` opens an engagement log for the round; the
-  guard appends one row per subagent shell call saying whether it recognised
-  the agent as a reviewer; `converge` reports what the round proved. It exists
-  because the guard was inert for roughly ninety named finders while every
-  review round read the file and correctly found it correct — a mechanism whose
-  working and inert behaviours are identical. Nothing reads it to decide
-  anything, so it never changes `CONTINUE`/`ESCALATE`. What it can say, and what
-  each one asks of you:
-
-  **`tree-guard engaged: N/M` is the only wording that is a pass.** Any other —
-  a name it did not match, a name it does not cover, rows with no session id, a
-  log nothing reached, no log at all — is a defect in the plugin or in an agent's
-  tool list, and a review in progress cannot fix its own installed guard. So the
-  action is the same for every one of them: copy the line into the report
-  **verbatim** and tell the user. The tool prints the diagnosis; do not restate
-  it from memory, and do not read the absence of an alarm as an all-clear.
-
-  Nothing here blocks convergence, and the line is never absent: a round that
-  opened no log, or opened one nothing reached, says so in words. Silence would
-  read the same as a pass, which is the failure this instrument was built for.
+  **Its last line is the tree-guard audit, and it is about the plugin, not your
+  change.** `tree-guard engaged: N/M` is the only wording that is a pass. For
+  any other wording, copy the line into the report **verbatim** and tell the
+  user — the tool prints the diagnosis; do not restate it from memory, and do
+  not read the absence of an alarm as an all-clear. It never changes
+  `CONTINUE`/`ESCALATE`. Background in `references/converge.md`.
 
   **Stop and escalate to the user** — surface the state, do not declare done —
   when any of:
@@ -764,52 +693,24 @@ scratch:
 
 ### The record
 
-| field | when | what |
-|---|---|---|
-| `outcome` | always | `converged`, `not-converged`, or `not-applicable` |
-| `rounds` `fixed` `dismissed` `open` | `converged` / `not-converged` | non-negative integers, and `rounds` is at least 1 — a review that ran no round is `not-applicable`; all four are **refused** for `not-applicable` |
-| `reason` | `not-applicable` only | `no-code-changed`, `user-declined`, `scratch-only`, `other` |
-| `note` | optional; required for `reason=other` | free text — the only free text there is, and it never enters the summary |
-| `tier` `adapter` | always | `tier` is `S`, `M` or `L` from `tier.json`; `adapter` from `impact.json` (`adapter=none` when impact.mjs wrote nothing) |
-| `intent` | `converged` / `not-converged` | `validated`, `author` or `skipped` — who read the intent **before** the code was written. Required, because an absent field and "nobody read it" would otherwise be the same state. `validated` is refused unless a `self-review-ticket-validator` completed before this task's first code change; the gate checks that order and never the verdict |
-| `forced` `computed` | when you overrode the tier | both `S`, `M` or `L` from `tier.json`, and written together — one alone does not say what was overridden |
-
-Anything that does not validate is **refused** — by the script in the same
-turn, or by the gate with every defect named at once. A refusal is not a
-reminder to review; it means the review is done and the record is malformed.
-Fix the named fields and write it once more.
-
-**`not-applicable` is the honest end of a turn the loop does not fit** —
-scratch files only, the user declined, or the gate armed on something that is
-not really a change. Name it; do not write a review that did not happen:
-
-```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --not-applicable user-declined --note "<their-exact-words>"
-```
-
-It takes no counts, on purpose. `rounds=0` is how 29 of the first 112 markers —
-a quarter of every marker ever written — recorded a non-review as a converged
-one, and every per-tier average carried them.
+You name the fields; the tool writes the string. Anything that does not validate
+is **refused**, with every defect named at once — so the field table does not
+need to be resident: fix what the refusal names and write it once more. The
+table, the `not-applicable` form and why it takes no counts are in
+`references/marker.md`.
 
 If the loop stopped short of a clean round — a stall, oscillation, or the round
 backstop (§3) — that is `--not-converged` with its real counts, and report the
-open state.
+open state. A turn the loop does not fit is `--not-applicable` with a reason,
+never a review that did not happen.
 
 ### Where it counts
 
-The file form counts only when the Write succeeded, the body parses as a JSON
-object holding the record, and the path is `…/self-review/CONVERGED.json` under
-a scratch prefix — the session scratchpad, `/tmp`, a `mktemp -d`, or
-`~/.claude/self-review/`. A `CONVERGED.json` inside the project is not a marker
-(it would clear the gate while leaving no trace). If `<work>` is a bare
-`mktemp -d`, put the file in a `self-review/` subdirectory of it. The gate
-writes the log line for this form.
-
-The script's *output* is what the gate matches, so quoting or `cat`-ing it never
-counts, and the command word has to resolve to this plugin's own copy — a
-`converged.sh` from somewhere else is not it. If your permission mode refuses
-the command (`auto` has refused `~/…`, `bash …` and `sh …` spellings), use the
-file form; that is what it is for.
+Both forms and their constraints are in `references/marker.md` → **Where it
+counts**. The short version: the file goes at `…/self-review/CONVERGED.json`
+under a scratch prefix, never inside the project; the script's *output* is what
+the gate matches, so quoting or `cat`-ing it never counts; if your permission
+mode refuses the command, use the file form.
 
 Either way: the marker is what the Stop gate looks for — not a sentence saying
 you reviewed, not a clean round that was never marked. Mark only after the
@@ -850,6 +751,9 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/salvage.mjs` — read a finder's report from its transcript (§2c); the same path recovers a dead reviewer's work (§2f)
 - `skills/self-review/references/angles.md` — the angle catalogue, per artifact kind
 - `skills/self-review/references/briefs.md` — intent block, finder/verifier briefs, ledger, report
+- `skills/self-review/references/recovery.md` — a dead, stalled or silent agent (§2f)
+- `skills/self-review/references/converge.md` — the `W` arithmetic and the tree-guard audit (§3)
+- `skills/self-review/references/marker.md` — the marker's record fields and where it counts (§4)
 - `agents/self-review-finder.md`, `agents/self-review-cold-grader.md`, `agents/self-review-verifier.md` — the reviewer agents
 - `agents/self-review-applier.md` — the writing hand (§2e): one per round, no shell
 - `scripts/coldrun.sh` — the contained cold run behind angle `X`; run by `round.sh`, never by a reviewer

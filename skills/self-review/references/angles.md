@@ -300,3 +300,25 @@ transcript of it already having been run in a sandbox — grade that against wha
 the artifact claims to do (exit 0 with no output is a finding) and do not
 invoke the artifact yourself: you have a shell, the sandbox is what makes that
 safe, and you are not in it. Report only what you can evidence.
+
+
+## Angle groups per tier
+
+Moved out of SKILL.md 2026-09-08: `tier.mjs` computes the plan and `round.sh`
+prints it, so the lead reads `tier.json`'s `finders[]`, not this. Read this when
+you are overriding the plan or explaining a `merged[]` row.
+
+The groups it encodes, for tier M — one finder each, launched in the same message:
+
+- **code**: `A+B+D` (line scan, removed behaviour, pitfalls) · `C+E+F` (cross-file, intent fidelity, verification audit; add `H` if async/IO/shared state) · `Q+V` (quality + conventions). Add `G` security as a fourth finder when the change touches input, auth, files, network, shell, secrets, or HTML, and `X` as its own finder when the change touches something a user runs.
+- **docs/prose**: `P1+P3` (accuracy + consistency) · `P2+V` (completeness, reader fit, conventions). Add `P4` for skills, prompts, agent files, CLAUDE.md, runbooks.
+- **config/infra**: `K1+K2` in one finder.
+- **shape**: `S`, added automatically from round 3 (and by hand whenever one unit takes findings in two rounds running). It is the only angle that may answer "delete it", so its input is the fix history and not the diff alone — `brief.mjs` puts the ledger's `## fixed` lines in the S row's brief, and in no other.
+- **cold run**: at tiers M and L, `X` is always its own finder and is never merged into another (at tier S the one compact finder grades the transcript itself, and has a shell for the rest of its angles). Its reviewer is `self-review-cold-grader`, whose tool list has **no Bash**: `round.sh` runs `coldrun.sh` before the round, inside a sandbox that denies the network and confines writes, and the grader reads the transcript. That costs a whole finder wherever the change ships something runnable — including a third one in round 2 — and the alternative was a reviewer deciding for itself which invocation of possibly-broken code was safe to execute, which two shape reviewers running rejected as wrong-layer.
+- **mixed**: take the union, but the cap (6 per round, at every tier) is per round, not per kind — merge groups within a kind to fit (e.g. code `A+B+D` · `C+E+F+H` · `G+Q+V`, docs `P1+P3` · `P2+P4+V`, config `K1+K2`), never drop a kind, and name in the report any angle that did not get its own finder. A finder still reviews one kind. `tier.mjs` applies this merge order itself and records it in `merged[]`.
+
+Tier L splits the groups: code `A+B` · `C+D` · `E+F` · `Q+V` · `X` · `G` · `H`
+(the last three only when applicable — `X` when the change touches an entry
+point); docs `P1` · `P2+V` · `P3` · `P4` (P4 only for
+skills, prompts, agent files, CLAUDE.md, runbooks); config `K1` · `K2`. Tier S
+uses the compact brief.

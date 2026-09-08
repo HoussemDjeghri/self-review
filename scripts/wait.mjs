@@ -16,9 +16,14 @@
 // Waiting inside one call is also *cheaper* than being woken: a wake is a
 // full-context turn per finisher, and this is one turn for the whole round.
 //
-// The other candidate signal, "N state files non-empty", is wrong: a finder
-// with nothing to report writes `[]` and never touches its state file, so every
-// converged round — the round every review ends on — would wait out the clock.
+// The other candidate signal, "N state files non-empty", is wrong — though not
+// for the reason first written here. That reason was "a finder with nothing to
+// report writes `[]` and never touches its state file", and 2026-09-08
+// falsified it: a finder wrote `[]` into its lifeboat. What holds is weaker and
+// still enough. In two rounds of this repo's own review, "nothing to report"
+// arrived three ways — no file at all, a zero-byte file, and `[]` — so a count
+// of non-empty files settles neither direction: it waits out the clock on the
+// first two and reads a report into the third.
 //
 // Exit 0 every reviewer settled (collect now) · 1 call ceiling reached with
 // budget left (call it again, immediately) · 3 the round's wait budget is spent
@@ -56,8 +61,32 @@ function parseArgs(argv) {
 
 const mtimeOr = (file, fallback) => { try { return statSync(file).mtimeMs; } catch { return fallback; } };
 
+// `null` when there is no state file at all, which is NOT the same news as a
+// state file holding nothing — both are normal, but a lead that reads "0" for a
+// reviewer whose findings are sitting in `round-N/state/` under another name (a
+// respawn, §2f, files under the name it was respawned as) learns to distrust
+// the column and goes back to reading the files by hand every round, which is
+// the per-round polling the whole script exists to remove. Reported 2026-09-07
+// after three days of use.
+//
+// It counts CANDIDATES, not lines, because the two diverge in both directions
+// and a line count is wrong in each. The header's prediction above — amended
+// there — was falsified on 2026-09-08 by a finder that wrote `[]` into the
+// lifeboat, which is the empty-list form its own agent file tells it to return;
+// the column said `1 filed` and the lead went looking for a candidate that was
+// never there. The mirror case costs more: the lifeboat's salvage value is a
+// dying finder's work, and a finder that appends its whole array at once puts
+// every candidate it had on a single line, which a line count renders as `1`.
+// An unparseable line still counts as one, because a truncated append is a line
+// the lead has to go and read.
 const stateLinesIn = (file) => {
-  try { return readFileSync(file, "utf8").split("\n").filter(Boolean).length; } catch { return 0; }
+  let text;
+  try { text = readFileSync(file, "utf8"); } catch { return null; }
+  return text.split("\n").filter(Boolean).reduce((n, line) => {
+    let parsed;
+    try { parsed = JSON.parse(line); } catch { return n + 1; }
+    return n + (Array.isArray(parsed) ? parsed.length : 1);
+  }, 0);
 };
 
 // The session id is in the work dir's own path — the scratchpad Claude Code
@@ -118,12 +147,12 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
   });
 }
 
-export function render(rows, verdict) {
+export function render(rows, verdict, extra = [], sessionId = undefined) {
   const width = Math.max(...rows.map((r) => r.name.length));
   const lines = rows.map((r) =>
     `${r.name.padEnd(width)}  ${r.status.padEnd(8)}  last ${r.lastAt.padEnd(19)}  ${String(r.calls).padStart(3)} calls  ` +
-    `${r.stateLines} filed${r.note ? `  (${r.note})` : ""}`);
-  return [...lines, verdict, ...stallAdvice(rows)].join("\n");
+    `${r.stateLines === null ? "no file" : `${r.stateLines} filed`}${r.note ? `  (${r.note})` : ""}`);
+  return [...lines, verdict, ...deadAdvice(rows, sessionId), ...stallAdvice(rows), ...extra].join("\n");
 }
 
 // A stalled reviewer is the one status whose remedy is neither "collect it"
@@ -131,6 +160,50 @@ export function render(rows, verdict) {
 // has to be told, per agent, that the work is intact and what to send. The
 // error text is quoted rather than classified away — a 522 and a reset time
 // are different facts and the lead is the one acting on them.
+// The other half of the "0 filed" confusion: a state file in this round that
+// belongs to no reviewer being waited on. §2f respawns a dead finder under a
+// new name, so its first attempt's findings stay on disk under the OLD one —
+// the lead globs `round-N/state/*.jsonl`, sees candidates, reads "no filed" in
+// the table, and concludes the counter is broken. It is not; the two are
+// looking at different names. Naming the orphans is what makes them
+// collectable instead of merely confusing, because `salvage.mjs` can still
+// read them.
+export function orphanAdvice(rows, stateDir, files) {
+  const waited = new Set(rows.map((r) => r.name));
+  const orphans = files
+    .filter((f) => f.endsWith(".jsonl") && !waited.has(f.slice(0, -".jsonl".length)))
+    .sort();
+  if (orphans.length === 0) return [];
+  // Both sentences agree with the count, not just the noun: the second line is
+  // as singular as the first ("an earlier attempt … Its candidates"), so
+  // conjugating only `file` moved the disagreement into the plural branch
+  // instead of removing it.
+  const one = orphans.length === 1;
+  return [
+    `# ${orphans.length} state file${one ? "" : "s"} in this round belong${one ? "s" : ""} to no reviewer above — ${one ? "an earlier attempt" : "earlier attempts"}`,
+    `# that §2f respawned under a new name. ${one ? "Its" : "Their"} candidates are still on disk and still collectable:`,
+    ...orphans.map((f) => `#   ${path.join(stateDir, f)}`),
+  ];
+}
+
+// A dead reviewer's remedy is a command, and SKILL.md §2f tells the lead the
+// tool prints it with the names already substituted — so it has to, or that
+// promise sends them to a reference file to assemble it by hand. The verdict
+// line can only say "a dead one goes to §2f": it is one sentence for the whole
+// table and it does not know which row died. This does, and it prints ONE call
+// for all of them, because salvage.mjs takes every name at once and a
+// per-agent line would be a per-agent turn.
+export function deadAdvice(rows, sessionId = "<session-id>") {
+  const dead = rows.filter((r) => r.status === "dead");
+  if (dead.length === 0) return [];
+  return [
+    "# A dead reviewer is salvaged BEFORE it is re-spawned: its transcript may already hold the",
+    "# report, and re-spawning one that finished pays for the same review twice (§2f).",
+    `#   → "\${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" ${sessionId} ${dead.map((r) => r.name).join(" ")}`,
+    "#   Re-spawn under a NEW name only for those that come back empty.",
+  ];
+}
+
 export function stallAdvice(rows) {
   const stalled = rows.filter((r) => r.status === "stalled");
   if (stalled.length === 0) return [];
@@ -218,11 +291,19 @@ export async function main(argv, {
 
   const read = makeReader();
   const snapshot = () => poll({ names, dir, since, roundDir, now: now(), config, waitStartMs, read });
+  // A missing state directory is the normal case in a round where nobody has
+  // filed yet, so it reads as "no orphans" rather than as an error.
+  const stateDir = path.join(roundDir, "state");
+  const orphans = () => {
+    let files = [];
+    try { files = readdirSync(stateDir); } catch { return []; }
+    return orphanAdvice(rows, stateDir, files);
+  };
   let rows = snapshot();
   // The table is worth printing even when the tool timeout, not this script,
   // ends the call — otherwise a wait that ran too long tells the lead nothing.
   const onSignal = () => {
-    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`));
+    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`, orphans(), sessionId));
     process.exit(1);
   };
   process.on("SIGTERM", onSignal);
@@ -250,7 +331,7 @@ export async function main(argv, {
       1: `# ${active} still active, ${Math.max(0, Math.round((budgetEndsMs - now()) / 60_000))}m of budget left — call wait.mjs again as the very next tool call.`,
       3: `# budget spent after ${config.budgetMinutes}m — treat the ${active} still active as dead (§2f).`,
     }[exitCode];
-    log(render(rows, verdict));
+    log(render(rows, verdict, orphans(), sessionId));
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);

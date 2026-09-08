@@ -154,6 +154,25 @@ const TASK_REF_RE = /<(?:task-id|tool-use-id)>([^<]+)<\//g;
 // reviewed itself. One finder is the floor on purpose, because tier S *is* one
 // finder with an all-angles brief.
 const REVIEWER_TYPES = /(?:^|:)self-review-(?:finder|cold-grader)$/;
+// The verifier, matched on EITHER half of what SKILL.md §2d names it by. It is
+// absent from REVIEWER_TYPES above and must stay absent: verifying findings the
+// session generated itself is not an independent read. This is the opposite
+// question — not "did anyone read the code" but "did anyone but the author rule
+// on the verdicts" — and the two conditions sit on the same marker without
+// touching. See `verifierState`.
+//
+// The trailing `(?:-|$)` is `tree-guard.mjs`'s REVIEWER boundary, and it has to
+// be: a name this gate reads as a verifier but that guard does not read as a
+// reviewer is an UNGUARDED shell in the author's tree that also clears the
+// marker. Verified live on 2026-09-07 — `self-review-verifier2` and
+// `self-review-verifiers-r2` were accepted here and matched by nothing there,
+// and the refusal text below authorises exactly that spelling. The suffix a
+// real verifier carries is the round and batch (`self-review-verifier-r2-b1`),
+// which the `-` admits. `general-purpose` — the §2b substitute — is admitted
+// through the name alone, which is the only evidence that agent carries.
+const VERIFIER_TYPE = /(?:^|:)self-review-verifier(?:-|$)/;
+const VERIFIER_NAME = /^self-review-verifier(?:-|$)/;
+const isVerifier = (agent) => VERIFIER_TYPE.test(agent.type) || VERIFIER_NAME.test(agent.name);
 // The one agent type whose LAUNCH implies it was told to edit. That implication
 // is what the arm substitutes for the edit evidence async agent results do not
 // carry, so it holds by construction for exactly this type and no other: the
@@ -721,6 +740,27 @@ function fileMarkerSummary(use, results) {
   return record ? { record, summary: formatSummary(record) } : { problems };
 }
 
+// The three verdict counts off a marker of either form, or `null` when any one
+// of them cannot be read as a non-negative integer. `validateMarker` requires
+// all three for `converged`, so a null here is a marker that did not go through
+// it — a script form whose line was reworded, say — and the verifier check
+// below treats that as no evidence rather than as zero. Zero would be a claim.
+//
+// One reader for both forms, deliberately: the file form hands over numbers and
+// the script form hands over the strings it printed, and two hand-written
+// parsers over the same four fields is the drift `scriptField` was written to
+// stop.
+function countsFrom(read) {
+  const counts = {};
+  for (const key of ["fixed", "dismissed", "open"]) {
+    const value = read(key);
+    const n = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isInteger(n) || n < 0) return null;
+    counts[key] = n;
+  }
+  return counts;
+}
+
 // Index of the last marker of either form, the last REJECTED file marker, the
 // accepted marker's `outcome`, and — for the accepted file form — what to log.
 // A rejection only speaks when it is the later of the two: a bad write followed
@@ -732,7 +772,7 @@ function fileMarkerSummary(use, results) {
 // unknown is never gated, because refusing on a value we failed to parse is a
 // block bought with a guess.
 function lastMarker(turn, results, cwd) {
-  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null;
+  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null, counts = null;
   turn.forEach((entry, index) => {
     for (const use of toolUses(entry)) {
       const text = results.get(use.id) ?? "";
@@ -740,6 +780,7 @@ function lastMarker(turn, results, cwd) {
         at = index; fileMarker = null;
         outcome = scriptField(text, "outcome");
         intent = scriptField(text, "intent");
+        counts = countsFrom((key) => scriptField(text, key));
         continue;
       }
       const written = fileMarkerSummary(use, results);
@@ -748,9 +789,10 @@ function lastMarker(turn, results, cwd) {
       at = index; fileMarker = { id: use.id, summary: written.summary };
       outcome = written.record.outcome;
       intent = written.record.intent ?? null;
+      counts = countsFrom((key) => written.record[key]);
     }
   });
-  return { at, fileMarker, outcome, intent, rejected: rejectedAt > at ? rejected : null };
+  return { at, fileMarker, outcome, intent, counts, rejected: rejectedAt > at ? rejected : null };
 }
 
 // converged.sh logs its own run; the file form is logged here, once per marker:
@@ -770,8 +812,39 @@ function logFileMarker({ id, summary }, cwd) {
   }
 }
 
+// One predicate, four users. A gate reminder is a meta user entry this hook
+// wrote, identified by the sentence it carries — and "identified by its
+// sentence" is the property that must not drift between the four counters,
+// because each obligation's refusal embeds only its own tag and cross-counting
+// would release a gate that was never satisfied.
+const isReminderFor = (e, tag) =>
+  e.type === "user" && e.isMeta && textOf(e.message?.content).includes(tag);
+
+// The three obligation counters below are built from this; `countReminders`
+// cannot be, because its bound is a CALL-time value (`markerAt`) rather than a
+// construction-time one — which is exactly the difference the comment above
+// UNREVIEWED_TAG exists to explain, so it stays visible in the signature.
+const reminderCounter = (tag) => (turn) => turn.filter((e) => isReminderFor(e, tag)).length;
+
+// The two refusals this counter bounds, named by the sentence each already
+// prints. `GATE_TAG` is on all five refusal messages by construction, so
+// counting it here pooled five obligations into one budget of two: a stale
+// `intent=validated` refusal plus a single no-marker block released the turn
+// with neither obligation at its own cap (reproduced live 2026-09-07). That is
+// the same class the `describeChanges` guard already refuses — a message
+// carrying a counter's sentence driving that counter's release — reached
+// without any forgery.
+//
+// BOTH, not just the no-marker one: a rejected marker does not move `at` in
+// `lastMarker`, so `markerAt` stays behind it and `countReminders` is the only
+// bound the malformed-record refusal has. Narrowing to the no-marker sentence
+// alone would leave a model writing bad markers blocked forever, which is the
+// deadlock MAX_REMINDERS exists to prevent.
+const UNMARKED_TAG = "the self-review loop has not converged";
+const REJECTED_TAG = "does not validate, so it does not clear the gate";
 const countReminders = (turn, since) =>
-  turn.filter((e, i) => i > since && e.type === "user" && e.isMeta && textOf(e.message?.content).includes(GATE_TAG)).length;
+  turn.filter((e, i) => i > since
+    && (isReminderFor(e, UNMARKED_TAG) || isReminderFor(e, REJECTED_TAG))).length;
 
 // ---------- in-flight agents ----------
 
@@ -799,6 +872,13 @@ function scanAgents(entries, results) {
   const launchedAt = new Map(); // agentId -> entry index of its latest launch
   const useIdOf = new Map();    // agentId -> its launch tool_use id
   const typeOf = new Map();     // agentId -> its subagent_type, as launched
+  // agentId -> the `name` it was launched under. SKILL.md §2d makes the NAME
+  // load-bearing for the verifier ("must start with self-review-verifier"),
+  // because the substitute a missing reviewer type sends the lead to is a
+  // `general-purpose` agent whose registered type says nothing. So a check that
+  // reads only `subagent_type` misses exactly the verifier that was hardest to
+  // spawn — see `isVerifier`.
+  const nameOf = new Map();
   const events = [];            // {index, key, resume} — a completion, or a SendMessage that resumes one
   const humanAt = [];
   entries.forEach((entry, index) => {
@@ -810,6 +890,7 @@ function scanAgents(entries, results) {
           launchedAt.set(match[1], index);
           useIdOf.set(match[1], use.id);
           typeOf.set(match[1], String(use.input?.subagent_type ?? ""));
+          nameOf.set(match[1], String(use.input?.name ?? ""));
         }
       } else if (use.name === "TaskStop" && typeof use.input?.task_id === "string") {
         events.push({ index, key: use.input.task_id, resume: false });
@@ -840,6 +921,7 @@ function scanAgents(entries, results) {
     const interjections = humanAt.filter((i) => i > at).length;
     agents.push({
       type: typeOf.get(agentId) ?? "",
+      name: nameOf.get(agentId) ?? "",
       launchedAt: at,
       doneAt: done ? last.index : -1,
       resumedAt: resumes.length ? resumes[resumes.length - 1].index : -1,
@@ -848,12 +930,43 @@ function scanAgents(entries, results) {
       // exists to release — ageing one out would refuse a slow but real
       // reviewer that ground through a big scope across two interjections.
       pending: !done && interjections < PENDING_INTERJECTION_LIMIT,
+      // Kept, not just consumed by `pending`: "how many human prompts landed
+      // since this launch" is what separates a slow agent in THIS task (zero)
+      // from a crashed one left over from an earlier task (one — the prompt
+      // that started the new task). `pending` alone cannot tell them apart.
+      interjections,
     });
   }
   return agents;
 }
 
 // ---------- did an independent reader exist? ----------
+
+// A pending agent releases the turn instead of blocking it, because ending the
+// turn is how this loop waits. But "pending" is window-wide with a two-prompt
+// age-out (PENDING_INTERJECTION_LIMIT), so a crashed agent from an ALREADY-MARKED
+// earlier task is still `pending` throughout the whole of the next task — one
+// human prompt is the task boundary itself, which is inside the limit. Reproduced
+// live 2026-09-07 in both `reviewerState` and `verifierState`: a crashed verifier
+// from task 1 released every converged marker in task 2, dismissals unruled, and
+// re-marking never cleared it because re-marking adds no human prompt.
+//
+// The seam the age-out was placed on (comment at PENDING_INTERJECTION_LIMIT) is
+// between a slow reviewer and one that crashed and holds the gate OPEN. This is
+// the third case it did not have in view: a crashed agent holding the gate DOWN.
+//
+// Two clauses, and both are load-bearing:
+//   launchedAt > prevMarkerAt — the agent was launched for the claim being made
+//     now, so it is this marker's business however long it takes. This is what
+//     keeps the 2026-08-22 case working: a real reviewer interjected into
+//     mid-review still counts as running.
+//   interjections === 0 — no human prompt has landed since the launch, so it
+//     cannot be a leftover from a previous task. This is what keeps a re-mark
+//     inside the same task from blocking: the release message tells the model to
+//     re-mark after the agent lands, and re-marking one stop early must not then
+//     demand a second agent over the same scope.
+const stillRunningFor = (a, prevMarkerAt) =>
+  a.pending && (a.launchedAt > prevMarkerAt || a.interjections === 0);
 
 // F10a′ ruling 2, as scoped on 2026-09-02: `converged` claims a review ran, so
 // refuse it when no plugin reviewer COMPLETED after the last change and before
@@ -877,7 +990,7 @@ function scanAgents(entries, results) {
 // four are separated because they take four different actions, and one message
 // telling a model to launch a finder when one is already running buys a
 // duplicate review of the same scope.
-function reviewerState(agents, externalChangeAt, changeAt, markerAt) {
+function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerAt) {
   const orchestrators = orchestratorsIn(agents);
   // Readers UNION orchestrators. A finished orchestrator has read everything it
   // was launched over, so "late" and "stale" have to see it too — otherwise a
@@ -921,13 +1034,80 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt) {
   // Still running is not missing. Blocking here would tell the model to spawn a
   // second finder over the same scope, or to poll — and ending the turn is how
   // this loop waits. So this one releases: the completion wakes the model, and
-  // the next Stop sees "late" and asks for the re-mark.
-  if (reviewers.some((a) => a.pending)) return "running";
+  // the next Stop sees "late" and asks for the re-mark. `stillRunningFor` is
+  // what stops a finder crashed in an earlier task from releasing every marker
+  // in this one.
+  if (reviewers.some((a) => stillRunningFor(a, prevMarkerAt))) return "running";
   // Completed, but after the marker was written: nothing had read the result
   // when the claim was made. Only the mark needs redoing.
   if (reviewers.some((a) => a.doneAt > markerAt)) return "late";
   // Completed before the last change: the edit behind it was read by nobody.
   return reviewers.some((a) => a.doneAt !== -1 && a.doneAt < changeAt) ? "stale" : "none";
+}
+
+// ---------- did an outsider rule on the verdicts? ----------
+
+// Field report 2026-09-07, measured over 8 loops / 24 rounds / 76 candidates:
+// THREE verifier agents ran in total. The loop was delivering "fresh readers
+// file claims and the author decides" — most of the value, but not the claim on
+// the tin, because the author's DISMISSALS went unchecked, and that is exactly
+// where author blindness lives.
+//
+// The cause was not a missing rule. SKILL.md §2d already said to spawn a
+// verifier when "dismissals in the round reach three in total" — but it was
+// PROSE the session lead had to obey about its own behaviour, and nothing
+// counted anything. At a measured ~3.2 candidates per round, three dismissals
+// in one round was also near-unreachable, so the one clause that could have
+// fired was written above the ceiling of the rounds it governed.
+//
+// Ruled 2026-09-07 (fresh Fable session at xhigh; question and answer in
+// docs/design-notes/), owner-approved with the cost: a verifier is REQUIRED
+// when either
+//
+//   dismissals >= 1                      — the threshold is one, not three,
+//     because a wrong FIX is visible in the diff and a wrong DISMISSAL is
+//     invisible: the dismissed ledger enters every later finder's brief as a
+//     do-not-refile list and `findings.mjs` records it against the repository,
+//     so one wrong dismissal suppresses rediscovery in this loop AND in every
+//     future loop over those files.
+//
+//   fixed + dismissed + open > 4         — kept against this file's author's
+//     own lean, for the reason that decided it: a dismissal trigger has a COST
+//     GRADIENT and a candidate trigger has none. If dismissing costs a verifier
+//     spawn and fixing costs nothing, a cost-disciplined lead fixes phantoms.
+//     The candidate count is fixed before any verdict is chosen, so nothing the
+//     lead decides can move it.
+//
+// The counts are the marker's own, which is what makes this need no filesystem:
+// every one of them is required for `outcome=converged`, they are on the same
+// line the outcome is read from, and their sum is this loop's candidate total.
+// It is a LOOP total, not the per-round count §2d speaks of — a wider net than
+// the ruling's, in the direction the owner paid for.
+const CANDIDATE_TRIGGER = 4;
+function verifierNeed(counts) {
+  if (!counts) return null;
+  if (counts.dismissed >= 1) return "dismissed";
+  return counts.fixed + counts.dismissed + counts.open > CANDIDATE_TRIGGER ? "candidates" : null;
+}
+
+// Did a verifier COMPLETE between the previous marker and this one? "Since the
+// last marker" is the frame because that is the span the marker's counts are a
+// claim about — a verifier from the loop before it ruled on other findings.
+//
+// Deliberately NOT ordered against `changeAt` the way `reviewerState` is. A
+// verifier rules on candidate FINDINGS, not on the final state of the files, so
+// a fix landing after it is the loop working: the whole point of a verdict is
+// that something is done about it. Reading a verifier as "stale" because the
+// fix it authorised came afterwards would refuse every correctly-run round.
+//
+// Returns "ok", "running" or "none" — three, not `reviewerState`'s six, because
+// the two blocking cases there ("late", "stale") are both orderings this
+// question does not ask.
+function verifierState(agents, prevMarkerAt, markerAt) {
+  const verifiers = agents.filter(isVerifier);
+  if (verifiers.some((a) => a.doneAt > prevMarkerAt && a.doneAt < markerAt)) return "ok";
+  if (verifiers.some((a) => stillRunningFor(a, prevMarkerAt))) return "running";
+  return "none";
 }
 
 // ---------- the applier arms the gate (F10b) ----------
@@ -992,15 +1172,45 @@ const orchestratorsIn = (agents) => agents.filter((a) => ORCHESTRATOR_TYPE.test(
 // and nothing ever releases. So these reminders are counted by their own
 // sentence, over the whole turn, and MAX_REMINDERS releases the same way.
 const UNREVIEWED_TAG = "outcome=converged claims a review ran";
-const countUnreviewed = (turn) =>
-  turn.filter((e) => e.type === "user" && e.isMeta && textOf(e.message?.content).includes(UNREVIEWED_TAG)).length;
+const countUnreviewed = reminderCounter(UNREVIEWED_TAG);
 
 // The same self-resetting-counter problem as above, one sentence of its own: a
 // model refused here HAS marked, so re-marking moves `markerAt` past every
 // reminder and a count anchored on it would never reach the release.
 const UNVALIDATED_TAG = "intent=validated claims a fresh reader saw the ticket";
-const countUnvalidated = (turn) =>
-  turn.filter((e) => e.type === "user" && e.isMeta && textOf(e.message?.content).includes(UNVALIDATED_TAG)).length;
+const countUnvalidated = reminderCounter(UNVALIDATED_TAG);
+
+// Third of the same shape, and it needs its own sentence for the same reason
+// the second did: three refusals sharing one counter would release the gate
+// after two attempts at three different problems.
+const UNVERIFIED_TAG = "these counts need a verifier behind them";
+const countUnverified = reminderCounter(UNVERIFIED_TAG);
+
+// The refusal. It names WHICH trigger fired, because the two want different
+// batches: `dismissed` wants the dismissed candidates specifically, and
+// `candidates` wants the round's whole set.
+function unverifiedReason(need, counts) {
+  const total = counts.fixed + counts.dismissed + counts.open;
+  const why = need === "dismissed"
+    ? [`This marker reports ${counts.dismissed} dismissal${counts.dismissed === 1 ? "" : "s"}, and no self-review-verifier completed since the previous marker.`,
+      `A wrong fix is visible in the diff. A wrong dismissal is not — it enters the dismissed ledger, every later finder is briefed not to refile it, and \`findings.mjs\` records it against this repository, so it suppresses rediscovery in future loops too. That is the author bias this loop exists to counter, and the author cannot be the one who rules on it.`,
+      `Spawn a verifier over the dismissed candidates (batches of <= 8, one message, then wait.mjs on their names), take its verdicts, and re-mark with your real counts.`]
+    : [`This marker reports ${total} candidates (fixed ${counts.fixed}, dismissed ${counts.dismissed}, open ${counts.open}) — more than ${CANDIDATE_TRIGGER} — and no self-review-verifier completed since the previous marker.`,
+      `The trigger is the candidate count and not the verdicts on purpose: it is fixed before you choose any of them, so a loop cannot get under it by fixing what it would otherwise have dismissed.`,
+      `Spawn a verifier over this round's candidates (batches of <= 8, one message, then wait.mjs on their names), take its verdicts, and re-mark with your real counts.`];
+  return [
+    `${GATE_TAG} The converged marker was refused: ${UNVERIFIED_TAG}.`,
+    ...why,
+    // The verifier's name is the containment, not housekeeping: the harness puts
+    // a named agent's NAME into the `agent_type` that PreToolUse hooks receive,
+    // so `tree-guard` matches on the name. An off-convention verifier has a
+    // shell in the author's working tree that no guard is watching — and this
+    // gate would not see it either, which is the second reason to say so here.
+    `Name it starting with \`self-review-verifier\` (\`self-review-verifier-r2-b1\`), whatever type you spawn it as — that prefix is what tree-guard matches and what this gate reads.`,
+    `Then: ${MARKER_BODY}`,
+    `If the numbers are wrong, fix the numbers rather than the review — but a dismissal you cannot show a quoted counter-proof for is an open finding, not a dismissed one.`,
+  ].join("\n");
+}
 
 /**
  * The whole of `intent=validated`: did a ticket validator COMPLETE inside THIS
@@ -1144,7 +1354,7 @@ function evaluate(entries, cwd) {
   // prompt later. logFileMarker is safe at window scope because it already
   // dedupes on the marker id anywhere in the log.
   const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
-  const { at: markerAtW, fileMarker, outcome, intent } = lastMarker(entries, results, cwd);
+  const { at: markerAtW, fileMarker, outcome, intent, counts } = lastMarker(entries, results, cwd);
   const lastChangeAt = changes.length ? Math.max(...changes.map((c) => c.index)) : -1;
   // ONE INDEX FRAME, declared before it is used twice below. markerAt and
   // lastChangeAt are turn-relative; agent records carry whole-window indices.
@@ -1236,7 +1446,7 @@ function evaluate(entries, cwd) {
     // a finder that completed after the APPLIER finished, not merely after the
     // lead's own last edit.
     const state = outcome === "converged"
-      ? reviewerState(agents, externalChangeAt, changeAtW, markerAtW)
+      ? reviewerState(agents, externalChangeAt, changeAtW, markerAtW, prevMarkerAt)
       : "ok";
     // A reviewer still working is not a missing one, and this loop waits by
     // ending turns: release, exactly as the pending branch below does.
@@ -1266,6 +1476,36 @@ function evaluate(entries, cwd) {
         reason: unreviewedReason(state, inFrame, changeAtW, cwd, orchestrators.length > 0),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
       };
+    }
+    // The verdicts, after the read. Two conditions on one marker that must not
+    // be conflated: the check above refuses a marker with no independent reader
+    // and explicitly does NOT count a verifier as one; this one refuses a marker
+    // whose counts say the author ruled alone on findings that needed an
+    // outsider. Order is the obligations' order — a session with no reviewer at
+    // all is told to review before it is told who should rule on the verdicts.
+    const need = outcome === "converged" ? verifierNeed(counts) : null;
+    if (need) {
+      const verified = verifierState(agents, prevMarkerAt, markerAtW);
+      // Same release as the reviewer branch, same reason: this loop waits by
+      // ending turns, and a verifier still working is not a missing one.
+      if (verified === "running") {
+        return {
+          systemMessage: `self-review gate: a converged marker landed while a verifier is still running — turn released so its verdicts can arrive; re-mark after they land and the gate re-checks at the next stop`,
+        };
+      }
+      if (verified === "none") {
+        const refusals = countUnverified(turn);
+        if (refusals >= MAX_REMINDERS) {
+          return {
+            systemMessage: `self-review gate: released after ${refusals} refusals of a converged marker whose ${need === "dismissed" ? "dismissals" : "candidate count"} needed a verifier — the verdicts may be the author's alone. (SELF_REVIEW_GATE=off disables the gate.)`,
+          };
+        }
+        return {
+          decision: "block",
+          reason: unverifiedReason(need, counts),
+          systemMessage: `self-review gate: converged marker refused — ${need === "dismissed" ? `${counts.dismissed} dismissal${counts.dismissed === 1 ? "" : "s"}` : `${counts.fixed + counts.dismissed + counts.open} candidates`} with no verifier completion behind them`,
+        };
+      }
     }
     // The intent claim, after the reviewer one: both can fail at once, and the
     // review is the older and larger obligation, so it is the one named first.
@@ -1406,7 +1646,7 @@ function blockReason(changes, reminders, cwd) {
     ? `${lead}Now: read its report and act on anything it left open, then mark convergence in a message of its own, AFTER your last edit: ${MARKER_BODY} — the marker is what clears this gate. Do not launch a second review of the same tree. If it FAILED, its completion is not a review: invoke the Skill tool with skill "${SKILL_NAME}" and run the loop yourself.`
     : `${lead}Now: invoke the Skill tool with skill "${SKILL_NAME}" and follow it to convergence — fresh reviewer subagents, verify each candidate, fix what survives, re-review until a round is clean. Finish by marking convergence in a message of its own, AFTER your last edit: ${MARKER_BODY} — the marker is what clears this gate — and only then write your final summary.`;
   return [
-    `${GATE_TAG} Files changed this turn but the self-review loop has not converged, so the turn cannot end yet.`,
+    `${GATE_TAG} Files changed this turn but ${UNMARKED_TAG}, so the turn cannot end yet.`,
     `Changed: ${describeChanges(changes, cwd)}`,
     now,
     // Suppressed on the orchestrator branch, which has just told the model not
@@ -1422,7 +1662,7 @@ function blockReason(changes, reminders, cwd) {
 // costs another full-context Stop cycle to reject again.
 function rejectionReason(problems) {
   return [
-    `${GATE_TAG} A convergence marker was written, but the record does not validate, so it does not clear the gate.`,
+    `${GATE_TAG} A convergence marker was written, but the record ${REJECTED_TAG}.`,
     ...problems.map((problem) => `  - ${problem}`),
     `Write it again, in a message of its own, with every field: ${MARKER_BODY}`,
     `If the review does not apply: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,

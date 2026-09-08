@@ -322,8 +322,62 @@ test("F8: pre-flight runs the project's own checks from the install copy, not fr
   // A copy, not a symlink: Node realpaths `import.meta.url`, so through a link
   // the suite would be right back at the checkout and the whole test is void.
   assert.notEqual(ran, realpathSync(repo));
-  assert.match(/^home: (.*)$/m.exec(report)?.[1] ?? "", /cold run – ü\/home$/,
-    "and with the copy's own empty home, where a file the developer happens to have is not there");
+  // The DEVELOPER'S home, and this assertion is the inversion of the one it
+  // replaces. The copy's own empty `home` was the original design; every
+  // toolchain keeps its locator state in HOME, so emptying it tells each of them
+  // to repair itself and the repair is a WRITE — through the linked dependency
+  // tree, into the author's real checkout. Measured on pnpm 2026-09-07:
+  // `.modules.yaml` holds an absolute storeDir, a moved HOME moves the default
+  // store, and pnpm purges and reinstalls the linked node_modules, rewriting the
+  // real repository's storeDir to a directory round.sh then deletes. The
+  // isolation that empty HOME was reaching for belongs to the CONTAINED cold run,
+  // where a write cannot escape; this stage stops before those tiers.
+  assert.equal(/^home: (.*)$/m.exec(report)?.[1] ?? "", process.env.HOME,
+    "with the developer's own HOME — an empty one makes the toolchain repair itself into the author's tree");
+});
+
+test("the tripwire reports a pre-flight that wrote into the checkout's dependency tree", () => {
+  // The stage LINKS node_modules rather than copying it, so every check has a
+  // live path into the author's real checkout. Inheriting HOME removes the cause
+  // we know of; it does not prove there is no other, and "a review never writes
+  // the author's tree" is the invariant that must not fail quietly. Reported,
+  // never fatal — the reviewers still need the suite verdict, and what a write
+  // into their node_modules means is the operator's call.
+  const { repo, work } = fixture();
+  // The `.gitignore` is the whole fixture. coldrun.sh links a dependency tree
+  // only when the copy predicate DROPPED it, which it does for ignored files
+  // and nothing else — without this line node_modules is copied into the stage,
+  // the suite writes into that copy, the checkout is untouched, and this test
+  // passes on an alarm with no breach behind it.
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules", "marker.txt"), "before\n");
+  writeFileSync(path.join(repo, "test.sh"),
+    '#!/bin/sh\necho "touching the linked tree"\necho after > node_modules/marker.txt\n');
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /TRIP {2}node_modules {4}pre-flight wrote into the checkout through the staged link:/,
+    `the write must reach the lead's own report, not only stderr:\n${done.stdout}`);
+  assert.equal(readFileSync(path.join(repo, "node_modules", "marker.txt"), "utf8"), "after\n",
+    "the author's own checkout is what was written — the alarm names that mechanism");
+});
+
+test("a pre-flight that wrote nothing adds no tripwire line", () => {
+  const { repo, work } = fixture();
+  // Ignored, so the tree is really LINKED — the negative case has to run the
+  // same traversal the positive one does, or it asserts nothing.
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules", "marker.txt"), "untouched\n");
+  writeFileSync(path.join(repo, "test.sh"), "#!/bin/sh\necho ok\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.doesNotMatch(done.stdout, /TRIP/,
+    "a tripwire that fires on a clean run is one the lead learns to ignore");
 });
 
 test("F8: a copy that cannot be staged falls back to the checkout and says so", () => {
@@ -495,4 +549,55 @@ test("no artifactRoot means the check does not run at all", () => {
   const { repo, work } = fixture();
   const r = withArtifactRoot(repo, "")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
   assert.doesNotMatch(r.stdout, /artifact-suite/, r.stdout + r.stderr);
+});
+
+test("every check failing to start in the copy falls back to the checkout and names the cause", () => {
+  // All-INFRA is the staging failure discovered one step later: the reviewers
+  // still need a real verdict on the code, and the checkout is where the checks
+  // are known to run. It must also say WHICH of the two happened — "the stage is
+  // broken for this project" is a defect in this plugin and "your suite is red"
+  // is not, and a report that lets the lead confuse them is worse than silent.
+  const { repo, work } = fixture();
+  // A shebang naming an interpreter that does not exist: the shell answers 127,
+  // which is exactly "this never ran" and needs no per-tool knowledge to read.
+  writeFileSync(path.join(repo, "test.sh"), "#!/nonexistent/interpreter\necho unreachable\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stderr, /no check could start in the install copy — a defect in this plugin's staging/, done.stderr);
+  assert.ok(existsSync(path.join(work, "round-1", "preflight-stage.txt")),
+    "the copy's own report is kept: it is the evidence for the plugin defect");
+  assert.match(done.stdout, /INFRA staging {2}no check could start in the install copy/, done.stdout);
+  // The header names where the verdicts under it came from. Rewriting
+  // preflight.txt from the checkout without moving `pf_from` printed the stage's
+  // path over the checkout's verdicts, contradicting the INFRA line four rows
+  // below it in the same block.
+  // `repo` is under /var, which macOS resolves to /private/var, so the header is
+  // matched by its tail rather than by the string this test holds.
+  assert.match(done.stdout, /pre-flight \(from .*\/repo\):/,
+    "the fallback reran from the checkout, so the header must say the checkout");
+  assert.doesNotMatch(done.stdout, /pre-flight \(from .*cold run/, done.stdout);
+});
+
+test("the tripwire is silent when pre-flight ran from the checkout, where there is no link", () => {
+  // Staging failed, so `pf_from` IS the checkout and pre-flight is running the
+  // project's own checks in the project's own tree. A suite touching its own
+  // node_modules there crossed no staged link — reporting it would put a false
+  // alarm in the one line of this block that is about the REVIEW rather than
+  // about the code, and would name a mechanism that did not happen.
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules", "marker.txt"), "before\n");
+  writeFileSync(path.join(repo, "test.sh"),
+    '#!/bin/sh\necho "touching its own tree"\necho after > node_modules/marker.txt\n');
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const round = shadowRound(work, { "coldrun.sh": "#!/bin/sh\necho 'no disk' >&2\nexit 2\n" });
+
+  const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stderr, /could not stage the install copy/, "the staging-failure path is the one under test");
+  assert.doesNotMatch(done.stdout, /TRIP/,
+    `no link was crossed, so there is nothing to report:\n${done.stdout}`);
 });

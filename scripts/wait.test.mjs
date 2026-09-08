@@ -11,7 +11,7 @@ import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { main, makeReader, render, sessionIdFrom } from "./wait.mjs";
+import { deadAdvice, main, makeReader, orphanAdvice, render, sessionIdFrom } from "./wait.mjs";
 
 const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 let seq = 0;
@@ -96,9 +96,30 @@ test("every reviewer finished: exits 0 at once, names them, and points at the co
   const r = await run(["--work", work, "--round", "1", "--session", subagents]);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /f-ab\s+finished\s+.*2 calls\s+2 filed/);
-  assert.match(r.out, /f-cd\s+finished\s+.*0 filed/);
+  // "no file" and "0 filed" are different news and the table must not spell
+  // them the same: f-cd never wrote a lifeboat, which is normal for a finder
+  // with nothing to report — a lead that reads it as "found nothing" when the
+  // findings are on disk under another name stops trusting the column.
+  assert.match(r.out, /f-cd\s+finished\s+.*no file/);
   assert.match(r.out, /# settled — 2 finished, 0 stalled, 0 dead/);
   assert.equal(r.elapsed, 0, "a settled round does not sleep");
+});
+
+test("the filed column counts candidates, not lines", async () => {
+  // Reproduced live on 2026-09-08, round 7 of this repo's own review: a finder
+  // with nothing to report wrote `[]` into its lifeboat — the empty-list form
+  // its own agent file tells it to return — and the column read `1 filed`. The
+  // lead went looking for a candidate that did not exist. The mirror case is
+  // worse: a dying finder salvaged as one JSON array puts every candidate it
+  // had on a single line, which the same count renders as `1`.
+  const { work, subagents, roundDir } = layout({ names: ["f-ab", "f-cd"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  spawn({ subagents, name: "f-cd", entries: report(), hash: "fedcba9876543210" });
+  writeFileSync(path.join(roundDir, "state", "f-ab.jsonl"), "[]\n");
+  writeFileSync(path.join(roundDir, "state", "f-cd.jsonl"), '[{"summary":"one"},{"summary":"two"}]\n{"summary":"three"}\n');
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.match(r.out, /f-ab\s+finished\s+.*0 filed/, "an empty list is zero candidates, not one line");
+  assert.match(r.out, /f-cd\s+finished\s+.*3 filed/, "an array line contributes its length");
 });
 
 test("the names default to the round's brief stems", async () => {
@@ -138,6 +159,14 @@ test("a reviewer silent past the stale limit is dead, and the round settles with
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /f-cd\s+dead/);
   assert.match(r.out, /# settled — 1 finished, 0 stalled, 1 dead/);
+  // SKILL.md §2f promises the tool prints the next action with the name already
+  // substituted, and sends the lead to references/recovery.md for everything else.
+  // A dead row whose remedy the lead has to assemble by hand breaks that promise.
+  // The path is a mktemp dir, so it can carry regex metacharacters; escape it
+  // rather than rely on today's temp-name alphabet.
+  const rx = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(r.out, new RegExp(`salvage\\.mjs" ${rx(subagents)} f-cd$`, "m"));
+  assert.doesNotMatch(r.out, /salvage\.mjs.* f-ab/, "a finished reviewer is collected, not salvaged");
 });
 
 test("the round's wait budget is spent: exit 3, and the active ones are to be treated as dead", async () => {
@@ -267,7 +296,9 @@ test("a transcript is re-parsed only when it has grown", () => {
 
 test("the table survives having no rows to pad against", () => {
   const rows = [{ name: "f-ab", status: "dead", lastAt: "—", calls: 0, stateLines: 0, note: "no transcript" }];
-  assert.match(render(rows, "# verdict"), /^f-ab {2}dead {6}last —.* {3}0 calls {2}0 filed {2}\(no transcript\)\n# verdict$/);
+  // Anchored at the head only: the dead row's own salvage advice follows the
+  // verdict, and this test is about the padding, not about what comes after.
+  assert.match(render(rows, "# verdict"), /^f-ab {2}dead {6}last —.* {3}0 calls {2}0 filed {2}\(no transcript\)\n# verdict\n/);
 });
 
 test("a SIGTERM prints the table rather than losing it", async () => {
@@ -335,4 +366,48 @@ test("an unmeasured stall shape tells the lead to read the error, not which way 
   assert.match(r.out, /f-ab\s+stalled/);
   assert.match(r.out, /shape this plugin has not measured: READ the error above/);
   assert.doesNotMatch(r.out, /resume it: SendMessage/, "the safe default is not a guess in either direction");
+});
+
+test("a state file belonging to no waited-on reviewer is named, not silently ignored", () => {
+  const rows = [{ name: "f-ab", status: "finished", lastAt: "—", calls: 1, stateLines: 1, note: "" }];
+  const listed = ["f-ab.jsonl", "f-cd-respawned.jsonl", "notes.txt"];
+  const advice = orphanAdvice(rows, "/w/round-1/state", listed);
+  assert.match(advice.join("\n"), /1 state file in this round belongs to no reviewer above — an earlier attempt/);
+  assert.match(advice.join("\n"), /Its candidates are still on disk/);
+  assert.match(advice.join("\n"), /f-cd-respawned\.jsonl/);
+  assert.doesNotMatch(advice.join("\n"), /notes\.txt/, "only .jsonl state files are candidates");
+  assert.doesNotMatch(advice.join("\n"), /f-ab\.jsonl/, "a file matching a waited-on name is not an orphan");
+});
+
+test("the orphan advice agrees with the count in both branches, not just on the noun", () => {
+  const rows = [{ name: "f-ab", status: "finished", lastAt: "—", calls: 1, stateLines: 1, note: "" }];
+  const advice = orphanAdvice(rows, "/w/round-1/state", ["f-cd.jsonl", "f-ef.jsonl"]).join("\n");
+  // Conjugating only `file` left "3 state files … an earlier attempt … Its
+  // candidates" — the same disagreement, moved to the other branch.
+  assert.match(advice, /2 state files in this round belong to no reviewer above — earlier attempts/);
+  assert.match(advice, /Their candidates are still on disk/);
+  assert.doesNotMatch(advice, /belongs/);
+  assert.doesNotMatch(advice, /\bIts\b/);
+});
+
+test("a round where every state file is accounted for adds nothing to the table", () => {
+  const rows = [{ name: "f-ab", status: "finished", lastAt: "—", calls: 1, stateLines: 1, note: "" }];
+  assert.deepEqual(orphanAdvice(rows, "/w/round-1/state", ["f-ab.jsonl"]), []);
+  assert.deepEqual(orphanAdvice(rows, "/w/round-1/state", []), [],
+    "a round nobody has filed in yet — the state dir may not even exist");
+});
+
+test("the dead advice is one runnable salvage call naming every dead reviewer and no live one", () => {
+  assert.deepEqual(deadAdvice([{ name: "f-ab", status: "finished" }]), []);
+  const lines = deadAdvice([
+    { name: "f-ab", status: "finished" },
+    { name: "f-cd", status: "dead" },
+    { name: "f-ef", status: "dead" },
+  ], "sess-1");
+  // The invocation salvage.mjs actually parses is positional — `<session-id>
+  // [name…]`, no flags — so this pins the shape, not merely the names. A
+  // printed command that does not run is worse than no command.
+  const call = lines.find((l) => l.includes("salvage.mjs"));
+  assert.equal(call, '#   → "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" sess-1 f-cd f-ef');
+  assert.ok(!lines.some((l) => l.includes("f-ab")), lines.join("\n"));
 });

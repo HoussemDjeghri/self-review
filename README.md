@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.7.7" src="https://img.shields.io/badge/version-0.7.7-191919">
+  <img alt="version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -62,9 +62,10 @@ enforcing:
   They are read-only by instruction (their prompt forbids writes and keeps Bash
   for running tests and reproductions).
 - **A finding needs a concrete failure scenario; a dismissal needs a quoted
-  counter-proof.** "Seems fine" does not dismiss. When the author's dismissals
-  reach three in a round, an independent verifier rules on all of them — that
-  is the author bias the loop exists to counter.
+  counter-proof.** "Seems fine" does not dismiss. One dismissal is enough to
+  send them all to an independent verifier, as are more than four candidates in
+  the loop, and the Stop gate refuses a converged marker with no verifier behind
+  it — that is the author bias the loop exists to counter.
 - **Convergence is an outcome, not a counter.** A round that fixed something
   forces another round. The loop continues only while a severity-weighted score
   strictly drops; a plateau, an oscillation (a round calling a previous fix
@@ -139,8 +140,8 @@ uninstalling.
    model may raise the tier on what line counts cannot see, and may lower it
    only with a recorded reason. Large and risky changes also get an independent
    verifier agent ruling on the findings; at the smaller tiers the author
-   verifies against the file, and a verifier is spawned when the dismissals
-   start piling up.
+   verifies against the file, and a verifier is spawned as soon as a single
+   candidate is dismissed.
 4. **Memory.** `scripts/findings.mjs prior` pulls the handful of findings past
    reviews of this repository recorded against the files this change touches —
    ten lines, ranked by proximity, never the running review's own — and

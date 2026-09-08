@@ -152,20 +152,42 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # library-only diff is exactly the case the cold run's entry-point filter
   # misses.
   #
-  # HOME is the copy's own empty home: a suite that reads a file the developer
-  # happens to have in theirs is a real install failure, and this is the cheapest
-  # reproduction. Writable, unlike the sandbox's — a read-only HOME fails npm,
-  # pip and cargo on their caches, and by the standard this fix is held to
-  # (F8: no long paths, because they break tooling nobody here owns and produce
-  # findings nobody can act on) that is noise, not hostility.
+  # HOME is the DEVELOPER'S, deliberately, and the copy's own `home` directory is
+  # left for the contained tier that coldrun.sh runs later. An empty HOME here was
+  # the original design — "a suite that reads a file the developer happens to have
+  # in theirs is a real install failure" — and it cost more than it ever caught.
+  #
+  # Every toolchain keeps its locator state in HOME: pnpm's store, rustup's
+  # toolchains, Go's module cache, Yarn's global cache, Deno's cache. Emptying it
+  # tells each of them to repair itself, and the repair is a WRITE — through the
+  # `node_modules` symlink below, into the author's real checkout. Measured
+  # 2026-09-07 on pnpm: `node_modules/.modules.yaml` records an absolute
+  # `storeDir`, a moved HOME moves the default store, `checkCompatibility()`
+  # throws `UnexpectedStoreError`, and pnpm purges and reinstalls — rewriting the
+  # real repository's `storeDir` to a temp directory this script then deletes, so
+  # the developer's next `pnpm install` offers to wipe their node_modules. Where
+  # it did not write it aborted instead: eight of eight round-1 pre-flights in one
+  # three-day field report reported `FAIL types` and `FAIL test`, all eight
+  # carrying `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`, and the operator
+  # learned by the third loop to ignore preflight.txt entirely. A signal that is
+  # wrong every time is worse than no signal.
+  #
+  # `CI=1`, the obvious fix, is the worse one: it only stops pnpm ASKING before it
+  # purges. The empty HOME also silently changed which pnpm ran (corepack has no
+  # cache there, so it fetches the newest) — a different toolchain than the
+  # developer's, over the network, every round.
+  #
+  # The property that empty HOME was reaching for belongs to the contained cold
+  # run, where writes are confined and the network is denied. This stage is
+  # uncontained by construction (`--stage-only` stops before the tiers), and an
+  # empty HOME is only safe where a write cannot escape. Ruled 2026-09-07.
   #
   # A staging failure is reported, not fatal: pre-flight from the checkout is
   # what every release until now did, and it is worth more than no pre-flight.
   pf_from="${repo_root:-$(pwd)}"
-  pf_home=""
   stage="$dir/cold run – ü"
   if ship="$("$here/coldrun.sh" --root "$pf_from" --stage-only --out "$stage" 2>"$dir/stage.err")" && [ -d "$ship" ]; then
-    pf_from="$ship"; pf_home="$stage/home"
+    pf_from="$ship"
   else
     echo "round.sh: could not stage the install copy (${dir}/stage.err) — pre-flight runs from the checkout, where a path bug cannot show" >&2
   fi
@@ -176,15 +198,86 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # exit-2 paths (a bad --root, an unwritable --out) completely: no message, no
   # preflight.txt, no section, exit 0 — and SKILL.md tells the session to say
   # which script did not run, which it then had no way to know.
-  if ! HOME="${pf_home:-$HOME}" "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
+  #
+  # The tripwire. `coldrun.sh --stage-only` LINKS the dependency trees rather than
+  # copying them, so every check pre-flight runs has a live path into the author's
+  # real checkout. Inheriting HOME removes the cause we know about; it does not
+  # prove there is no other, and the invariant "a review never writes the author's
+  # tree" is the one this plugin cannot get wrong quietly. So it is measured, once
+  # per round, with one traversal per linked tree and no per-tool knowledge in it.
+  #
+  # Reported, never fatal: a dependency tree that a check legitimately touched is
+  # not a reason to withhold a suite verdict the reviewers need, and the operator
+  # is the one who decides what a write into their node_modules means. It is also
+  # the signal that flips this design — if it fires with the developer's own HOME,
+  # linking that tree is unsafe at any HOME and the answer is to stop linking that
+  # one directory and report its checks as INFRA.
+  sentinel="$dir/.deps-sentinel"
+  : >"$sentinel"
+
+  if ! "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
     echo "round.sh: preflight.sh failed (${dir}/preflight.err) — the project's own checks did not run; say so in the report" >&2
   fi
+
+  # Only the STAGE has links to cross. On the staging-failure path above,
+  # `pf_from` is the checkout itself and pre-flight is simply running the
+  # project's own checks in the project's own tree — a suite touching its own
+  # `node_modules/.cache` there is ordinary, and reporting it as a breach would
+  # put a false alarm in the one message this block reserves for a defect in the
+  # review rather than in the code.
+  #
+  # The linked trees are ENUMERATED, not listed: `coldrun.sh` decides what to
+  # link, and a second copy of its list here would fail open — an ecosystem
+  # added there would silently stop being watched. Every symlink at the stage's
+  # root is a path out of it, which is exactly what this measures. The trailing
+  # slash is load-bearing: `find` without it stats the link and never descends.
+  tripped=""
+  if [ "$pf_from" != "${repo_root:-$(pwd)}" ]; then
+    while IFS= read -r link; do
+      [ -n "$link" ] || continue
+      hit="$(find "$link/" -newer "$sentinel" -print -quit 2>/dev/null || true)"
+      # `if`, not `[ … ] && …`: under `set -e` a false `&&` list is a failing
+      # command and would end the round on the ordinary case where nothing wrote.
+      if [ -n "$hit" ]; then
+        tripped="$tripped
+TRIP  $(basename "$link")    pre-flight wrote into the checkout through the staged link: $hit"
+      fi
+    done <<EOF
+$(find "$pf_from" -maxdepth 1 -type l 2>/dev/null || true)
+EOF
+  fi
+  rm -f "$sentinel"
   # The verdict lines only — preflight.txt keeps the failure tail, and --out
   # exists precisely so that tail stays out of the main session's context.
   # `no checks detected` is a verdict too: without it the caller cannot tell
   # "pre-flight ran and this project defines nothing to run" from "pre-flight
   # never ran", and those call for opposite reactions.
-  pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
+  # Every check failing to START is the staging failure above, discovered one
+  # step later: the reviewers still need a real verdict on the code, and the
+  # checkout is where the checks are known to run. So it falls back exactly as a
+  # failed stage does — and says which of the two happened, because "the stage is
+  # broken for this project" is a defect in the plugin and "your suite is red" is
+  # not, and the report must not let the lead confuse them.
+  if [ "$pf_from" != "${repo_root:-$(pwd)}" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
+    echo "round.sh: no check could start in the install copy — a defect in this plugin's staging, not in the project. Re-running pre-flight from the checkout; report both." >&2
+    mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
+    if ! "$here/preflight.sh" --root "${repo_root:-$(pwd)}" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
+      echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
+    fi
+    tripped="$tripped
+INFRA staging  no check could start in the install copy (${dir}/preflight-stage.txt); the verdicts below are from the checkout"
+    # The header at the end of this script names where pre-flight ran, and the
+    # comment above it says why that is load-bearing. Rewriting preflight.txt
+    # without moving `pf_from` printed the stage's path over the checkout's
+    # verdicts — contradicting, four lines apart, the INFRA line just appended.
+    pf_from="${repo_root:-$(pwd)}"
+  fi
+
+  pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|INFRA|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
+  # The tripwire's verdict rides with the other verdicts rather than only on
+  # stderr: the lead reads this block, and a write into the author's tree is the
+  # one line here that is about the REVIEW rather than about the code.
+  pf="$pf$tripped"
 
   # Ruling 1, item 3: the shipped suite, run in the shape it SHIPS in.
   #
@@ -238,7 +331,7 @@ SKIP artifact-suite  no *.test.mjs under $artifact_root/ — nothing to run as t
       else
         ship_rc=0
         ( cd "$ship_root" && env -u NODE_TEST_CONTEXT -u NODE_OPTIONS \
-            SELF_REVIEW_LOG_DIR="$dir/artifact-log" HOME="${pf_home:-$HOME}" \
+            SELF_REVIEW_LOG_DIR="$dir/artifact-log" \
             node --test --test-reporter tap "${ship_tests[@]}" ) >"$dir/artifact-suite.txt" 2>&1 || ship_rc=$?
         ship_plan="$(awk '/^# tests [1-9]/{t=1} /^# fail 0$/{f=1} END{print (t && f) ? "yes" : "no"}' "$dir/artifact-suite.txt" 2>/dev/null)"
         ship_count="$(awk '/^# tests [0-9]+$/{print $3}' "$dir/artifact-suite.txt" 2>/dev/null | tail -1)"

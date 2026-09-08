@@ -275,10 +275,12 @@ function renderSections({ row, index, total, round, intent, scope, live, angles,
     state: grading
       ? `STATE FILE (crash insurance)\n${stateFile} — each time a candidate firms up, Write\n` +
         `the candidates you have so far there, one JSON object per line. If your session\n` +
-        `dies, this file is what survives.\n`
+        `dies, this file is what survives. Nothing to report means you never write it:\n` +
+        `\`[]\` belongs in your final message, not here.\n`
       : `STATE FILE (crash insurance)\n${stateFile} — append each candidate there as one\n` +
         `JSON line the moment it firms up, batched into the same Bash call as your next\n` +
-        `read. If your session dies, this file is what survives.\n`,
+        `read. If your session dies, this file is what survives. Nothing to report means\n` +
+        `you never write it: \`[]\` belongs in your final message, not here.\n`,
     output:
       `CALL BUDGET\n${row.calls} tool calls. Spend them on reading the enclosing code and proving\n` +
       `findings, not on breadth for its own sake.\n\n` +

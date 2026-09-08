@@ -236,6 +236,21 @@ export function toRecord(entry, position, { review, round, ts }) {
     mechanism: clean(entry.mechanism ?? "", LIMITS.mechanism),
     proof: clean(entry.proof ?? "", LIMITS.proof),
   };
+  // "A dismissal without a quoted counter-proof is not a dismissal" is SKILL.md
+  // §2d's rule, and until 2026-09-07 it was only prose: the ledger accepted a
+  // `dismissed` row with an empty `proof`, and that row then entered every later
+  // finder's do-not-refile brief. A wrong FIX is visible in the diff; a wrong
+  // dismissal is invisible and it suppresses rediscovery in this loop and in
+  // every future loop over the same files. So the one field that makes it
+  // checkable is required at the point of writing.
+  //
+  // Write-time only — deliberately NOT in `recordProblem`, which vets rows
+  // already on disk. Rows written before this rule are honest history; failing
+  // them there would make the loop forget what it once found, which is the
+  // opposite of what this protects.
+  if (record.verdict === "dismissed" && !record.proof) {
+    report("proof — a dismissal needs the counter-proof quoted (SKILL.md §2d: a dismissal without one is an unverified candidate, not a dismissal)");
+  }
   return { record: problems.length ? null : record, problems };
 }
 

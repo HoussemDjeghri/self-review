@@ -76,8 +76,8 @@ is the UUID in your scratchpad path; a `<work>` outside the scratchpad needs
 because `wait.mjs` keeps its state under `round-<n>/` and numbers from 1, and
 the ticket is not round 1 of anything. Exit 1 means call it again, now; exit 3
 means it went dead — salvage by hand, and re-spawn once under a new suffix only
-if the transcript holds no verdict (self-review §2f); a row marked stalled is
-resumed, not re-spawned (§2g). Do not end the turn to wait, and do not check on
+if the transcript holds no verdict; a row marked stalled is resumed, not
+re-spawned (both in self-review §2f, and in its `references/recovery.md`). Do not end the turn to wait, and do not check on
 it any other way (self-review rule 1).
 
 If the type is not offered, a `general-purpose` agent with the agent file

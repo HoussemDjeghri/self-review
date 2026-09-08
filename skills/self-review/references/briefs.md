@@ -55,9 +55,10 @@ is the order and the wording.
 
 ## Verifier brief
 
-Spawned only in the cases SKILL.md §2d names (tier L; the round's dismissals
-reach three in total, counted across every verification pass rather than per
-batch; an uncertain behaviour-changing fix). One verifier per batch of up to 8
+Spawned only in the cases SKILL.md §2d names (a single dismissal, counted
+across every verification pass rather than per batch; more than four candidates
+in the loop; tier L; an uncertain behaviour-changing fix — the first two are
+enforced by the Stop gate). One verifier per batch of up to 8
 candidates, `subagent_type: "self-review-verifier"` (fallback: `general-purpose`
 + the verifier system prompt text). Otherwise you verify, with the same rubric,
 and the ledger carries your quoted proof.

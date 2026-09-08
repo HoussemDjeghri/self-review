@@ -60,7 +60,11 @@ const toolResult = (id, content, toolUseResult = content) => ({
   type: "user", uuid: `r${seq}`, timestamp: stamp(), toolUseResult,
   message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
 });
-const gateFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(), message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} please review` } });
+// Carries the no-marker refusal's own sentence, not just the tag. `GATE_TAG`
+// is on all five refusals, so a fixture holding only the tag stood in for any of
+// them — and the counter it feeds is bounded to two of the five.
+const UNMARKED_TAG = "the self-review loop has not converged";
+const gateFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(), message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} Files changed this turn but ${UNMARKED_TAG}, so the turn cannot end yet.` } });
 const interrupted = () => ({ type: "user", timestamp: stamp(), message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } });
 const compactSummary = () => ({ type: "user", isCompactSummary: true, timestamp: stamp(), message: { role: "user", content: "This session is being continued from a previous conversation…" } });
 
@@ -484,6 +488,33 @@ test("second reminder is labelled; after the cap the gate releases with a notice
   const released = run(turn(...write(`${PROJECT}/a.ts`), gateFeedback(), said("x"), gateFeedback(), said("y")));
   assert.equal(released.json?.decision, undefined);
   assert.match(released.json.systemMessage, /released/);
+});
+
+test("an obligation refusal does not spend the no-marker budget", () => {
+  // Every refusal carries GATE_TAG, so counting the tag pooled five obligations
+  // into one budget of two: one no-marker reminder plus one stale
+  // intent=validated refusal released the turn with NEITHER at its own cap.
+  const stale = () => ({
+    type: "user", isMeta: true, timestamp: stamp(),
+    message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} The marker was refused: intent=validated claims a fresh reader saw the ticket, but no self-review-ticket-validator completed before this task's first code change.` },
+  });
+  const r = run(turn(...write(`${PROJECT}/a.ts`), stale(), said("x"), gateFeedback(), said("y")));
+  assert.ok(blocks(r), "one no-marker reminder is one, whatever else the gate refused");
+  assert.match(r.json.reason, /Second reminder/);
+});
+
+test("a refused-marker reminder still counts, or a bad marker deadlocks the turn", () => {
+  // countReminders is the ONLY bound on the malformed-record refusal: a
+  // rejected marker does not move `at` in lastMarker, so markerAt stays behind
+  // it. Narrowing the counter to the no-marker sentence alone would block a
+  // model writing bad markers forever.
+  const rejected = () => ({
+    type: "user", isMeta: true, timestamp: stamp(),
+    message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} A convergence marker was written, but the record does not validate, so it does not clear the gate.` },
+  });
+  const r = run(turn(...write(`${PROJECT}/a.ts`), rejected(), said("x"), rejected(), said("y")));
+  assert.equal(r.json?.decision, undefined, "two refused markers reach the cap and release");
+  assert.match(r.json.systemMessage, /released/);
 });
 
 test("reminders before a marker do not count toward the cap", () => {
@@ -2024,4 +2055,172 @@ test("an unresolvable Bash write is a write, and it is ordered like any other", 
   const alone = run(turn(...bash(unnamed), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
   assert.ok(blocks(alone), "intent=validated was accepted with provably zero validators");
   assert.match(alone.json.systemMessage, /intent=validated refused/);
+});
+
+// ---------- the verdicts need an outsider (field report 2026-09-07) ----------
+// Measured over 8 loops / 24 rounds / 76 candidates: 3 verifiers. §2d's
+// "dismissals reach three" was prose AND was above the ceiling of a ~3.2
+// candidate round, so the one clause that could have fired never did.
+let vfSeq = 0;
+const verifier = (over = {}) => {
+  const id = `vf${++vfSeq}`;
+  return [...call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name: `self-review-verifier-r1-b1`, ...over }, LAUNCHED(id)),
+    notification(id)];
+};
+const CONVERGED = (over) => ({ ...CONVERGED_RECORD, ...over });
+
+test("a converged marker reporting a dismissal is refused without a verifier", () => {
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /1 dismissal, and no self-review-verifier completed/);
+  // The reason a threshold of one is right, in the refusal itself.
+  assert.match(r.json.reason, /A wrong fix is visible in the diff\. A wrong dismissal is not/);
+  assert.match(r.json.systemMessage, /1 dismissal with no verifier completion/);
+});
+
+test("a completed verifier satisfies the dismissal clause, by type or by name", () => {
+  // The name must NOT match here, or this case passes on the name branch and
+  // the type branch has no test at all — measured: deleting the type branch
+  // left the whole suite green.
+  const byType = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...verifier({ name: "checker-r1-b1" }),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))));
+  assert.equal(byType.stdout, "", "the registered type is evidence");
+  // §2b sends a lead whose reviewer type is missing to `general-purpose`, where
+  // the prefixed NAME is the only thing that identifies it — to tree-guard and
+  // to this gate alike.
+  const byName = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...verifier({ subagent_type: "general-purpose", name: "self-review-verifier-r2-b1" }),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))));
+  assert.equal(byName.stdout, "", "the name convention is evidence too");
+});
+
+test("more than four candidates needs a verifier even with nothing dismissed", () => {
+  // The trigger has no cost gradient on purpose: it is fixed before any verdict
+  // is chosen, so a loop cannot get under it by fixing what it would have
+  // dismissed.
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(CONVERGED({ fixed: 5, dismissed: 0, open: 0 }))));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /5 candidates \(fixed 5, dismissed 0, open 0\) — more than 4/);
+  assert.match(r.json.reason, /fixed before you choose any of them/);
+});
+
+test("four candidates and no dismissal is under the trigger", () => {
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(CONVERGED({ fixed: 2, dismissed: 0, open: 2 }))));
+  assert.equal(r.stdout, "", "the boundary is > 4, not >= 4");
+});
+
+test("the script-form marker's counts are read the same way", () => {
+  const cmd = `${CONVERGED_Q} --converged --rounds 1 --fixed 0 --dismissed 2 --open 0 --intent author`;
+  const out = "SELF-REVIEW CONVERGED — outcome=converged rounds=1 fixed=0 dismissed=2 open=0 intent=author";
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...bash(cmd, out)));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /2 dismissals, and no self-review-verifier completed/);
+});
+
+test("a verifier still running releases the turn rather than blocking", () => {
+  const id = "vfrun";
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name: "self-review-verifier-r1-b1" }, LAUNCHED(id)),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))));
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /a verifier is still running/);
+});
+
+test("a marker whose counts cannot be read makes no verifier claim", () => {
+  // A legacy line with no `outcome=` is not gated at all; this is the narrower
+  // case — the outcome parses, the counts do not. Refusing on numbers we failed
+  // to read would be a block bought with a guess, which is the one thing this
+  // gate does not do.
+  const out = "SELF-REVIEW CONVERGED — outcome=converged rounds=1 intent=author";
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...bash(MARKER_CMD, out)));
+  assert.equal(r.stdout, "");
+});
+
+test("the verifier refusal releases after MAX_REMINDERS, with its own counter", () => {
+  const body = [...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const feedback = () => ({ type: "user", isMeta: true, timestamp: stamp(),
+    message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} The converged marker was refused: these counts need a verifier behind them.` } });
+  const r = run([human("go"), ...body, feedback(), said("a"), feedback(), said("b"), ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })), said("done")]);
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /released after 2 refusals .* dismissals needed a verifier/);
+});
+
+test("every name this gate reads as a verifier is one tree-guard reads as a reviewer", () => {
+  // The two regexes live in different files and are edited separately, which is
+  // exactly the seam. Verified 2026-09-07: without the trailing boundary,
+  // `self-review-verifier2` cleared this gate and was matched by nothing in
+  // tree-guard — an unguarded shell in the author's tree that also cleared the
+  // marker.
+  const src = (f) => readFileSync(path.join(path.dirname(GATE), f), "utf8");
+  const re = (text, name) => {
+    const line = new RegExp(`^const ${name} = (/.*/);$`, "m").exec(text);
+    assert.ok(line, `${name} is not a single-line regex constant any more — update this test`);
+    return eval(line[1]); // eslint-disable-line no-eval -- the source IS the fixture
+  };
+  const gate = src("self-review-gate.mjs"), guard = src("tree-guard.mjs");
+  const VERIFIER_NAME = re(gate, "VERIFIER_NAME"), VERIFIER_TYPE = re(gate, "VERIFIER_TYPE");
+  const REVIEWER = re(guard, "REVIEWER");
+  for (const name of ["self-review-verifier", "self-review-verifier-r2-b1", "self-review-verifier2",
+    "self-review-verifiers-r2", "self-review-verifier-", "self-review:self-review-verifier"]) {
+    if (VERIFIER_NAME.test(name) || VERIFIER_TYPE.test(name)) {
+      assert.ok(REVIEWER.test(name), `${name} clears the gate but tree-guard does not guard it`);
+    }
+  }
+});
+
+test("a verifier from the previous loop does not satisfy the next marker", () => {
+  // `verifierState`'s lower bound is the PREVIOUS marker, and every other test
+  // in this block runs with none. Same shape as the validator's own
+  // "a marker closes the task" case.
+  const first = [...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...verifier(),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const second = [...write(`${PROJECT}/src/b.ts`), ...reviewed(),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const r = run([human("go"), ...first, human("now the next one"), ...second, said("done")]);
+  assert.ok(blocks(r), "the second loop's dismissal needs its own verifier");
+  assert.match(r.json.reason, /1 dismissal, and no self-review-verifier completed/);
+});
+
+// ---------- a crashed agent must not hold the gate DOWN either ----------
+// PENDING_INTERJECTION_LIMIT ages a pending agent out after two human prompts,
+// and a task boundary costs exactly one — so an agent crashed in an
+// ALREADY-MARKED task stayed `pending` through the whole of the next one and
+// released every marker in it. `stillRunningFor` is the fix; these four guard
+// both directions, in both functions that call it.
+const crashedVerifier = (id) =>
+  call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name: "self-review-verifier-r1-b1" }, LAUNCHED(id));
+
+test("a verifier crashed in an earlier task does not release this task's dismissal", () => {
+  const first = [...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...crashedVerifier("vfcrash"),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const second = [...write(`${PROJECT}/src/b.ts`), ...reviewed(),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const r = run([human("go"), ...first, human("now the next one"), ...second, said("done")]);
+  assert.ok(blocks(r), "a verifier that crashed before the task boundary is not this task's verifier");
+  assert.match(r.json.reason, /1 dismissal, and no self-review-verifier completed/);
+});
+
+test("a re-mark while this task's own verifier is still pending still releases", () => {
+  const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })),
+    ...crashedVerifier("vflive"),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })), said("done")]);
+  assert.ok(!blocks(r), "ending the turn is how this loop waits for its OWN verifier");
+  assert.match(r.json.systemMessage, /a verifier is still running/);
+});
+
+test("a finder crashed in an earlier task does not release this task's marker", () => {
+  const first = [...write(`${PROJECT}/src/a.ts`), ...launch("fdcrash"), ...writeMarker()];
+  const second = [...write(`${PROJECT}/src/b.ts`), ...writeMarker()];
+  const r = run([human("go"), ...first, human("now the next one"), ...second, said("done")]);
+  assert.ok(blocks(r), "a finder that crashed before the task boundary reviewed none of this task");
+  assert.match(r.json.reason, /No reviewer agent ran in this window/);
+});
+
+test("a finder still running in this task releases the marker", () => {
+  // The 2026-08-22 case, and the reason `stillRunningFor` has two clauses.
+  const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("fdlive"), ...writeMarker(),
+    ...write(`${PROJECT}/src/b.ts`), ...writeMarker(), said("done")]);
+  assert.ok(!blocks(r), "a reviewer still working is not a missing one");
+  assert.match(r.json.systemMessage, /a reviewer is still running/);
 });

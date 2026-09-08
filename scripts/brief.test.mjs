@@ -235,6 +235,20 @@ test("a brief that fits carries no budget note", () => {
   assert.match(brief.text, /STATE FILE[^\n]*\n\/w\/round-1\/state\/r1-a\.jsonl/);
 });
 
+test("both briefs say an empty lifeboat is left alone, not filled with `[]`", () => {
+  // 2026-09-08: a finder with nothing to report wrote `[]` into its state file,
+  // taking the empty-list form from the OUTPUT section eleven lines below —
+  // which is the final message's contract, not the lifeboat's. `wait.mjs` read
+  // the round as having a candidate. The count there no longer miscounts it,
+  // but the shape is manufactured here, so it is closed here too.
+  for (const grading of [false, true]) {
+    const agent = grading ? "self-review-cold-grader" : "self-review-finder";
+    const text = renderBrief(briefArgs({ row: { ...briefArgs().row, agent } })).text;
+    assert.match(text, /STATE FILE[\s\S]*?belongs in your final message, not here/,
+      `grading=${grading}: the lifeboat's contract must rule out \`[]\``);
+  }
+});
+
 test("the estimator counts bytes, not characters", () => {
   assert.equal(estimateTokens("abcdefg"), 2);
   // Four two-byte characters: 8 bytes is 3 estimated tokens, 4 characters would

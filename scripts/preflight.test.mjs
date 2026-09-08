@@ -51,7 +51,7 @@ test("a package.json script becomes a check, named by kind and run through the p
   const out = run(p);
   assert.match(out, /PASS {2}lint {4}npm run lint/);
   assert.match(out, /PASS {2}test {4}npm test/);
-  assert.match(out, /# 2 run, 0 failed, 0 skipped/);
+  assert.match(out, /# 2 run, 0 failed, 0 could not start, 0 skipped/);
 });
 
 test("a failing check reports its exit code and the tail of its output", () => {
@@ -82,7 +82,7 @@ test("a check named in preflight.skip is reported, not run", () => {
   }, { npm: 'echo ran; exit 1' });
   const out = run(p, [], { SELF_REVIEW_CONFIG: path.join(p.root, "config.json") });
   assert.match(out, /SKIP {2}test {4}\(preflight.skip\)/);
-  assert.match(out, /# 1 run, 1 failed, 1 skipped/);
+  assert.match(out, /# 1 run, 1 failed, 0 could not start, 1 skipped/);
   assert.doesNotMatch(out, /FAIL {2}test/, "a skipped check cannot fail");
 });
 
@@ -177,4 +177,64 @@ test("usage errors exit 2 and run nothing", () => {
     assert.equal(result.status, 2, `expected usage error for ${args.join(" ")}`);
     assert.equal(result.stdout, "");
   }
+});
+
+// A check that could not START is not a check that failed. Measured over three
+// days of use: a pre-flight that false-failed in 8 of 8 rounds taught its
+// operator to skip the section entirely, so the one round where it was finally
+// right was skipped with the rest. 126 and 127 are the SHELL's own answer to
+// "did this ever run", which is why they are the whole test — a per-tool error
+// string list would catch more and rot silently, and rot is what is being fixed.
+test("a check whose command cannot be run is INFRA, not FAIL", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
+    { npm: "exit 127" });
+  const out = run(p);
+  assert.match(out, /INFRA test {4}npm test {3}\(exit 127 — the command could not be run; the check never started\)/);
+  assert.match(out, /# 1 run, 0 failed, 1 could not start, 0 skipped/,
+    "an environment that is broken must not be counted as a red suite");
+  assert.doesNotMatch(out, /^FAIL/m);
+});
+
+test("a check found but not executable is INFRA too", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
+    { npm: "exit 126" });
+  assert.match(run(p), /INFRA test .*\(exit 126/);
+});
+
+test("a timeout stays FAIL, because a hang can be real", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
+    { npm: "sleep 5" });
+  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1" });
+  assert.match(out, /FAIL {2}test/);
+  assert.match(out, /timeout 1s/);
+  assert.match(out, /# 1 run, 1 failed, 0 could not start, 0 skipped/);
+});
+
+test("every check failing to start says so, and says it is a defect in the review", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { lint: "x", test: "x" } }) },
+    { npm: "exit 127" });
+  const out = run(p);
+  assert.match(out, /^# EVERY check failed to start\. This is a defect in the review, not in the project:/m);
+  assert.match(out, /nothing here is a verdict on the code/);
+});
+
+test("one check that could not start alongside a real failure is not the all-INFRA case", () => {
+  // The banner is about a broken STAGE. A project whose linter is missing and
+  // whose suite is genuinely red is a project with a red suite, and telling the
+  // lead to disregard that verdict would hide the finding pre-flight exists for.
+  const p = project({ "package.json": JSON.stringify({ scripts: { lint: "x", test: "x" } }) },
+    { npm: 'case "$*" in *lint*) exit 127 ;; *) echo boom; exit 1 ;; esac' });
+  const out = run(p);
+  assert.match(out, /INFRA lint/);
+  assert.match(out, /FAIL {2}test/);
+  assert.doesNotMatch(out, /EVERY check failed to start/);
+});
+
+test("--help prints the whole header, including the last paragraph", () => {
+  // The header is printed by a derived range, not a line range, because a fixed
+  // one silently dropped the last paragraph when the header grew. Asserting
+  // both ends is what makes the next truncation fail here instead of shipping.
+  const out = run(project({}), ["--help"]);
+  assert.match(out, /run the project's own checks before spending reviewers/);
+  assert.match(out, /Exit 0 even when checks fail/);
 });
