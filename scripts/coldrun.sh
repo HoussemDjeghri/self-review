@@ -214,12 +214,24 @@ home="$out/home";  mkdir -p "$home"
 # is safe where a link to the ROOT would not be, because Node realpaths
 # `import.meta.url`: a dependency resolving back to the checkout is a dependency
 # either way, while a root that resolved back would defeat the whole test.
+#
+# `node_modules` is linked wherever it sits, not only at the root: a pnpm
+# workspace keeps one per package, and with only the root's linked every
+# package's own imports failed to resolve — a false FAIL on every monorepo
+# (docs/FIELD_REPORT-2026-09-18.md, "Diagnosed afterwards"). A package whose
+# directory the copy did not create is not staged, so its tree is not linked.
 if [ "$stage_only" -eq 1 ]; then
-  for dep in node_modules .venv venv vendor .bundle; do
+  for dep in .venv venv vendor .bundle; do
     if [ -e "$root/$dep" ] && [ ! -e "$ship/$dep" ]; then
       ln -sfn "$root/$dep" "$ship/$dep" || die "could not link $dep into the sandbox"
     fi
   done
+  while IFS= read -r -d '' dep; do
+    rel="${dep#"$root"/}"
+    if [ -d "$ship/$(dirname "$rel")" ] && [ ! -e "$ship/$rel" ]; then
+      ln -sfn "$dep" "$ship/$rel" || die "could not link $rel into the sandbox"
+    fi
+  done < <(find "$root" \( -name .git -o -name node_modules \) -prune -name node_modules -print0)
   printf '%s\n' "$ship"
   exit 0
 fi

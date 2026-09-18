@@ -1619,6 +1619,65 @@ test("explained exempt evidence beside an unexplained code file names the code f
   assert.doesNotMatch(r.json.reason, /docs\/a\.md/);
 });
 
+test("from a subdirectory cwd the git evidence is read against the repository's top", () => {
+  // Porcelain paths are relative to the top, never to the cwd. Resolved against
+  // a subdirectory they named files that do not exist, every stat missed, and a
+  // scripted code write read as "nothing in the working tree changed".
+  const { repo } = repoFixture({ "src/generated.mjs": "export const x = 1;\n" });
+  const r = run(turn(bash(SCRIPTED(repo)[0])), { payload: { cwd: path.join(repo, "src") } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /Changed: generated\.mjs/, r.json.reason);
+});
+
+// ---------- the working tree's veto over an exempt-classified Bash write ----------
+//
+// Each of the five historical mis-parses was a command the parser read as
+// prose or scratch while the file it wrote was code. A fixture cannot revert
+// those fixes, so it stages their shape directly: the command names only an
+// exempt file, and the code beside it changed where no tool call accounts for it.
+
+test("the veto: an exempt redirect beside unexplained code arms, and says why", () => {
+  const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
+  const r = run(turn(bash(`printf x > ${repo}/src/notes.md`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the parser said prose; the tree says code changed beside it");
+  assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
+  assert.match(r.json.reason, /read as prose-only/);
+  assert.doesNotMatch(r.json.reason, /src\/notes\.md/, "the exempt file is not the change");
+});
+
+test("the veto: the same stem in another directory arms too", () => {
+  const { repo } = repoFixture({ "out/gen.txt": "x\n", "src/gen.mjs": "export {};\n" });
+  const r = run(turn(bash(`printf x > ${repo}/out/gen.txt`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
+});
+
+test("the veto: unexplained code nowhere near what the command named does not arm", () => {
+  // Narrowed by the replay: 8 of 352 eligible turns had evidence another
+  // session or a `git reset --hard` could have produced, and none was a hit.
+  const { repo } = repoFixture({ "docs/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
+  assert.equal(run(turn(bash(`printf x > ${repo}/docs/notes.md`)), { payload: { cwd: repo } }).stdout, "");
+});
+
+test("the veto: code a successful Edit explains adds no second change", () => {
+  const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
+  const r = run(turn(...edit(`${repo}/src/gen.mjs`), bash(`printf x > ${repo}/src/notes.md`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the Edit is the change");
+  assert.doesNotMatch(r.json.reason, /shell command|read as prose-only/, r.json.reason);
+});
+
+test("the veto: no repository or no turn timestamp keeps today's pass", () => {
+  const dir = mkdtempSync(path.join(REAL_HOME, `${HOME_FIXTURE}${process.pid}-norepo-`));
+  fixtures.add(dir);
+  mkdirSync(path.join(dir, "src"));
+  writeFileSync(path.join(dir, "src", "gen.mjs"), "export {};\n");
+  assert.equal(run(turn(bash(`printf x > ${dir}/src/notes.md`)), { payload: { cwd: dir } }).stdout, "", "no git to ask");
+  const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
+  const entries = turn(bash(`printf x > ${repo}/src/notes.md`));
+  entries[0] = { ...entries[0], timestamp: "not a date" };
+  assert.equal(run(entries, { payload: { cwd: repo } }).stdout, "", "no turn start to date the evidence against");
+});
+
 test("the intent check and the change check agree: an exempt write is not a first change, the unresolved heredoc is", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n" });
   const VALIDATED = { ...CONVERGED_RECORD, intent: "validated" };

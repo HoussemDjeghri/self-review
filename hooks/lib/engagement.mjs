@@ -106,20 +106,13 @@ export function noteEngagement(repoRoot, agentType, matched, { session = null, l
 // prefix is the claim, and whether tree-guard's REVIEWER matched it is the
 // measurement. Deliberately not tree-guard's regex: a check written in the
 // terms of the thing it checks passes whenever that thing is consistent with
-// itself, which is exactly the failure being audited.
+// itself, which is exactly the failure being audited. Every name here is one
+// tree-guard is meant to cover — since 0.8.2 that includes the applier — so an
+// unmatched row under it can only mean the guard's regex has gone inert (F10h).
+// `engagement.test.mjs` asserts tree-guard's decision really does deny one
+// canonical spelling of each, so the two cannot drift apart in silence.
 export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|applier|ticket-validator)\b/;
 
-// Of the names this plugin generates, the ones tree-guard is meant to cover.
-// The split decides which of two DIFFERENT failures an unmatched row is, and
-// they have different remedies: a covered type the guard did not match means
-// the guard's regex has gone inert (F10h, the defect this log exists to catch);
-// an uncovered type means an agent ran a shell that no guard was ever watching.
-// Kept as a static list rather than read from tree-guard, for the reason OURS
-// is: a check written in the terms of the thing it checks passes whenever that
-// thing is consistent with itself. `engagement.test.mjs` asserts tree-guard's
-// REVIEWER really does match one canonical spelling of each name here, so the
-// two constants cannot drift apart in silence.
-const COVERED = /^(self-review:)?self-review-(finder|verifier|cold-grader|ticket-validator)\b/;
 
 /**
  * What the log says about the round that just ran.
@@ -157,7 +150,7 @@ export function auditEngagement(text, { round = null } = {}) {
   // at all — means nothing opened a round here, and the file's other rows are
   // not evidence about it.
   if (openedAt === -1) {
-    return { calls: 0, matched: 0, unmatched: [], uncovered: [], unattributed: 0, blind: false, opened: false };
+    return { calls: 0, matched: 0, unmatched: [], unattributed: 0, blind: false, opened: false };
   }
   const after = rows.slice(openedAt + 1);
   const nextRound = after.findIndex((row) => row.kind === "round");
@@ -168,28 +161,18 @@ export function auditEngagement(text, { round = null } = {}) {
   const attributed = mine.filter((row) => row.session);
   const unattributed = mine.length - attributed.length;
   const typeOf = (row) => String(row.agentType ?? "");
-  const covered = attributed.filter((row) => COVERED.test(typeOf(row)));
+  const covered = attributed.filter((row) => OURS.test(typeOf(row)));
   const unmatched = [...new Set(covered.filter((row) => !row.matched).map(typeOf))];
-  // Counted in ROWS, not names: "1 name" understated three shell calls the
-  // first time this fired, and the number that matters is how many calls went
-  // unwatched.
-  const uncovered = [...attributed
-    .filter((row) => OURS.test(typeOf(row)) && !COVERED.test(typeOf(row)))
-    .reduce((tally, row) => tally.set(typeOf(row), (tally.get(typeOf(row)) ?? 0) + 1), new Map())]
-    .map(([agentType, rows]) => ({ agentType, rows }));
   return {
     calls: attributed.length,
     matched: attributed.filter((row) => row.matched).length,
     unmatched,
-    uncovered,
     unattributed,
     // Over EVERY attributed row, not just the covered ones. Restricting it to
     // covered types would have made it silent in precisely the case it exists
     // for: when the guard's regex dies, the names it fails on are the ones no
     // regex here matches either, so `covered` would be empty and the alarm
-    // would not fire. The `uncovered` case is separated by the line's priority
-    // order instead — a round with matched rows is not blind, so it falls
-    // through to the uncovered clause.
+    // would not fire.
     blind: attributed.length > 0 && attributed.every((row) => !row.matched),
     opened: true,
   };
@@ -205,17 +188,6 @@ export function engagementLine(audit) {
     return `# tree-guard did NOT match ${audit.unmatched.length} name this plugin generated (${audit.unmatched.join(", ")}) — ` +
       "its reviewer regex has gone inert against what the harness now sends, and every shell those agents ran was unguarded (ruling 1, item 2)";
   }
-  if (audit.uncovered?.length) {
-    const rows = audit.uncovered.reduce((n, one) => n + one.rows, 0);
-    return `# ${rows} shell call${rows === 1 ? "" : "s"} under ${audit.uncovered.map((one) => one.agentType).join(", ")}, ` +
-      "a name the guard does not cover. That agent is declared with no Bash tool at all; if a real one ran these, " +
-      "its tool list is not being honoured and no guard was watching";
-  }
-  // After `uncovered`, and deliberately: a round whose only unmatched rows are
-  // uncovered types is not a blind guard, and saying "no reviewer ran a shell
-  // under a name it knows" there names the wrong defect. The inert clause stays
-  // FIRST, because a dead regex fails on names COVERED does match, so it can
-  // never be misfiled as uncovered.
   if (audit.blind) {
     return `# tree-guard matched none of the ${audit.calls} subagent shell call${audit.calls === 1 ? "" : "s"} this round — ` +
       "either no reviewer ran a shell under a name it knows, or it is watching nothing (ruling 1, item 2)";

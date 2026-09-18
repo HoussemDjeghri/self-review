@@ -6,7 +6,7 @@
 // inside the repository under review.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync, realpathSync, symlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -366,6 +366,49 @@ test("the tripwire reports a pre-flight that wrote into the checkout's dependenc
     `the write must reach the lead's own report, not only stderr:\n${done.stdout}`);
   assert.equal(readFileSync(path.join(repo, "node_modules", "marker.txt"), "utf8"), "after\n",
     "the author's own checkout is what was written — the alarm names that mechanism");
+});
+
+test("pre-flight runs with pnpm's pre-run install off, and the tripwire watches a workspace package's link", () => {
+  // pnpm 11 installs before a script whose dependencies look stale, and the
+  // stage always does: the workspace state records the checkout's absolute
+  // paths. The install purges, and with no TTY aborts — a FAIL on code nobody
+  // broke, in every round-1 report of a pnpm workspace (field report 2026-09-18).
+  // With every package's node_modules now linked, a write through a NESTED link
+  // reaches the checkout as surely as one through the root's, so the tripwire
+  // must see those too.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  mkdirSync(path.join(repo, "packages", "app", "node_modules"), { recursive: true });
+  writeFileSync(path.join(repo, "packages", "app", "index.js"), "export default 1;\n");
+  writeFileSync(path.join(repo, "packages", "app", "node_modules", "marker.txt"), "before\n");
+  writeFileSync(path.join(repo, "test.sh"),
+    '#!/bin/sh\necho "verify: $pnpm_config_verify_deps_before_run"\necho after > packages/app/node_modules/marker.txt\nexit 1\n');
+  // Red on purpose: preflight.txt keeps the output tail of a failing check only.
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  const report = readFileSync(path.join(work, "round-1", "preflight.txt"), "utf8");
+  assert.match(report, /^verify: false$/m, report);
+  assert.match(done.stdout, /TRIP {2}packages\/app\/node_modules {4}pre-flight wrote into the checkout/,
+    `a write through a package's link must trip like one through the root's:\n${done.stdout}`);
+});
+
+test("a symlink the repository itself commits is not a path into the checkout", () => {
+  // The tripwire walks every link in the stage at any depth, and the copy keeps
+  // the repo's own links. A relative `current -> releases/v1` lands pointing
+  // inside the stage, so a write through it never left the copy — reporting it
+  // as a write into the checkout is a breach that did not happen.
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "releases", "v1"), { recursive: true });
+  writeFileSync(path.join(repo, "releases", "v1", "keep.txt"), "v1\n");
+  symlinkSync("releases/v1", path.join(repo, "current"));
+  writeFileSync(path.join(repo, "test.sh"), "#!/bin/sh\necho built > current/out.txt\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.doesNotMatch(done.stdout, /TRIP/, done.stdout);
 });
 
 test("a pre-flight that wrote nothing adds no tripwire line", () => {

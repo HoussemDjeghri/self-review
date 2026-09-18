@@ -498,3 +498,27 @@ test("--stage-only copies the tree and runs nothing, with the dependency trees a
   // developer's.
   assert.deepEqual(readdirSync(path.join(out, "home")), []);
 });
+
+test("--stage-only links a workspace package's own node_modules, not only the root's", () => {
+  // pnpm keeps one per package. With only the root's linked, every package's
+  // own imports failed to resolve from the stage — a false FAIL on every
+  // monorepo round (field report 2026-09-18). A tree under a directory the copy
+  // did not create has nowhere to go, and one inside another tree is that
+  // tree's business.
+  const repo = repoWith({
+    "packages/app/index.js": "export default 1;\n",
+    "packages/app/node_modules/dep/index.js": "module.exports = 2;\n",
+    "node_modules/top/node_modules/inner/index.js": "module.exports = 3;\n",
+    "dist/node_modules/stray/index.js": "module.exports = 4;\n",
+  }, { gitignore: "node_modules/\ndist/\n" });
+  const out = realpathSync(mkdtempSync(path.join(tmpdir(), "cold stage ")));
+  const done = spawnSync("bash", [COLDRUN, "--root", repo, "--out", out, "--stage-only"], { encoding: "utf8" });
+
+  assert.equal(done.status, 0, done.stderr);
+  const ship = done.stdout.trim();
+  const nested = path.join(ship, "packages/app/node_modules");
+  assert.ok(lstatSync(nested).isSymbolicLink(), "the package's tree is linked too");
+  assert.equal(readFileSync(path.join(nested, "dep/index.js"), "utf8"), "module.exports = 2;\n");
+  assert.ok(lstatSync(path.join(ship, "node_modules")).isSymbolicLink());
+  assert.ok(!existsSync(path.join(ship, "dist")), "an ignored directory is not conjured to hold a link");
+});

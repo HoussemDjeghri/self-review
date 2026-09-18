@@ -97,41 +97,38 @@ test("a torn line does not stop the rest being audited", () => {
   assert.equal(audit.calls, 1);
 });
 
-test("the plugin-generated test does not reuse tree-guard's own regex", async () => {
-  // A check written in the terms of the thing it checks passes whenever that
-  // thing is consistent with itself, which is the failure being audited. The
-  // proof: a name tree-guard's REVIEWER does NOT match is still recognised here
-  // as one this plugin generated, which is what makes the first clause fire.
+test("the applier is guarded now, so its shell calls count as covered, not unwatched", async () => {
+  // Until 0.8.2 the applier was the one generated name the guard did not match,
+  // and this audit's `uncovered` line was how its shell calls were found:
+  // named launches do not honour `tools:` (field report 2026-09-18).
+  // tree-guard now denies it every Bash call, so a row under it is a matched
+  // call, and the `uncovered` clause went with the state it described.
   const guard = await import("../tree-guard.mjs");
   const name = "self-review-applier-r2";
-  assert.equal(guard.evaluate({ agent_id: "a1", agent_type: name, tool_name: "Bash", tool_input: { command: "git checkout ." } }), null,
-    "the applier is not a reviewer, so the guard is right not to match it");
-  const audit = auditEngagement(log(round(1), agent(name, false)));
-  assert.deepEqual(audit.unmatched, [], "an applier is not a type the guard covers, so this is not evidence its regex died");
-  assert.deepEqual(audit.uncovered, [{ agentType: name, rows: 1 }],
-    "but the audit still knows it is a name this plugin generated, and that a shell ran under it unwatched");
-  assert.match(engagementLine(audit), /a name the guard does not cover/);
+  assert.ok(guard.evaluate({ agent_id: "a1", agent_type: name, tool_name: "Bash", tool_input: { command: "ls" } }));
+  const audit = auditEngagement(log(round(1), agent(name, true)));
+  assert.deepEqual(audit.unmatched, []);
+  assert.match(engagementLine(audit), /^# tree-guard engaged: 1\/1/);
 });
 
 test("the covered list and tree-guard's own regex cannot drift apart in silence", async () => {
-  // COVERED decides which of two different failures an unmatched row is, and it
-  // is deliberately not tree-guard's constant. Deliberate independence is only
-  // safe if a divergence is caught: if tree-guard stops matching a type this
-  // file calls covered, that type's rows would be filed as `inert` — true — but
-  // if the guard STARTS covering one this file does not, an unwatched shell
-  // would be filed as covered-and-matched and vanish. So the overlap is asserted.
+  // OURS is the list of names the guard is meant to cover, and it is
+  // deliberately not tree-guard's constant. Deliberate independence is only
+  // safe if a divergence is caught: a type OURS names that the guard stops
+  // denying would ship an unguarded shell reported as merely `inert`. So the
+  // overlap is asserted against the guard's whole decision, not one regex.
   const guard = await import("../tree-guard.mjs");
   const denied = (agentType) =>
     guard.evaluate({ agent_id: "a1", agent_type: agentType, tool_name: "Bash", tool_input: { command: "git checkout ." } });
-  for (const type of ["self-review-finder-r1-ab", "self-review-verifier-r1", "self-review-cold-grader-r1-x", "self-review-ticket-validator"]) {
+  for (const type of ["self-review-finder-r1-ab", "self-review-verifier-r1", "self-review-cold-grader-r1-x", "self-review-ticket-validator", "self-review-applier-r1"]) {
     assert.ok(denied(type), `tree-guard must cover ${type}, which engagement.mjs counts as covered`);
   }
 });
 
-test("every role this plugin ships is classified by OURS, not just the three it covers", () => {
+test("every role this plugin ships is classified by OURS", () => {
   // The other direction of the same drift, and the one the first test cannot
   // see. OURS decides whether a row is EXPLAINED at all: a role it does not
-  // match is neither `inert` nor `uncovered`, so its rows land in the generic
+  // match is never reported as `inert`, so its rows land in the generic
   // `engaged: N/M` ratio and an inert guard over that role reads as a partial
   // match. Deriving the list from the shipped agent files is what keeps a
   // fifth role from being silently unclassified — a hand-copied fourth
@@ -143,7 +140,7 @@ test("every role this plugin ships is classified by OURS, not just the three it 
   assert.ok(roles.length >= 4, `only ${roles.length} agent files found — the walk, not the rule, is what failed`);
   const unclassified = roles.filter((role) => !OURS.test(`${role}-r1-ab`));
   assert.deepEqual(unclassified, [],
-    "a role this plugin ships that OURS does not match falls through both explanatory branches of the audit");
+    "a role this plugin ships that OURS does not match can never be reported as inert");
 });
 
 test("the two sides may spell the same repository differently and still meet", () => {
@@ -189,7 +186,7 @@ test("an unopened round reports that it proved nothing, and never borrows anothe
   const text = readFileSync(engagementFile(repo, dir), "utf8");
 
   const round2 = auditEngagement(text, { round: 2 });
-  assert.deepEqual(round2, { calls: 0, matched: 0, unmatched: [], uncovered: [], unattributed: 0, blind: false, opened: false });
+  assert.deepEqual(round2, { calls: 0, matched: 0, unmatched: [], unattributed: 0, blind: false, opened: false });
   assert.match(engagementLine(round2), /no engagement log was opened/);
   assert.doesNotMatch(engagementLine(round2), /engaged: 2\/2/, "round 1's rows are not round 2's evidence");
 

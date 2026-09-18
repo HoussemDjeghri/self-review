@@ -319,9 +319,9 @@ registered type is `general-purpose`, which no guard recognises, so the name is
 the only thing containing it.
 **Never do that for `self-review-applier`**: the Stop gate arms on that exact
 agent type, so a substitute is invisible to it *and* carries `Bash` — the gate
-stops seeing the edits and the one writing agent stops being the one that cannot
-reach a shell, which is both halves of that design gone in a single
-substitution. If the applier type is missing, apply the fixes yourself as §2e's
+stops seeing the edits, and unless you also forget the name, only that half is
+lost: tree-guard denies every shell call under `self-review-applier-…`, so a
+misnamed substitute is the one that loses the other half as well. If the applier type is missing, apply the fixes yourself as §2e's
 fallback says, and say so in the report. `round.sh` already wrote the briefs, and the Agent-call table it printed is the
 round's plan: one line per finder with its name, agent type, model and brief
 path. Each brief carries the intent block, the scope pointer, that row's angle

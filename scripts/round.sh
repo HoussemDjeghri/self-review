@@ -270,7 +270,14 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   sentinel="$dir/.deps-sentinel"
   : >"$sentinel"
 
-  if ! "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
+  # pnpm 11 runs `pnpm install` before any script whose dependencies look stale,
+  # and the stage always looks stale: `.pnpm-workspace-state-v1.json` records the
+  # checkout's absolute project paths. That install decides to purge the linked
+  # modules directory and, with no TTY, aborts — `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`,
+  # exit 1, a FAIL on code nobody broke. Off for pre-flight wherever it runs: a
+  # review has no business installing anything. The `pnpm_config_` spelling is
+  # the one pnpm reads; `npm_config_…` is ignored (field report 2026-09-18).
+  if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
     echo "round.sh: preflight.sh failed (${dir}/preflight.err) — the project's own checks did not run; say so in the report" >&2
   fi
 
@@ -283,22 +290,30 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   #
   # The linked trees are ENUMERATED, not listed: `coldrun.sh` decides what to
   # link, and a second copy of its list here would fail open — an ecosystem
-  # added there would silently stop being watched. Every symlink at the stage's
-  # root is a path out of it, which is exactly what this measures. The trailing
-  # slash is load-bearing: `find` without it stats the link and never descends.
+  # added there would silently stop being watched. So every symlink in the stage
+  # is a candidate — at any depth, since a workspace package's `node_modules` is
+  # linked too — and the ones watched are those whose physical target is inside
+  # the checkout: the copy also keeps links the repository itself commits, and a
+  # relative one lands pointing back into the stage, where a write is the copy's
+  # own business. A link to a file is never one coldrun made. `find` does not follow
+  # links, so the enumeration never walks into a dependency tree; the trailing
+  # slash below is what makes the second `find` descend into one.
   tripped=""
   if [ "$pf_from" != "${repo_root:-$(pwd)}" ]; then
+    checkout="$(cd -P "${repo_root:-$(pwd)}" && pwd)"
     while IFS= read -r link; do
       [ -n "$link" ] || continue
+      target="$(cd -P "$link" 2>/dev/null && pwd || true)"
+      case "$target" in "$checkout"|"$checkout"/*) ;; *) continue ;; esac
       hit="$(find "$link/" -newer "$sentinel" -print -quit 2>/dev/null || true)"
       # `if`, not `[ … ] && …`: under `set -e` a false `&&` list is a failing
       # command and would end the round on the ordinary case where nothing wrote.
       if [ -n "$hit" ]; then
         tripped="$tripped
-TRIP  $(basename "$link")    pre-flight wrote into the checkout through the staged link: $hit"
+TRIP  ${link#"$pf_from"/}    pre-flight wrote into the checkout through the staged link: $hit"
       fi
     done <<EOF
-$(find "$pf_from" -maxdepth 1 -type l 2>/dev/null || true)
+$(find "$pf_from" -type l 2>/dev/null || true)
 EOF
   fi
   rm -f "$sentinel"
@@ -316,7 +331,8 @@ EOF
   if [ "$pf_from" != "${repo_root:-$(pwd)}" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
     echo "round.sh: no check could start in the install copy — a defect in this plugin's staging, not in the project. Re-running pre-flight from the checkout; report both." >&2
     mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
-    if ! "$here/preflight.sh" --root "${repo_root:-$(pwd)}" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
+    # The same pnpm switch as the first run, for the same reason.
+    if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "${repo_root:-$(pwd)}" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
       echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
     fi
     tripped="$tripped

@@ -78,7 +78,13 @@ const GUARD_TAG = "[tree-guard]";
 // agent's own type is NOT guarded, by design: the plugin generates every name
 // it is responsible for, and an unrecognised one is treated as not a reviewer,
 // the same accepted fail-open as an unlisted `rm` spelling. F10h.
-const REVIEWER = /(^|:)self-review-(finder|verifier|cold-grader|ticket-validator)(-|$)/;
+const REVIEWER = /(^|:)self-review-(finder|verifier|ticket-validator)(-|$)/;
+// The two agents declared with no Bash at all: the applier (its edits must be
+// the ones the Stop gate can see) and the cold grader (angle X executes
+// nothing). A named launch does not honour a declared tool list — 78 of 99
+// named launches ran Bash (field report 2026-09-18) — so the guard enforces it.
+// Decided unadvised (docs/design-notes/questions/no-bash-reviewers-answer.md).
+const SHELL_LESS = /(^|:)self-review-(applier|cold-grader)(-|$)/;
 
 /**
  * The git verbs a reviewer may run. Everything else is denied.
@@ -214,7 +220,8 @@ export function evaluate(payload) {
   if (typeof payload.agent_id !== "string" || !payload.agent_id) return null;
   if (payload.tool_name !== "Bash") return null;
   const agentType = String(payload.agent_type ?? "");
-  const matched = REVIEWER.test(agentType);
+  const shellLess = SHELL_LESS.test(agentType);
+  const matched = shellLess || REVIEWER.test(agentType);
   // The audit line, before the decision. This is not a bypass patch — the file
   // is still frozen against those — it is ruling 1's item 2: the guard's allow
   // path and its inert path are the same silence, and that is how it came to be
@@ -224,6 +231,7 @@ export function evaluate(payload) {
   // that cannot write its audit line from holding a turn hostage.
   noteEngagement(typeof payload.cwd === "string" ? payload.cwd : "", agentType, matched, { session: payload.session_id });
   if (!matched) return null;
+  if (shellLess) return noShell(agentType);
   const reason = offence(payload.tool_input?.command ?? "");
   if (!reason) return null;
   return {
@@ -237,6 +245,20 @@ export function evaluate(payload) {
       ].join("\n"),
     },
     systemMessage: `tree-guard: denied a tree-mutating command from ${payload.agent_type}`,
+  };
+}
+
+function noShell(agentType) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: [
+        `${GUARD_TAG} Denied: you are ${agentType}, and that agent has no shell — its definition lists no Bash tool, and this guard holds it to that.`,
+        `Do now: finish with the tools you have. Anything that needs a command (a test run, a git check, a reproduction) goes in your report as blocked, with what you would have run; the lead runs it.`,
+      ].join("\n"),
+    },
+    systemMessage: `tree-guard: denied a shell call from ${agentType}, which has no Bash tool`,
   };
 }
 

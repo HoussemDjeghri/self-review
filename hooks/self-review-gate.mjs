@@ -118,7 +118,7 @@ import { runHook } from "./lib/hook.mjs";
 import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, skillName } from "./lib/config.mjs";
 import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
-import { SHELL_INTERPRETERS, afterBacktick, afterPrefixes, afterSingleQuoted, afterSubstitution, commandOf, feederLead, inlineShell, maskQuotes, words } from "./lib/shell.mjs";
+import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
 const CONFIG = loadConfig();
@@ -333,35 +333,6 @@ const SCRIPT_WRITE_PATTERNS = [
   /\bSet-Content\b|\bOut-File\b/,
 ];
 
-// Matched against the command word alone: `cat > scope.sh <<EOF` must not read as `sh`.
-const INTERPRETER_RE = /^(python[\d.]*|node|deno|bun|ruby|perl|php|bash|sh|zsh|osascript)$/;
-// Starts at the `<<` itself: a leading `[^\n]*` made every long line without a
-// heredoc quadratic (14 s for a 100k-character command).
-const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
-
-// A heredoc body is data when it feeds cat/tee/a file and code when it feeds an
-// interpreter (`python3 - <<EOF`). Data bodies are dropped — a README that
-// mentions `sed -i` is not a write. Code bodies are lifted out and analysed as
-// code, so a script that opens a file for writing is still seen.
-//
-// The feeder is the simple command the `<<` belongs to, not the line's first
-// word: `X=$(python3 - <<EOF` and `cd dir; python3 - <<EOF` both feed python3.
-// Reading the line's first word read the second as `cd`, dropped the body as
-// data, and a heredoc that rewrote a hook outside the repo never reached the
-// gate (field report 2026-09-18, item 4 — every such command began `cd …;`).
-function separateHeredocs(cmd) {
-  const scripts = [];
-  const text = cmd.replace(/\r\n?/g, "\n"); // a CRLF heredoc terminates all the same
-  const shell = text.replace(HEREDOC_RE, (whole, _quote, _word, offset) => {
-    const head = whole.slice(0, whole.indexOf("\n"));
-    const line = text.slice(text.lastIndexOf("\n", offset - 1) + 1, offset);
-    const interpreter = commandOf(words(feederLead(line))).match(INTERPRETER_RE)?.[1];
-    if (interpreter) scripts.push({ interpreter, body: whole.slice(head.length + 1, whole.lastIndexOf("\n")) });
-    return head;
-  });
-  return { shell, scripts };
-}
-
 // `S=/tmp/x; … > "$S/out"` is the common shape of scratch writes (long paths
 // get a variable). Substituting the command's own assignments lets the scratch
 // check see the real target instead of an opaque `$S`. Each reference takes
@@ -385,60 +356,6 @@ function expandLocalAssignments(cmd) {
     if (!latest || OPAQUE_VALUE.test(latest.raw)) return whole;
     return latest.value;
   });
-}
-
-// The bodies of `$( … )` and backtick substitutions, outside single quotes: the
-// shell runs each as a command list of its own, so `RESULT=$(mv a b)` and
-// `echo "$(cp a b)"` move and copy all the same. Inside "…" an apostrophe is
-// text, so `echo "it's $(rm x)"` still yields `rm x`.
-function substitutionBodies(cmd) {
-  const bodies = [];
-  let quoted = false; // inside "…"
-  for (let i = 0; i < cmd.length;) {
-    if (cmd[i] === "\\") i += 2; // an escaped character opens nothing
-    else if (cmd[i] === '"') { quoted = !quoted; i++; }
-    else if (cmd[i] === "'" && !quoted) i = afterSingleQuoted(cmd, i + 1);
-    else if (cmd[i] === "`") {
-      const end = afterBacktick(cmd, i + 1);
-      bodies.push(cmd.slice(i + 1, cmd[end - 1] === "`" ? end - 1 : end));
-      i = end;
-    } else if (cmd[i] === "$" && cmd[i + 1] === "(") {
-      const end = afterSubstitution(cmd, i + 2);
-      bodies.push(cmd.slice(i + 2, cmd[end - 1] === ")" ? end - 1 : end));
-      i = end;
-    } else i++;
-  }
-  return bodies;
-}
-
-// Split a command into simple commands at newlines, `;`, `|`, `&` outside quotes,
-// so that `grep "a|b" f && cat > g` is judged per segment: only the second writes.
-// Substitution bodies become segments of their own, so a writer at the head of
-// a `$( … )` is at command position somewhere.
-function splitSegments(cmd) {
-  const segments = [];
-  let current = "", quote = null, escapes = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      current += ch;
-      if (ch === "\\" && escapes) current += cmd[++i] ?? ""; // keep the pair in source order
-    } else if (ch === "'" || ch === '"' || ch === "`") {
-      quote = ch; escapes = ch === '"' || (ch === "'" && cmd[i - 1] === "$"); current += ch; // "…" and $'…' honour backslashes
-    } else if (ch === "\\" && cmd[i + 1] === "\n") {
-      i++; // a line continuation: bash removes both and joins the lines
-    } else if (ch === "\\" && i + 1 < cmd.length) {
-      current += ch + cmd[++i]; // an escaped separator is not a separator
-    } else if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
-      segments.push(current); current = "";
-    } else {
-      current += ch;
-    }
-  }
-  segments.push(current);
-  for (const body of substitutionBodies(cmd)) segments.push(...splitSegments(body));
-  return segments.map((seg) => seg.trim()).filter(Boolean);
 }
 
 const expandHome = (p) => (p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p.replace(/^\$HOME\//, HOME + "/").replace(/^\$\{?TMPDIR\}?/, tmpdir()));
@@ -579,11 +496,20 @@ function statusPaths(stdout) {
 function writesSince(cwd, since) {
   if (!cwd) return "no working directory to ask git about";
   if (!Number.isFinite(since)) return "no timestamp for the start of this turn";
+  // Porcelain paths are relative to the repository's top, never to the cwd, so
+  // from a subdirectory they used to resolve to files that do not exist: the
+  // stat below missed every one and the evidence came back silently empty.
+  // `--show-cdup` is the way up in the cwd's own spelling, which is the one
+  // every parsed target is resolved in — `--show-toplevel` returns a realpath,
+  // and on macOS `/private/var/…` never matches a target written as `/var/…`.
+  const cdup = spawnSync("git", ["-C", cwd, "rev-parse", "--show-cdup"], { encoding: "utf8" });
+  if (cdup.status !== 0 || typeof cdup.stdout !== "string") return "no git repository";
+  const top = path.resolve(cwd, cdup.stdout.trim());
   const status = spawnSync("git", ["-C", cwd, "status", "--porcelain=v1", "--untracked-files=all", "-z"], { encoding: "utf8" });
   if (status.status !== 0 || typeof status.stdout !== "string") return "no git repository";
   const files = [];
   for (const rel of statusPaths(status.stdout)) {
-    const file = path.resolve(cwd, rel);
+    const file = path.resolve(top, rel);
     // A deleted file has no mtime and nothing to review. It is also not what
     // this fallback is for: the question is what the turn WROTE.
     let stat;
@@ -641,7 +567,7 @@ function* writeEvents(entries, from, to, cwd) {
         const blind = writes.unknown || writes.named.length === 0;
         yield blind || writes.gated.length
           ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named }
-          : { index, kind: "exempt", id: use.id, explains: writes.named };
+          : { index, kind: "exempt", id: use.id, explains: writes.named, shell: true };
       }
     }
     if (entry.type === "user" && agentEdited(entry)) {
@@ -686,8 +612,32 @@ function collectChanges(turn, cwd, since) {
   const succeeded = succeededToolUses(turn);
   const explained = new Set(events.filter((e) => e.explains && succeeded.has(e.id))
     .flatMap((e) => e.explains.map((p) => path.resolve(p))));
+  const unexplainedCode = (written) => written.filter((file) => !explained.has(file) && !isExempt(file));
+  // The working tree's veto over a Bash write the parser read as prose-only.
+  // Five fixes in a row were the same defect — the parser said scratch or prose
+  // and the file was code (TMPDIR, mktemp, an atomic `.tmp` suffix, a quoted
+  // mktemp, a truncation) — and each passed silently, because an exempt verdict
+  // never asked git. So the tree gets one job: it can overrule "nothing gated".
+  // The parser keeps deciding alone wherever it named a gated target.
+  //
+  // Narrowed to evidence BESIDE what the command named — the same directory, or
+  // the same stem (`gen.mjs.tmp` → `gen.mjs`). Replayed over 352 turns the gate
+  // passes today that hold such a write: no true hit is observable, while 8
+  // could arm falsely — another session's edit in the same window, or a `git
+  // reset --hard` / `stash pop` rewriting tracked code. The ruling
+  // (resolved-write-shape-answer.md) makes that the case for narrowing before
+  // shipping. What stays invisible: a mis-parse whose real target is outside
+  // the repo, ignored, or unrelated to anything it named.
+  const vetoExempt = (event) => {
+    const written = witnessed();
+    if (!Array.isArray(written)) return;
+    const named = event.explains.map((p) => path.resolve(p));
+    const beside = unexplainedCode(written).filter((file) =>
+      named.some((n) => path.dirname(n) === path.dirname(file) || (stem(n) !== "" && stem(n) === stem(file))));
+    if (beside.length) changes.push({ index: event.index, kind: "bash", files: beside, vetoed: true });
+  };
   for (const event of events) {
-    if (event.kind === "exempt") continue;
+    if (event.kind === "exempt") { if (event.shell) vetoExempt(event); continue; }
     if (event.kind === "file") { changes.push({ index: event.index, kind: "file", file: event.file }); continue; }
     if (event.kind === "agent") { changes.push({ index: event.index, kind: "agent", agentType: event.agentType }); continue; }
     // A resolvable target decides on its own: it may be outside the repo,
@@ -696,7 +646,7 @@ function collectChanges(turn, cwd, since) {
     const written = witnessed();
     if (!Array.isArray(written)) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: written }); continue; }
     const unexplained = written.filter((file) => !explained.has(file));
-    const gated = unexplained.filter((file) => !isExempt(file));
+    const gated = unexplainedCode(written);
     if (gated.length) { changes.push({ index: event.index, kind: "bash", files: gated }); continue; }
     // Every unexplained file is exempt: prose, config, scratch. That is a real
     // answer — the artifact was looked at — so no change is recorded. An empty
@@ -709,6 +659,9 @@ function collectChanges(turn, cwd, since) {
   }
   return changes;
 }
+
+// `gen.mjs.tmp`, `gen.mjs` and `gen.test.mjs` share one: everything before the first dot.
+const stem = (file) => path.basename(file).split(".")[0];
 
 // The marker script at command position — `cd x && /abs/converged.sh "…"` is an
 // invocation; `echo '…converged.sh…'` and `grep converged.sh …` only mention it.
@@ -1688,6 +1641,9 @@ function describeChanges(changes, cwd) {
     const caveat = blind.length === bash.length ? `could not determine which files — ${blind[0].unresolved}`
       : blind.length ? `${blind.length} of them could not be resolved — ${blind[0].unresolved}` : "";
     parts.push(`${bash.length} shell command(s) that write files${caveat ? ` (${caveat})` : ""}`);
+    // Said, because the command itself looks harmless: what it named was prose
+    // or scratch, and the code that changed is only the working tree's word.
+    if (bash.some((c) => c.vetoed)) parts.push("a command the parser read as prose-only ran in a turn where unexplained code beside what it named changed");
   }
   if (agents) parts.push(`${agents} subagent(s) that edited files`);
   // Named by what it IS, not by what it wrote: the launch is the evidence, and

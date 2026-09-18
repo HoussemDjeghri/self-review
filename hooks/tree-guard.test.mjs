@@ -109,6 +109,18 @@ test("every name brief.mjs's fallback plan generates is a name tree-guard recogn
 // Depth is NOT the variable — measured in the same run. A depth-2 finder's
 // payload carries every key a depth-1 one does; it read as unguarded only
 // because its parent had named it off-convention.
+test("the applier and the cold grader get no shell at all, named or not", () => {
+  // Both are declared without Bash, and a named launch does not honour that
+  // (78 of 99 named launches ran Bash; field report 2026-09-18).
+  for (const agent_type of ["self-review:self-review-applier", "self-review-applier-r1", "self-review:self-review-cold-grader", "self-review-cold-grader-r1-x"]) {
+    for (const command of ["ls", "node --test", "git status"]) {
+      assert.ok(denied(command, { agent_type }), `${agent_type}: ${command}`);
+    }
+  }
+  assert.ok(!denied("ls"), "a finder keeps its shell");
+  assert.ok(!denied("ls", { agent_type: "self-review-applier-r1", agent_id: undefined }), "the lead is never a reviewer");
+});
+
 test("depth 2 is not a hole; a name is", () => {
   assert.ok(denied("git stash",
     { agent_id: "aself-review-finder-r2-cef-11c485", agent_type: "self-review-finder-r2-cef" }),
@@ -348,6 +360,22 @@ test("every shipped agent that has a shell is inside tree-guard", () => {
     const type = `self-review:${file.replace(/\.md$/, "")}`;
     assert.ok(denied("git stash", { agent_type: type }),
       `${file} carries Bash and is outside tree-guard: its shell can reach git`);
+  }
+});
+
+test("an agent file's tool list is the spec for which reviewers get a shell at all", () => {
+  // A named launch does not honour `tools:` (78 of 99 ran Bash; field report
+  // 2026-09-18), so SHELL_LESS enforces it — and this test keeps the two from
+  // drifting: an agent declared without Bash is denied even `ls`, and one
+  // declared with it is not.
+  const agentDir = path.join(path.dirname(GUARD), "../agents");
+  const files = readdirSync(agentDir).filter((file) => file.endsWith(".md"));
+  const shellLess = files.filter((file) => !grants(agentDefinition(path.join(agentDir, file)), "Bash"));
+  assert.ok(shellLess.length > 0, "no agent is declared without Bash — this test has stopped testing anything");
+  for (const file of files) {
+    const type = `self-review:${file.replace(/\.md$/, "")}`;
+    assert.equal(denied("ls", { agent_type: type }), shellLess.includes(file),
+      `${file}: its declared tools and tree-guard disagree about whether it has a shell`);
   }
 });
 

@@ -33,7 +33,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { isMain } from "../hooks/lib/config.mjs";
 import { COUNTS, LABELS, OUTCOMES as MARKER_OUTCOMES, fieldsFromFlags, formatSummary, isCounted, validateMarker } from "../hooks/lib/marker.mjs";
-import { SHELL_INTERPRETERS, afterPrefixes, commandOf, feederLead, inlineShell, maskQuotes, words } from "../hooks/lib/shell.mjs";
+import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "../hooks/lib/shell.mjs";
 import { readRecords, reviewFromWork } from "./findings.mjs";
 
 const DEFAULT_PROJECTS = path.join(homedir(), ".claude", "projects");
@@ -457,62 +457,19 @@ function summaryOfBody(body) {
 }
 
 // ── Reading a Bash command for the marker ──────────────────────────────────
-// The gate answers the same question with private helpers
-// (self-review-gate.mjs: separateHeredocs, substitutionBodies, splitSegments).
-// Only maskQuotes and feederLead are shared (lib/shell.mjs). Moving the rest is
-// deferred to its own change (docs/design-notes/questions/
-// shared-segmenter-answer.md). For audit, that move changes behaviour. It is
-// not a pure refactor, because the copies differ:
-// - The gate's splitSegments is a hand-written quote scanner that also
-//   recurses into `$( )` and backtick bodies. This one splits on the
-//   maskQuotes output and never looks inside a substitution, so a marker at
-//   a substitution head is not counted. Measured 2026-09-18: no such marker
-//   in any transcript.
-// - The gate's interpreter list also has osascript.
-// When the move lands, re-run the audit over the same corpus and diff the
-// counts.
+// The heredoc split, the segmenter and the interpreter list are the gate's own
+// (lib/shell.mjs), so audit reads a Bash command exactly as the gate does —
+// including a marker at the head of a `$( … )`, which the private copy this
+// replaced never looked inside.
 // One difference is deliberate: the gate compares the script against THIS
 // install's absolute path. A transcript was written by whatever install ran
 // it, so the audit matches the script's basename.
 
 const MARKER_SCRIPT = "converged.sh";
-const INTERPRETER = /^(python[\d.]*|node|deno|bun|ruby|perl|php|bash|sh|zsh)$/;
-const HEREDOC = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
 // The marker path as it appears inside a script's source, not as a whole word.
 const MARKER_PATH_IN_TEXT = /self-review\/(review-\d+\/)?CONVERGED\.json/;
 // `.write(` alone is not here: `sys.stdout.write(open(p).read())` only reads.
 const WRITE_CALL = /write_text|writeFileSync|writeFile\b|open\([^)]*['"][wa]/;
-
-// Heredoc bodies leave the shell text: a body is data (a commit message that
-// mentions converged.sh is not an invocation) unless it feeds an interpreter,
-// in which case it is kept as that interpreter's script.
-// The feeder is the simple command the `<<` belongs to: `cd x; python3 - <<EOF`
-// feeds python3, as the gate reads it — through the same shared `feederLead`.
-function separateHeredocs(command) {
-  const scripts = [];
-  const text = command.replace(/\r\n?/g, "\n");
-  const shell = text.replace(HEREDOC, (whole, _quote, _word, offset) => {
-    const head = whole.slice(0, whole.indexOf("\n"));
-    const line = text.slice(text.lastIndexOf("\n", offset - 1) + 1, offset);
-    const interpreter = commandOf(words(feederLead(line))).match(INTERPRETER)?.[1];
-    if (interpreter) scripts.push({ interpreter, body: whole.slice(head.length + 1, whole.lastIndexOf("\n")) });
-    return head;
-  });
-  return { shell, scripts };
-}
-
-// Simple commands: split at newline, `;`, `|` and `&` outside quotes.
-function splitSegments(text) {
-  const masked = maskQuotes(text);
-  const segments = [];
-  let start = 0;
-  for (let i = 0; i <= masked.length; i++) {
-    if (i < masked.length && !/[\n;|&]/.test(masked[i])) continue;
-    segments.push(text.slice(start, i).trim());
-    start = i + 1;
-  }
-  return segments.filter(Boolean);
-}
 
 // The segments a command runs as shell: its own, and those of a heredoc fed to a shell.
 function shellSegments(command) {
@@ -563,7 +520,7 @@ function writesMarkerFile(command) {
   if (scripts.some((s) => !SHELL_INTERPRETERS.has(s.interpreter) && scriptWritesMarker(s.body))) return true;
   return segments.some((segment) => {
     const word = commandOf(words(segment));
-    return INTERPRETER.test(word) && !SHELL_INTERPRETERS.has(word) && scriptWritesMarker(segment);
+    return INTERPRETER_RE.test(word) && !SHELL_INTERPRETERS.has(word) && scriptWritesMarker(segment);
   });
 }
 

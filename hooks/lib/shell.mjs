@@ -132,6 +132,93 @@ export function feederLead(line) {
   return line.slice(Math.max(...FEEDER_BOUNDARIES.map((c) => bounds.lastIndexOf(c))) + 1);
 }
 
+// ── Segmenting a command: moved verbatim from self-review-gate.mjs so the gate
+// and audit.mjs read a command the same way (ruling: docs/design-notes/
+// questions/shared-segmenter-answer.md). The gate's call sites are unchanged.
+
+// Matched against the command word alone: `cat > scope.sh <<EOF` must not read as `sh`.
+export const INTERPRETER_RE = /^(python[\d.]*|node|deno|bun|ruby|perl|php|bash|sh|zsh|osascript)$/;
+// Starts at the `<<` itself: a leading `[^\n]*` made every long line without a
+// heredoc quadratic (14 s for a 100k-character command).
+const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
+
+// A heredoc body is data when it feeds cat/tee/a file and code when it feeds an
+// interpreter (`python3 - <<EOF`). Data bodies are dropped — a README that
+// mentions `sed -i` is not a write. Code bodies are lifted out and analysed as
+// code, so a script that opens a file for writing is still seen.
+//
+// The feeder is the simple command the `<<` belongs to, not the line's first
+// word: `X=$(python3 - <<EOF` and `cd dir; python3 - <<EOF` both feed python3.
+// Reading the line's first word read the second as `cd`, dropped the body as
+// data, and a heredoc that rewrote a hook outside the repo never reached the
+// gate (field report 2026-09-18, item 4 — every such command began `cd …;`).
+export function separateHeredocs(cmd) {
+  const scripts = [];
+  const text = cmd.replace(/\r\n?/g, "\n"); // a CRLF heredoc terminates all the same
+  const shell = text.replace(HEREDOC_RE, (whole, _quote, _word, offset) => {
+    const head = whole.slice(0, whole.indexOf("\n"));
+    const line = text.slice(text.lastIndexOf("\n", offset - 1) + 1, offset);
+    const interpreter = commandOf(words(feederLead(line))).match(INTERPRETER_RE)?.[1];
+    if (interpreter) scripts.push({ interpreter, body: whole.slice(head.length + 1, whole.lastIndexOf("\n")) });
+    return head;
+  });
+  return { shell, scripts };
+}
+
+// The bodies of `$( … )` and backtick substitutions, outside single quotes: the
+// shell runs each as a command list of its own, so `RESULT=$(mv a b)` and
+// `echo "$(cp a b)"` move and copy all the same. Inside "…" an apostrophe is
+// text, so `echo "it's $(rm x)"` still yields `rm x`.
+function substitutionBodies(cmd) {
+  const bodies = [];
+  let quoted = false; // inside "…"
+  for (let i = 0; i < cmd.length;) {
+    if (cmd[i] === "\\") i += 2; // an escaped character opens nothing
+    else if (cmd[i] === '"') { quoted = !quoted; i++; }
+    else if (cmd[i] === "'" && !quoted) i = afterSingleQuoted(cmd, i + 1);
+    else if (cmd[i] === "`") {
+      const end = afterBacktick(cmd, i + 1);
+      bodies.push(cmd.slice(i + 1, cmd[end - 1] === "`" ? end - 1 : end));
+      i = end;
+    } else if (cmd[i] === "$" && cmd[i + 1] === "(") {
+      const end = afterSubstitution(cmd, i + 2);
+      bodies.push(cmd.slice(i + 2, cmd[end - 1] === ")" ? end - 1 : end));
+      i = end;
+    } else i++;
+  }
+  return bodies;
+}
+
+// Split a command into simple commands at newlines, `;`, `|`, `&` outside quotes,
+// so that `grep "a|b" f && cat > g` is judged per segment: only the second writes.
+// Substitution bodies become segments of their own, so a writer at the head of
+// a `$( … )` is at command position somewhere.
+export function splitSegments(cmd) {
+  const segments = [];
+  let current = "", quote = null, escapes = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      current += ch;
+      if (ch === "\\" && escapes) current += cmd[++i] ?? ""; // keep the pair in source order
+    } else if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch; escapes = ch === '"' || (ch === "'" && cmd[i - 1] === "$"); current += ch; // "…" and $'…' honour backslashes
+    } else if (ch === "\\" && cmd[i + 1] === "\n") {
+      i++; // a line continuation: bash removes both and joins the lines
+    } else if (ch === "\\" && i + 1 < cmd.length) {
+      current += ch + cmd[++i]; // an escaped separator is not a separator
+    } else if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
+      segments.push(current); current = "";
+    } else {
+      current += ch;
+    }
+  }
+  segments.push(current);
+  for (const body of substitutionBodies(cmd)) segments.push(...splitSegments(body));
+  return segments.map((seg) => seg.trim()).filter(Boolean);
+}
+
 // The words of a segment, quotes removed but each quoted span kept whole — a
 // sed expression or a path with spaces is one word, not several. Empty spans
 // (`-i ''`) are dropped.
