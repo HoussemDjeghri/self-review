@@ -690,3 +690,131 @@ test("recordsByReview groups every findings file on disk by the review that file
   writeFileSync(path.join(findings, "ddd.jsonl"), JSON.stringify({ review: "bad@1", round: 0 }) + "\n");
   assert.equal(recordsByReview(logDir).has("bad@1"), false);
 });
+
+// Field report 2026-09-18 §6: four ways the referee misread real sessions.
+const bash = (command) => ({ type: "tool_use", name: "Bash", input: { command } });
+const RECORD = '{"outcome":"converged","rounds":2,"fixed":1,"dismissed":0,"open":0,"intent":"author"}';
+
+test("a marker file written by Bash ends its review, with the fields it wrote", () => {
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
+    assistant("2026-08-23T10:30:00Z", [bash(`cat > "$TMPDIR/s/self-review/review-2/CONVERGED.json" <<'EOF'\n${RECORD}\nEOF`)]),
+    assistant("2026-08-23T11:01:00Z", [spawn("r1-xyz")]),
+    assistant("2026-08-23T11:30:00Z", [bash(`python3 -c 'import pathlib; pathlib.Path("/tmp/s/self-review/CONVERGED.json").write_text("""${RECORD.replace('"rounds":2', '"rounds":3')}""")'`)]),
+    assistant("2026-08-23T12:01:00Z", [spawn("r1-q")]),
+    assistant("2026-08-23T12:30:00Z", [bash("echo '{not json' > /tmp/s/self-review/CONVERGED.json")]),
+  ]);
+  const { reviews } = audit(file);
+  assert.equal(reviews.length, 3, "each Bash-written marker closes its own window");
+  assert.deepEqual(reviews.map((r) => r.rounds), [2, 3, null]);
+  assert.deepEqual(reviews.map((r) => r.markerSource), ["transcript", "transcript", "transcript"]);
+});
+
+test("a marker written by an interpreter heredoc behind `cd x &&` or `;` closes its review", () => {
+  const write = (sep) => `cd /repo${sep} python3 - <<'PY'\nimport pathlib; pathlib.Path("/tmp/s/self-review/CONVERGED.json").write_text('${RECORD}')\nPY`;
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
+    assistant("2026-08-23T10:30:00Z", [bash(write(" &&"))]),
+    assistant("2026-08-23T11:01:00Z", [spawn("r1-xyz")]),
+    assistant("2026-08-23T11:30:00Z", [bash(write(";"))]),
+  ]);
+  const { reviews } = audit(file);
+  assert.deepEqual(reviews.map((r) => [r.rounds, r.markerSource]), [[2, "transcript"], [2, "transcript"]]);
+});
+
+test("a command that only reads or mentions the marker is not a marker", () => {
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
+    assistant("2026-08-23T10:10:00Z", [bash('git commit -m "audit: parse converged.sh --converged --rounds 1 markers"')]),
+    assistant("2026-08-23T10:11:00Z", [bash("grep -n converged.sh plugin/scripts/audit.mjs")]),
+    assistant("2026-08-23T10:12:00Z", [bash("cat /tmp/s/self-review/CONVERGED.json | jq .rounds")]),
+    assistant("2026-08-23T10:13:00Z", [bash('git commit -m "write > /tmp/s/self-review/CONVERGED.json via cat"')]),
+    assistant("2026-08-23T10:14:00Z", [bash("git commit -F - <<'EOF'\nconverged.sh --converged --rounds 1 was misread\nEOF")]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.outcome, "unmarked");
+  assert.equal(review.markerSource, null);
+});
+
+test("the script invoked through a quoted path, a prefix or a subshell is still read as flags", () => {
+  const flags = "--converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author";
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash(`"/Users/me/.claude/plugins/cache/self-review/0.8.0/scripts/converged.sh" ${flags}`)]),
+    assistant("2026-08-23T11:01:00Z", [spawn("r1-b")]),
+    assistant("2026-08-23T11:30:00Z", [bash(`cd /repo && bash -c '/p/scripts/converged.sh ${flags.replace("--rounds 2", "--rounds 4")}'`)]),
+  ]);
+  const { reviews } = audit(file);
+  assert.deepEqual(reviews.map((r) => [r.outcome, r.rounds, r.fixed]), [["converged", 2, 3], ["converged", 4, 3]]);
+});
+
+test("a `;` inside an unquoted $( … ) argument does not split the script's invocation", () => {
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash('"$CLAUDE_PLUGIN_ROOT/scripts/converged.sh" --converged --rounds 1 --fixed 0 --dismissed 0 --open 0 --intent author --note $(date; true)')]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.deepEqual([review.outcome, review.rounds, review.fixed, review.dismissed], ["converged", 1, 0, 0]);
+});
+
+test("an interpreter heredoc inside a still-open $( writes a marker", () => {
+  const command = `X=$(python3 - <<EOF\nimport pathlib; pathlib.Path("/tmp/s/self-review/CONVERGED.json").write_text('${RECORD}')\nEOF\n)`;
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash(command)]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.deepEqual([review.rounds, review.markerSource], [2, "transcript"]);
+});
+
+test("an interpreter heredoc inside a double-quoted $( writes a marker", () => {
+  const command = `X="$(python3 - <<EOF\nimport pathlib; pathlib.Path("/tmp/s/self-review/CONVERGED.json").write_text('${RECORD}')\nEOF\n)"`;
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash(command)]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.deepEqual([review.rounds, review.markerSource], [2, "transcript"]);
+});
+
+test("an interpreter heredoc behind a `2>&1` redirect writes a marker", () => {
+  const command = `python3 - 2>&1 <<'EOF'\nimport pathlib; pathlib.Path("/tmp/s/self-review/CONVERGED.json").write_text('${RECORD}')\nEOF`;
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash(command)]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.deepEqual([review.rounds, review.markerSource], [2, "transcript"]);
+});
+
+test("a brace inside a JSON string does not cut a Bash-written marker's record short", () => {
+  const record = RECORD.replace("}", ',"note":"a } and a { inside"}');
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-a")]),
+    assistant("2026-08-23T10:30:00Z", [bash(`cat > /tmp/s/self-review/CONVERGED.json <<'EOF'\n${record}\nEOF`)]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.deepEqual([review.outcome, review.rounds, review.fixed, review.dismissed], ["converged", 2, 1, 0]);
+});
+
+test("a reviewer launched as a named teammate is classified by its name's role prefix", () => {
+  const brief = (timestamp) => [
+    { type: "user", timestamp, message: { content: "<teammate-message>Your brief is attached.</teammate-message>" } },
+    assistant(timestamp, [{ type: "text", text: "[]" }]),
+  ];
+  const file = session(
+    [
+      assistant("2026-08-23T10:01:00Z", [spawn("self-review-finder-r1-abd")]),
+      assistant("2026-08-23T10:30:00Z", [bashMarker("rounds=1 fixed=0 tier=M")]),
+    ],
+    [
+      ["f", brief("2026-08-23T10:02:00Z"), { name: "self-review-finder-r1-abd", agentType: "self-review-finder-r1-abd" }],
+      ["g", brief("2026-08-23T10:03:00Z"), { agentType: "self-review-cold-grader-r1-x" }],
+      ["v", brief("2026-08-23T10:04:00Z"), { name: "self-review-verifier-r1-b1", agentType: "self-review-verifier-r1-b1" }],
+      ["x", brief("2026-08-23T10:05:00Z"), { name: "self-review-finderish", agentType: "general-purpose" }],
+    ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.agents.finders, 2, "the finder and the cold-grader both review an angle");
+  assert.equal(review.agents.verifiers, 1);
+  assert.equal(review.agents.names.includes("self-review-finderish"), false, "a prefix is a whole role word, not a stem");
+});

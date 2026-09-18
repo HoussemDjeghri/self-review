@@ -92,15 +92,24 @@ user in `~/.claude/self-review/config.json` (objects merge, arrays replace).
 
 ## 0 · Establish the scope and the intent
 
-Make a work dir: `<scratchpad>/self-review/` (use the session scratchpad from
-your system prompt; else `mktemp -d`). Rounds go in `round-1/`, `round-2/`, …
+The work dir is one per **review**, and a script makes it. `<reviews>` is
+`<scratchpad>/self-review/` (the session scratchpad from your system prompt;
+else `mktemp -d`); `round.sh --new-review` (below) allocates
+`<reviews>/review-<k>/` in it and prints `work: <path>` as its first line.
+**`<work>` is that printed path from then on** — every later round, the ledger,
+the marker. Rounds go in `<work>/round-1/`, `round-2/`, … A new change is a new
+review, even in the same session: never reuse an earlier `<work>`. Reviews that
+shared one dir compared W against another review's rounds and took another
+change's tier ceiling; `round.sh` now refuses a second round 1 in one dir and a
+round whose predecessor is missing.
 Every `<…>` below is a placeholder you substitute before running the command,
 and each one is a single token on purpose: unsubstituted, `<` and `>` are
 redirections, so a placeholder containing a space would be read as two words and
 the shell would consume the next flag as a filename instead of failing loudly.
 
-The **INTENT block** goes in `<work>/intent.md` (the end of this section says
-what goes in it). Which of the three the marker claims turns on **who read the
+The **INTENT block** goes in `<reviews>/intent.md` (the end of this section says
+what goes in it); `--new-review` moves it, and the ticket's `ticket/`, into the
+review dir, so the next review cannot brief against this one's ticket. Which of the three the marker claims turns on **who read the
 intent**, not on which skill ran. `--intent validated`: a validator read it
 before the code existed — the `ticket` skill is how that happens, and if it ran
 then `intent.md` is already there, so use it as it stands and do not write a
@@ -113,9 +122,13 @@ being written now purely to brief the reviewers. All three are honest; only
 **one call**:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/round.sh" --work <work> --round 1 --intent <work>/intent.md \
+"${CLAUDE_PLUGIN_ROOT}/scripts/round.sh" --new-review --work <reviews> --intent <reviews>/intent.md \
   [--base <ref>] [--force S|M|L --reason "…"] [paths…]
 ```
+
+Round `N` ≥ 2 is `round.sh --work <work> --round <N> --intent <work>/intent.md`,
+and it prints `findings.mjs converge`'s verdict on round `N−1` above the plan
+(§3).
 
 That is scope, pre-flight, impact, tier, prior findings and every brief — one
 turn, and it prints the tier line, the Agent-call table, and the pre-flight
@@ -229,7 +242,7 @@ script did not run.
 
 ## 1 · Pre-flight: let machines catch what machines catch
 
-`round.sh --round 1` already ran it and printed its verdict lines; the failure
+`round.sh --new-review` (round 1) already ran it and printed its verdict lines; the failure
 tails are in `<work>/round-1/preflight.txt`, kept out of your context on purpose.
 Run it directly only when re-checking a fix:
 
@@ -680,7 +693,7 @@ loop did not apply, `--not-applicable` with its reason.
 rule anywhere:
 
 ```
-Write  <work>/CONVERGED.json          # i.e. <scratchpad>/self-review/CONVERGED.json
+Write  <work>/CONVERGED.json          # i.e. <scratchpad>/self-review/review-<k>/CONVERGED.json
 {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author"}
 ```
 
@@ -707,8 +720,8 @@ never a review that did not happen.
 ### Where it counts
 
 Both forms and their constraints are in `references/marker.md` → **Where it
-counts**. The short version: the file goes at `…/self-review/CONVERGED.json`
-under a scratch prefix, never inside the project; the script's *output* is what
+counts**. The short version: the file goes at `…/self-review/review-<k>/CONVERGED.json`
+(or `…/self-review/CONVERGED.json`) under a scratch prefix, never inside the project; the script's *output* is what
 the gate matches, so quoting or `cat`-ing it never counts; if your permission
 mode refuses the command, use the file form.
 

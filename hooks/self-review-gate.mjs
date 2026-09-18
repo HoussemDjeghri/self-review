@@ -118,7 +118,7 @@ import { runHook } from "./lib/hook.mjs";
 import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, skillName } from "./lib/config.mjs";
 import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
-import { SHELL_INTERPRETERS, afterBacktick, afterDoubleQuoted, afterPrefixes, afterSingleQuoted, afterSubstitution, commandOf, inlineShell, words } from "./lib/shell.mjs";
+import { SHELL_INTERPRETERS, afterBacktick, afterPrefixes, afterSingleQuoted, afterSubstitution, commandOf, feederLead, inlineShell, maskQuotes, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
 const CONFIG = loadConfig();
@@ -131,7 +131,10 @@ const SKILL_NAME = skillName();
 // scratch write needs no permission rule, which is what makes the plugin
 // portable. A write there that does not validate is refused, not ignored.
 const MARKER_TOKEN_RE = /^SELF-REVIEW CONVERGED\b/m;
-const MARKER_FILE_RE = /(^|\/)self-review\/CONVERGED\.json$/;
+// One optional `review-<k>/` segment: a lead running several reviews in one
+// session keeps each in its own work dir (review-identity ruling D1). Only that
+// shape — any other directory between would let an arbitrary file count.
+const MARKER_FILE_RE = /(^|\/)self-review\/(?:review-\d+\/)?CONVERGED\.json$/;
 const MARKER_COMMAND = CONVERGED_SCRIPT;
 // What to PRINT when telling the model to run it. The gate's message is copied
 // into a Bash call verbatim, so an install path holding a space arrived as two
@@ -293,9 +296,16 @@ function isScratchPath(p) {
 function isExempt(p) {
   if (isScratchPath(p)) return true;
   if (p.endsWith("/")) return false;
-  const ext = path.extname(p).toLowerCase();
-  return ext ? EXEMPT_EXTENSIONS.has(ext) : EXEMPT_NAMES.has(path.basename(p).toLowerCase());
+  const file = stripAtomicSuffix(p);
+  const ext = path.extname(file).toLowerCase();
+  return ext ? EXEMPT_EXTENSIONS.has(ext) : EXEMPT_NAMES.has(path.basename(file).toLowerCase());
 }
+
+// `notes.md.new` is written and then renamed over `notes.md`: the file is what
+// sits under the suffix, so it is judged as that file — `README.new` as
+// `README`, and a bare `build.new` as `build`, which nothing exempts.
+const ATOMIC_SUFFIX_RE = /\.(?:new|tmp)$/i;
+const stripAtomicSuffix = (p) => p.replace(ATOMIC_SUFFIX_RE, "");
 
 const REDIRECT_RE = /(^|[^<>&0-9])>{1,2}(?!&)\s*(?!\/dev\/null)\S/; // to a file, not /dev/null or an fd
 const TEE_RE = /\btee\b/;
@@ -333,47 +343,23 @@ const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\
 // interpreter (`python3 - <<EOF`). Data bodies are dropped — a README that
 // mentions `sed -i` is not a write. Code bodies are lifted out and analysed as
 // code, so a script that opens a file for writing is still seen.
+//
+// The feeder is the simple command the `<<` belongs to, not the line's first
+// word: `X=$(python3 - <<EOF` and `cd dir; python3 - <<EOF` both feed python3.
+// Reading the line's first word read the second as `cd`, dropped the body as
+// data, and a heredoc that rewrote a hook outside the repo never reached the
+// gate (field report 2026-09-18, item 4 — every such command began `cd …;`).
 function separateHeredocs(cmd) {
   const scripts = [];
   const text = cmd.replace(/\r\n?/g, "\n"); // a CRLF heredoc terminates all the same
   const shell = text.replace(HEREDOC_RE, (whole, _quote, _word, offset) => {
     const head = whole.slice(0, whole.indexOf("\n"));
     const line = text.slice(text.lastIndexOf("\n", offset - 1) + 1, offset);
-    const lead = line.slice(line.lastIndexOf("(") + 1); // `X=$(python3 - <<EOF` feeds python3 too
-    const interpreter = commandOf(words(lead)).match(INTERPRETER_RE)?.[1];
+    const interpreter = commandOf(words(feederLead(line))).match(INTERPRETER_RE)?.[1];
     if (interpreter) scripts.push({ interpreter, body: whole.slice(head.length + 1, whole.lastIndexOf("\n")) });
     return head;
   });
   return { shell, scripts };
-}
-
-// Replaces quoted strings — and bare `$( … )` or backtick bodies, which
-// splitSegments judges on their own — with Q's of the same length, so operators inside them are not
-// read as shell syntax and positions still line up with the raw text. A scanner
-// rather than a regex because a double-quoted string may hold
-// a $( … ) substitution that itself holds quotes — `echo "n: $(jq '…"…"…' f)"`
-// is a common shape, and a regex loses phase at its inner quote, exposing a `>`
-// inside <task-notification> as a redirect.
-function maskQuotes(cmd) {
-  let out = "";
-  for (let i = 0; i < cmd.length;) {
-    const ch = cmd[i];
-    // A backslash at top level escapes the next character, so neither is shell
-    // syntax — mask both. Without this the scan had no escape awareness at all
-    // and read `\"` as OPENING a quoted region: `echo a\"b | grep "x>y"` lost
-    // phase and exposed the `>` inside the later quoted string as a redirect,
-    // reporting a read-only pipeline as a write. `echo a\>b` was the same hole
-    // one step shorter — an escaped operator read as an operator. The quote fix
-    // below only stopped one way of INJECTING a stray quote; this is the defect
-    // both spellings reached. `afterDoubleQuoted` already handles an escape
-    // inside an open string; top level was the gap.
-    if (ch === "\\" && i + 1 < cmd.length) { out += "QQ"; i += 2; continue; }
-    const end = ch === "'" ? afterSingleQuoted(cmd, i + 1) : ch === '"' ? afterDoubleQuoted(cmd, i + 1)
-      : ch === "`" ? afterBacktick(cmd, i + 1) : ch === "$" && cmd[i + 1] === "(" ? afterSubstitution(cmd, i + 2) : 0;
-    if (end) { out += "Q".repeat(end - i); i = end; }
-    else { out += ch; i++; }
-  }
-  return out;
 }
 
 // `S=/tmp/x; … > "$S/out"` is the common shape of scratch writes (long paths
@@ -524,9 +510,19 @@ function analyzeShell(text, dir, acc) {
   return dir;
 }
 
-// Returns the gated paths the command writes (empty when unknowable), or null
-// when the command does not write or writes only exempt files.
-function bashWriteTargets(command, cwd) {
+// What a command writes: null when it writes nothing, otherwise `named` — every
+// target it resolved, exempt ones included — and `gated`, the non-exempt subset.
+// `unknown` says some write's target could not be named at all.
+//
+// An unknowable write gates, and the known targets are only the NAMES it is
+// reported under — so they are filtered the same way every other path in this
+// file is. Filtering them by scratch alone was the narrower rule, and it let a
+// prose-only turn block: one command that both wrote a doc through a heredoc
+// and ran an interpreter whose target could not be resolved named the .md as
+// the change. When nothing non-exempt is left to name, an empty list is the
+// honest answer and collectChanges falls through to the git evidence, which
+// decides on what the turn actually wrote rather than on what was parseable.
+function bashWrites(command, cwd) {
   if (typeof command !== "string") return null;
   const acc = { writes: false, unknown: false, targets: [] };
   const { shell, scripts } = separateHeredocs(command);
@@ -536,17 +532,8 @@ function bashWriteTargets(command, cwd) {
     else if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; }
   }
   if (!acc.writes) return null;
-  // An unknowable write gates, and the known targets are only the NAMES it is
-  // reported under — so they are filtered the same way every other path in this
-  // file is. Filtering them by scratch alone was the narrower rule, and it let a
-  // prose-only turn block: one command that both wrote a doc through a heredoc
-  // and ran an interpreter whose target could not be resolved named the .md as
-  // the change. When nothing non-exempt is left to name, an empty list is the
-  // honest answer and collectChanges falls through to the git evidence, which
-  // decides on what the turn actually wrote rather than on what was parseable.
-  if (acc.unknown) return [...new Set(acc.targets.filter((p) => !isExempt(p)))];
-  if (acc.targets.length > 0 && acc.targets.every(isExempt)) return null;
-  return [...new Set(acc.targets.filter((p) => !isExempt(p)))];
+  const named = [...new Set(acc.targets)];
+  return { named, gated: named.filter((p) => !isExempt(p)), unknown: acc.unknown };
 }
 
 /**
@@ -627,6 +614,12 @@ function agentEdited(entry) {
  * `unresolved` is not a guess and not a git fallback: it is the parser's own
  * report that a write happened at this index whose non-exempt targets it could
  * not name. Only `collectChanges` asks git, and only to learn WHICH files.
+ *
+ * A write that touched only exempt paths is yielded too, as kind `exempt`: it is
+ * never a change, but the paths it names (`explains`, with the tool_use `id` so
+ * a caller can ask whether the call succeeded) are what the git evidence must
+ * not credit to an unresolved write. The explained paths come from here rather
+ * than from a second walk for the reason the paragraph above gives.
  */
 function* writeEvents(entries, from, to, cwd) {
   for (let index = from + 1; index < to; index += 1) {
@@ -635,13 +628,20 @@ function* writeEvents(entries, from, to, cwd) {
     for (const use of toolUses(entry)) {
       if (EDIT_TOOLS.has(use.name)) {
         const file = use.input?.file_path ?? use.input?.notebook_path;
-        if (file && !isExempt(file)) yield { index, kind: "file", file };
+        if (!file) continue;
+        yield isExempt(file)
+          ? { index, kind: "exempt", id: use.id, explains: [file] }
+          : { index, kind: "file", id: use.id, file, explains: [file] };
       } else if (use.name === "Bash") {
-        // Three answers, kept as three: null is no write, [] is a write whose
-        // targets did not resolve, a list names them. bashWriteTargets has
-        // already dropped the exempt paths, so no caller filters them again.
-        const targets = bashWriteTargets(use.input?.command, cwd);
-        if (targets) yield { index, kind: "bash", targets, unresolved: targets.length === 0 };
+        const writes = bashWrites(use.input?.command, cwd);
+        if (!writes) continue;
+        // Three answers, kept as three: an exempt-only write is no change, an
+        // empty `targets` is a write whose targets did not resolve, a list names
+        // them. A writer with no path operand at all resolved nothing either.
+        const blind = writes.unknown || writes.named.length === 0;
+        yield blind || writes.gated.length
+          ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named }
+          : { index, kind: "exempt", id: use.id, explains: writes.named };
       }
     }
     if (entry.type === "user" && agentEdited(entry)) {
@@ -653,16 +653,41 @@ function* writeEvents(entries, from, to, cwd) {
 // The first write of `(from, to)`, as the event rather than its index: the
 // refusal text needs to say whether the gate could name what was written.
 function firstWriteEvent(entries, from, to, cwd) {
-  for (const event of writeEvents(entries, from, to, cwd)) return event;
+  for (const event of writeEvents(entries, from, to, cwd)) if (event.kind !== "exempt") return event;
   return null;
+}
+
+// The tool calls whose result came back without an error. A failed or denied
+// call wrote nothing, so it explains nothing — and a denied Edit is the likeliest
+// reason a session falls back to a heredoc in the first place.
+function succeededToolUses(entries) {
+  const ids = new Set();
+  for (const entry of entries) {
+    if (entry.type !== "user" || !hasToolResult(entry)) continue;
+    for (const block of entry.message.content) {
+      if (block?.type === "tool_result" && block.is_error !== true) ids.add(block.tool_use_id);
+    }
+  }
+  return ids;
 }
 
 function collectChanges(turn, cwd, since) {
   const changes = [];
+  const events = [...writeEvents(turn, -1, turn.length, cwd)];
   // One git call per Stop at most, and only when a command shape needs it.
   let evidence;
   const witnessed = () => (evidence === undefined ? (evidence = writesSince(cwd, since)) : evidence);
-  for (const event of writeEvents(turn, -1, turn.length, cwd)) {
+  // The git evidence covers the whole turn but the verdict is per event, so a
+  // file some other successful call already accounts for — exempt ones included,
+  // wherever in the turn it landed — cannot clear an unresolved write. Crediting
+  // it did exactly that: a heredoc rewrote a hook outside the repo, git saw only
+  // the two `.md` files a Write and a redirect had made, and the all-exempt rule
+  // below read that as "the artifact was prose" (unresolved-write ruling §1).
+  const succeeded = succeededToolUses(turn);
+  const explained = new Set(events.filter((e) => e.explains && succeeded.has(e.id))
+    .flatMap((e) => e.explains.map((p) => path.resolve(p))));
+  for (const event of events) {
+    if (event.kind === "exempt") continue;
     if (event.kind === "file") { changes.push({ index: event.index, kind: "file", file: event.file }); continue; }
     if (event.kind === "agent") { changes.push({ index: event.index, kind: "agent", agentType: event.agentType }); continue; }
     // A resolvable target decides on its own: it may be outside the repo,
@@ -670,13 +695,17 @@ function collectChanges(turn, cwd, since) {
     if (!event.unresolved) { changes.push({ index: event.index, kind: "bash", files: event.targets }); continue; }
     const written = witnessed();
     if (!Array.isArray(written)) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: written }); continue; }
-    const gated = written.filter((file) => !isExempt(file));
+    const unexplained = written.filter((file) => !explained.has(file));
+    const gated = unexplained.filter((file) => !isExempt(file));
     if (gated.length) { changes.push({ index: event.index, kind: "bash", files: gated }); continue; }
-    // Every file the turn touched is exempt: prose, config, scratch. That is a
-    // real answer — the artifact was looked at — so no change is recorded. An
-    // empty list is not: the command wrote something the evidence cannot
-    // account for, and the gate falls back to blocking.
+    // Every unexplained file is exempt: prose, config, scratch. That is a real
+    // answer — the artifact was looked at — so no change is recorded. An empty
+    // remainder is not: the command wrote something the evidence cannot account
+    // for, and the gate falls back to blocking. The two empty cases get two
+    // texts, because "nothing changed" is the one leads have learned to answer
+    // with `not-applicable`, and here something did change — just not visibly.
     if (!written.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "nothing in the working tree changed since this turn began" });
+    else if (!unexplained.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "every file changed in the working tree is accounted for by another tool call, so this one wrote somewhere git cannot see from here — outside this repository, or into a file another call also wrote" });
   }
   return changes;
 }
@@ -842,9 +871,13 @@ const reminderCounter = (tag) => (turn) => turn.filter((e) => isReminderFor(e, t
 // deadlock MAX_REMINDERS exists to prevent.
 const UNMARKED_TAG = "the self-review loop has not converged";
 const REJECTED_TAG = "does not validate, so it does not clear the gate";
+// Pooled with the two above rather than counted apart: it is the same
+// obligation — a marker that postdates the last change — asked in the words
+// that fit an honest marker overtaken by an editor's completion.
+const REMARK_TAG = "your marker was written before an editing subagent finished";
 const countReminders = (turn, since) =>
   turn.filter((e, i) => i > since
-    && (isReminderFor(e, UNMARKED_TAG) || isReminderFor(e, REJECTED_TAG))).length;
+    && [UNMARKED_TAG, REJECTED_TAG, REMARK_TAG].some((tag) => isReminderFor(e, tag))).length;
 
 // ---------- in-flight agents ----------
 
@@ -998,14 +1031,22 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
   // message tells the model to launch a finder it already delegated. Not
   // "running": an orchestrator is an editor, so a pending one is intercepted by
   // the "applying" branch below and never reaches that line.
-  const reviewers = [...agents.filter((a) => REVIEWER_TYPES.test(a.type)), ...orchestrators];
+  const finders = agents.filter((a) => REVIEWER_TYPES.test(a.type));
+  const reviewers = [...finders, ...orchestrators];
+  // A finder's scope is frozen when it is LAUNCHED, not when it reports: one
+  // launched before a change and completing after it read the tree the change
+  // replaced (unresolved-write ruling, second half). Background finders notify
+  // one at a time, so fixing what one found while another still reads is the
+  // ordinary shape of a round, not a corner. A SendMessage resume does not
+  // refresh this — the skill's premise is a reader who has not seen the code.
+  const fresh = finders.filter((a) => a.launchedAt > changeAt);
   // An applier still running cannot have been read by anyone, whatever the
   // finders did: its edits are not a fixed set yet, so no completion can be
   // "after the last change". Checked before "ok" because a finder that
   // completed after the last MAIN-CHAIN change would otherwise satisfy the
   // condition while the tree is still moving.
   if (editorsIn(agents).some((a) => a.pending)) return "applying";
-  if (reviewers.some((a) => a.doneAt > changeAt && a.doneAt < markerAt)) return "ok";
+  if (fresh.some((a) => a.doneAt !== -1 && a.doneAt < markerAt)) return "ok";
   // The orchestrator's own clause, and the reason it is a SEPARATE line rather
   // than a wider `reviewers` filter: its anchor is IN `changeAt`, because it is
   // a change source, so the line above can never admit it. One index on both
@@ -1027,10 +1068,9 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
   // o2 had already stopped reading before. The baseline is therefore per-agent:
   // everything THIS orchestrator did not do, siblings included. That is the
   // ruling's own wording — "launched after every change it did not make".
-  if (orchestrators.some((o) =>
-    o.doneAt !== -1 && o.doneAt < markerAt &&
-    o.launchedAt > Math.max(externalChangeAt,
-      ...orchestrators.filter((x) => x !== o).map(editorAnchor)))) return "ok";
+  const vouches = (o) => o.launchedAt > Math.max(externalChangeAt,
+    ...orchestrators.filter((x) => x !== o).map(editorAnchor));
+  if (orchestrators.some((o) => o.doneAt !== -1 && o.doneAt < markerAt && vouches(o))) return "ok";
   // Still running is not missing. Blocking here would tell the model to spawn a
   // second finder over the same scope, or to poll — and ending the turn is how
   // this loop waits. So this one releases: the completion wakes the model, and
@@ -1040,9 +1080,15 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
   if (reviewers.some((a) => stillRunningFor(a, prevMarkerAt))) return "running";
   // Completed, but after the marker was written: nothing had read the result
   // when the claim was made. Only the mark needs redoing.
-  if (reviewers.some((a) => a.doneAt > markerAt)) return "late";
-  // Completed before the last change: the edit behind it was read by nobody.
-  return reviewers.some((a) => a.doneAt !== -1 && a.doneAt < changeAt) ? "stale" : "none";
+  // Only a reader whose scope covers the last change can be late — a finder
+  // launched after it, an orchestrator launched after every change it did not
+  // make: re-marking on a mid-flight reader's report would clear an edit it
+  // never saw.
+  if ([...fresh, ...orchestrators.filter(vouches)].some((a) => a.doneAt > markerAt)) return "late";
+  // Completed before the last change, or launched before it: the edit behind
+  // it was read by nobody.
+  return finders.some((a) => a.doneAt !== -1 && a.launchedAt <= changeAt) ||
+    orchestrators.some((a) => a.doneAt !== -1 && a.doneAt < changeAt) ? "stale" : "none";
 }
 
 // ---------- did an outsider rule on the verdicts? ----------
@@ -1257,7 +1303,10 @@ function unvalidatedReason(unnamedAt = null) {
   ].join("\n");
 }
 
-function unreviewedReason(state, changes, lastChangeAt, cwd, hasOrchestrator = false) {
+// `midFlight`: the reviewer that ran was launched before the last change and
+// reported after it, so "landed after it finished" would be false — and the
+// model, which saw the completion arrive after its edit, would not believe it.
+function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, midFlight }) {
   // Named through describeChanges, which is the one place that knows a change
   // may be a file, a shell command whose targets did not resolve, or a
   // subagent's edit — reading `.file` off it directly prints "undefined" for
@@ -1268,7 +1317,9 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, hasOrchestrator = f
     ? [`A reviewer did complete, but only AFTER the marker was written — nothing had read the result when you claimed it. Do not launch another one: it has already reported.`,
       `Read its report, act on it, and then re-mark, in a message of its own:`]
     : state === "stale"
-      ? [`A reviewer did complete, but this landed after it finished: ${latest} — read by nobody but you.`,
+      ? [midFlight
+        ? `A reviewer did complete, but this landed after it was launched — a reviewer reads the tree it was given, so it never saw: ${latest}. Nothing read it but you.`
+        : `A reviewer did complete, but this landed after it finished: ${latest} — read by nobody but you.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`]
       : [`No reviewer agent ran in this window — a verifier alone does not count, because verifying findings you generated yourself is reviewing your own work.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`];
@@ -1473,7 +1524,10 @@ function evaluate(entries, cwd) {
       }
       return {
         decision: "block",
-        reason: unreviewedReason(state, inFrame, changeAtW, cwd, orchestrators.length > 0),
+        reason: unreviewedReason(state, inFrame, changeAtW, cwd, {
+          hasOrchestrator: orchestrators.length > 0,
+          midFlight: agents.some((a) => REVIEWER_TYPES.test(a.type) && a.launchedAt <= changeAtW && a.doneAt > changeAtW),
+        }),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
       };
     }
@@ -1575,11 +1629,42 @@ function evaluate(entries, cwd) {
       systemMessage: `self-review gate: the convergence marker was refused — ${rejected.length} problem(s) with the record`,
     };
   }
+  if (remarkOnly(outcome, markerAtW, inFrame, editors)) {
+    return {
+      decision: "block",
+      reason: remarkReason(outcome),
+      systemMessage: `self-review gate: an editing subagent finished after the ${outcome} marker — re-mark with the same outcome`,
+    };
+  }
   return {
     decision: "block",
     reason: blockReason(described, reminders, cwd) + beside,
     systemMessage: `self-review gate: ${describeChanges(described, cwd)} — ${lastChange(described)?.kind === "orchestrator" ? "read its report and re-mark before the turn ends" : "running the review loop before the turn ends"}`,
   };
+}
+
+// An honest `not-converged` or `not-applicable` marker needs no reader, only a
+// place after the last change — and when everything after it is an editor that
+// was ALREADY running when it was written, finishing is the only thing that
+// moved. The generic text then sent a lead who had just obeyed ESCALATE back
+// into a round (review-identity ruling D2). An editor launched or resumed after
+// the marker is new work, and a main-chain change after it is the lead's own:
+// both keep the generic block.
+function remarkOnly(outcome, markerAtW, inFrame, editors) {
+  if (outcome !== "not-converged" && outcome !== "not-applicable") return false;
+  if (markerAtW === -1) return false;
+  const later = inFrame.filter((c) => c.index > markerAtW);
+  const laterEditors = editors.filter((a) => editorAnchor(a) > markerAtW);
+  return later.length > 0
+    && later.every((c) => c.kind === "applier" || c.kind === "orchestrator")
+    && laterEditors.every((a) => a.launchedAt < markerAtW && a.resumedAt < markerAtW);
+}
+
+function remarkReason(outcome) {
+  return [
+    `${GATE_TAG} ${REMARK_TAG}. Its claim still stands, but a marker has to come after the last change, and an editing subagent's completion is one.`,
+    `So: re-mark, same outcome — no round required. Write the same ${outcome} record again, with the same counts, in a message of its own.`,
+  ].join("\n");
 }
 
 function shortPath(file, cwd) {

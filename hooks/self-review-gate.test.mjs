@@ -185,6 +185,17 @@ test("a Bash write to a prose file passes; the same write to a script blocks; a 
   assert.doesNotMatch(mixed.json.reason, /docs\/a\.md/);
 });
 
+// Field report 2026-09-18: a handoff note written atomically as `HANDOFF.md.new`
+// then renamed armed the gate three times — `.new` is not an extension anyone
+// reviews, and the file under it was prose.
+test("an atomic-write suffix is judged by the extension under it: .md.new passes, .mjs.new blocks", () => {
+  assert.equal(run(turn(bash(`cat > ${PROJECT}/HANDOFF.md.new <<'EOF'\nx\nEOF\nmv ${PROJECT}/HANDOFF.md.new ${PROJECT}/HANDOFF.md`))).stdout, "");
+  assert.equal(run(turn(write(`${PROJECT}/notes.md.tmp`))).stdout, "");
+  assert.ok(blocks(run(turn(bash(`cat > ${PROJECT}/hook.mjs.new <<'EOF'\nx\nEOF`)))));
+  assert.equal(run(turn(write(`${PROJECT}/README.new`))).stdout, "", "a bare exempt name under the suffix is still that name");
+  assert.ok(blocks(run(turn(write(`${PROJECT}/build.new`)))), "a bare .new has no extension under it to vouch for it");
+});
+
 test("Edit, MultiEdit and NotebookEdit all count as changes", () => {
   for (const [name, input] of [
     ["Edit", { file_path: `${PROJECT}/a.py` }],
@@ -298,10 +309,26 @@ test("writes hidden in shell wrappers are seen: bash -c, a leading assignment, b
     `echo $'it\\'s fine' ; rm ${PROJECT}/important.sh`,
     `X=$(python3 - <<'EOF'\nopen('${PROJECT}/x.py','w').write('a')\nEOF\n)`,
     `X=$(bash <<'EOF'\nrm ${PROJECT}/important.sh\nEOF\n)`,
+    `X="$(python3 - <<'EOF'\nopen('${PROJECT}/x.py','w').write('a')\nEOF\n)"`,
+    `X="$(bash <<'EOF'\nrm ${PROJECT}/important.sh\nEOF\n)"`,
+    `X="a"$(python3 - <<'EOF'\nopen('${PROJECT}/x.py','w').write('a')\nEOF\n)`,
+    `python3 -c "import os"<<'EOF'\nopen('${PROJECT}/x.py','w').write('a')\nEOF`,
+    `bash -c "true"<<'EOF'\nrm ${PROJECT}/important.sh\nEOF`,
   ];
   for (const c of cases) assert.ok(blocks(run(turn(bash(c, "")))), c);
   assert.ok(!blocks(run(turn(bash(`echo $'it\\'s fine' ; ls ${PROJECT}`, "")))));
   assert.ok(!blocks(run(turn(bash("echo `date` > /tmp/scratch/now.txt", "")))));
+});
+
+test("a redirect's `&` is not the heredoc feeder's boundary; a background `&` is", () => {
+  const py = `open('${PROJECT}/x.py','w').write('a')`;
+  const cases = [
+    `python3 - 2>&1 <<'EOF'\n${py}\nEOF`,
+    `python3 - >&2 <<'EOF'\n${py}\nEOF`,
+    `node - &>/dev/null <<'EOF'\nrequire('fs').writeFileSync('${PROJECT}/x.mjs','a')\nEOF`,
+    `cd /x & python3 - <<'EOF'\n${py}\nEOF`,
+  ];
+  for (const c of cases) assert.ok(blocks(run(turn(bash(c, "")))), c);
 });
 
 test("a redirect target ending in a parenthesis keeps it; a subshell's closer is not part of the target", () => {
@@ -809,10 +836,14 @@ test("only converged is gated — not-converged and not-applicable end the turn 
 
 test("a reviewer launched before a human interjection still counts — the window is not the turn", () => {
   // The 2026-08-22 false block, in the shape ruling 2's literal wording would
-  // have reintroduced: the finder is launched, the user interjects, the change
-  // and the completion land after it, and the marker follows.
-  const r = run([human("start the review"), ...launch("rvX"), said("running"),
-    human("any progress?"), ...write(`${PROJECT}/src/a.ts`), notification("rvX"), ...marker(), said("done")]);
+  // have reintroduced: the finder is launched, the user interjects, the
+  // completion lands after it, and the marker follows. The change comes from an
+  // applier, because it must PRECEDE the finder's launch (a finder reads the
+  // tree it was launched over — see the launch-order tests below) and still be
+  // in the gate's frame after the interjection; a main-chain edit from before
+  // the interjection belongs to the previous turn.
+  const r = run([human("start the review"), ...applier("apX"), notification("apX"), ...launch("rvX"), said("running"),
+    human("any progress?"), notification("rvX"), ...marker(), said("done")]);
   assert.equal(r.stdout, "");
 });
 
@@ -859,6 +890,43 @@ test("a reviewer that completed AFTER the marker asks only for a re-mark, not fo
   assert.match(r.json.reason, /only AFTER the marker was written/);
   assert.match(r.json.reason, /Do not launch another one/);
   assert.doesNotMatch(r.json.reason, /launch one self-review-finder/);
+});
+
+// A finder's scope is frozen when it is LAUNCHED, so completing after a change
+// is not reading it (unresolved-write ruling, second half). Background finders
+// notify one at a time: the lead fixes what finder A found while finder B is
+// still reading the old tree, and B's completion used to read as `ok`.
+
+test("a finder launched before an edit and completed after it is stale, and the reason names the mid-flight change", () => {
+  const r = run([human("go"), ...launch("mid1"), ...write(`${PROJECT}/src/a.ts`), notification("mid1"), ...marker(), said("done")]);
+  assert.ok(blocks(r), "the finder's scope was frozen before the edit it completed after");
+  assert.match(r.json.reason, /landed after it was launched[^\n]*src\/a\.ts/);
+  assert.doesNotMatch(r.json.reason, /No reviewer agent ran in this window/, "a reviewer did run: the state is stale, not none");
+});
+
+test("a finder launched in the same entry as an edit does not clear it", () => {
+  const both = {
+    type: "assistant", uuid: `a${++seq}`, timestamp: stamp(),
+    message: { role: "assistant", content: [
+      { type: "tool_use", id: "w-fboth", name: "Edit", input: { file_path: `${PROJECT}/a.ts`, old_string: "a", new_string: "b" } },
+      { type: "tool_use", id: "f-fboth", name: "Agent", input: { prompt: "review", subagent_type: "self-review-finder" } },
+    ] },
+  };
+  const r = run(turn(both, toolResult("w-fboth", "updated"), toolResult("f-fboth", LAUNCHED("fboth"), {}),
+    notification("fboth"), ...marker()));
+  assert.ok(blocks(r), "an edit in the launching entry is not an edit the launch came after");
+});
+
+test("a finder launched after the last change satisfies converged; the orchestrator's clause is unchanged", () => {
+  assert.equal(run([human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("aft1"), notification("aft1"), ...marker(), said("done")]).stdout, "");
+  assert.equal(run(turn(...write(`${PROJECT}/a.ts`), ...orch("oAft"), notification("oAft"), ...marker())).stdout, "");
+});
+
+test("a finder resumed through SendMessage after the change does not count: the skill's premise is a fresh reader", () => {
+  const r = run([human("go"), ...launch("res1"), notification("res1"), ...write(`${PROJECT}/src/a.ts`),
+    ...resume("res1"), notification("res1"), ...marker(), said("done")]);
+  assert.ok(blocks(r));
+  assert.doesNotMatch(r.json.reason, /No reviewer agent ran in this window/);
 });
 
 test("an unrelated agent that parses does not hide a reviewer, and does not stand in for one", () => {
@@ -991,6 +1059,50 @@ test("the applier block is bounded like every other, and says what it is waiting
     human("go"), ...applier("ap1"), notification("ap1"), said("dispatched"),
     gateFeedback(), said("still nothing"), gateFeedback(), said("still nothing"),
   ]);
+  assert.ok(!blocks(r));
+  assert.match(r.json.systemMessage, /released/);
+});
+
+// An honest non-converged marker written while the applier was still editing
+// (review-identity ruling, D2). The marker must postdate the change, so it still
+// blocks — but what is missing is the re-mark, not a round: the generic text sent
+// a lead who had just obeyed ESCALATE back into the loop.
+const REMARK_TAG = "your marker was written before an editing subagent finished";
+const remarkFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(), message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} ${REMARK_TAG}.` } });
+const NOT_APPLICABLE = [`${CONVERGED_Q} --not-applicable user-declined`, "SELF-REVIEW CONVERGED — outcome=not-applicable reason=user-declined"];
+
+test("an applier finishing after a not-converged or not-applicable marker asks for the same re-mark, not a round", () => {
+  for (const mark of [NOT_CONVERGED, NOT_APPLICABLE]) {
+    const midFlight = [human("go"), ...applier("apNc"), ...bash(...mark), notification("apNc"), said("done")];
+    const r = run(midFlight);
+    assert.ok(blocks(r), `${mark[1]}: the marker must postdate the change`);
+    assert.match(r.json.reason, /\[self-review-gate\]/);
+    assert.match(r.json.reason, /re-mark, same outcome — no round required/);
+    assert.doesNotMatch(r.json.reason, /review loop/);
+    assert.doesNotMatch(r.json.reason, /finder/);
+    assert.equal(run([...midFlight, ...bash(...mark)]).stdout, "", "the re-mark releases it");
+  }
+});
+
+test("a not-converged marker after the applier completed releases with no finder behind it", () => {
+  assert.equal(run(turn(...applier("apNc2"), notification("apNc2"), ...bash(...NOT_CONVERGED))).stdout, "");
+});
+
+test("a main-chain edit after a not-converged marker still gets the generic block", () => {
+  for (const body of [
+    turn(...bash(...NOT_CONVERGED), ...write(`${PROJECT}/src/a.ts`)),
+    turn(...applier("apNc3"), ...bash(...NOT_CONVERGED), ...write(`${PROJECT}/src/a.ts`), notification("apNc3")),
+  ]) {
+    const r = run(body);
+    assert.ok(blocks(r));
+    assert.match(r.json.reason, new RegExp(UNMARKED_TAG));
+    assert.doesNotMatch(r.json.reason, /no round required/);
+  }
+});
+
+test("the re-mark block is bounded by MAX_REMINDERS like the generic one", () => {
+  const r = run([human("go"), ...applier("apNc4"), ...bash(...NOT_CONVERGED), notification("apNc4"),
+    said("x"), remarkFeedback(), said("y"), remarkFeedback(), said("z")]);
   assert.ok(!blocks(r));
   assert.match(r.json.systemMessage, /released/);
 });
@@ -1181,6 +1293,15 @@ test("a user config file extends the exempt lists and sets the reminder cap; a b
 test("a CONVERGED.json written inside the project, not a scratch dir, is not a marker", () => {
   assert.ok(blocks(run(turn(...write(`${PROJECT}/src/a.ts`), ...writeMarker(CONVERGED_RECORD, PROJECT)))));
   assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(CONVERGED_RECORD, mkdtempSync(path.join(tmpdir(), "sr-"))))).stdout, "");
+});
+
+test("a marker in a per-review work dir counts: one review-<k>/ segment, and nothing else between", () => {
+  const markAt = (file) => call("Write", { file_path: file, content: JSON.stringify(CONVERGED_RECORD) }, `File created successfully at: ${file}`);
+  const cleared = (file) => run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markAt(file))).stdout === "";
+  assert.ok(cleared(`${SCRATCH}/self-review/review-3/CONVERGED.json`), "the per-review dir round.sh allocates");
+  assert.ok(cleared(`${SCRATCH}/self-review/CONVERGED.json`), "the base path still is one");
+  assert.ok(!cleared(`${SCRATCH}/self-review/review-3/x/CONVERGED.json`), "a second segment is not");
+  assert.ok(!cleared(`${SCRATCH}/self-review/evil/CONVERGED.json`), "an arbitrary segment is not");
 });
 
 test("the write marker is logged once even when another session's entry landed after it", () => {
@@ -1433,6 +1554,85 @@ test("F7: a resolvable prose target does not hide a code artifact beside it", ()
   assert.doesNotMatch(r.json.reason, /notes\.md/, "the exempt half is not evidence of a change");
 });
 
+// The seatbelt's hole, observed 2026-09-18: a heredoc edited a hook OUTSIDE the
+// cwd's repository, git saw only two `.md` files the same turn wrote with other
+// tools, and the all-exempt rule read that as "the artifact was prose". The
+// evidence is turn-wide but the verdict is per event, so a file another event
+// already explains cannot clear an unresolved write (unresolved-write ruling §1).
+const HEREDOC_OUTSIDE = `cd ${REAL_HOME}/.claude/hooks; python3 - <<'PY'\np='guard.mjs'\nopen(p,'w').write('x')\nPY`;
+test("an interpreter heredoc behind `cd x;` or `&&` on the same line is code, not data", () => {
+  // The field commands all began `cd ~/.claude/hooks;`, and the heredoc's
+  // feeder was read as the line's FIRST command word — `cd` — so the body was
+  // dropped as data and the write never reached the gate at all.
+  for (const sep of [";", " &&", " ||", " |"]) {
+    const cmd = `cd ${PROJECT}/sub${sep} python3 - <<'PY'\nopen('${PROJECT}/x.mjs','w').write('x')\nPY`;
+    assert.ok(blocks(run(turn(bash(cmd)))), sep);
+  }
+  assert.equal(run(turn(bash(`cd ${PROJECT}; cat > ${PROJECT}/notes.md <<'EOF'\nopen('a','w')\nEOF`))).stdout, "", "a data heredoc stays data");
+});
+
+test("a `;` inside a quoted argument is not the heredoc feeder's boundary", () => {
+  const cmd = `cd ${PROJECT}/sub && python3 - "a;b" <<'PY'\nopen('${PROJECT}/lib/evil.mjs','w').write('x')\nPY`;
+  assert.ok(blocks(run(turn(bash(cmd)))));
+});
+
+function failed(name, input) {
+  const id = `${name}${++seq}`;
+  const result = toolResult(id, "<tool_use_error>File has not been read yet.</tool_use_error>");
+  result.message.content[0].is_error = true;
+  return [toolUse(name, input, id), result];
+}
+
+test("an unresolved write whose only evidence other tools already explain blocks, with its own reason", () => {
+  const { repo } = repoFixture({ "docs/a.md": "# a\n", "docs/b.md": "# b\n" });
+  const r = run(turn(...write(`${repo}/docs/a.md`), bash(`cat > ${repo}/docs/b.md <<'EOF'\n# b\nEOF`), bash(HEREDOC_OUTSIDE)),
+    { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the field case: the .md files were written by the Write and the redirect, not by the heredoc");
+  assert.match(r.json.reason, /could not determine which files — every file changed in the working tree is accounted for by another tool call/);
+  assert.doesNotMatch(r.json.reason, /nothing in the working tree changed/, "leads have learned to answer that one with not-applicable");
+});
+
+test("an unresolved write whose evidence is an unexplained exempt file still records no change", () => {
+  const { repo } = repoFixture({ "config/settings.json": "{}\n" });
+  assert.equal(run(turn(bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } }).stdout, "");
+});
+
+test("a failed Write explains nothing: its file stays evidence for the heredoc after it", () => {
+  const { repo } = repoFixture({ "docs/a.md": "# a\n" });
+  const r = run(turn(...failed("Write", { file_path: `${repo}/docs/a.md`, content: "x" }), bash(HEREDOC_OUTSIDE)),
+    { payload: { cwd: repo } });
+  assert.equal(r.stdout, "", r.json?.reason);
+});
+
+test("a successful Edit and a heredoc on the same exempt file block — the accepted false arm", () => {
+  const { repo } = repoFixture({ "docs/a.md": "# a\n" });
+  const r = run(turn(...edit(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /accounted for by another tool call/);
+});
+
+test("explained exempt evidence beside an unexplained code file names the code file", () => {
+  const { repo } = repoFixture({ "docs/a.md": "# a\n", "src/gen.mjs": "export {};\n" });
+  const r = run(turn(...write(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
+  assert.doesNotMatch(r.json.reason, /docs\/a\.md/);
+});
+
+test("the intent check and the change check agree: an exempt write is not a first change, the unresolved heredoc is", () => {
+  const { repo } = repoFixture({ "docs/a.md": "# a\n" });
+  const VALIDATED = { ...CONVERGED_RECORD, intent: "validated" };
+  const VALIDATOR_TYPE = "self-review:self-review-ticket-validator";
+  const first = run(turn(...write(`${repo}/docs/a.md`), ...launch("tvA", VALIDATOR_TYPE), notification("tvA"),
+    bash(HEREDOC_OUTSIDE), ...reviewed(), ...writeMarker(VALIDATED)), { payload: { cwd: repo } });
+  assert.equal(first.stdout, "", "the validator finished before the first CODE change; the .md before it is not one");
+  const late = run(turn(...write(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE), ...launch("tvB", VALIDATOR_TYPE), notification("tvB"),
+    ...reviewed(), ...writeMarker(VALIDATED)), { payload: { cwd: repo } });
+  assert.ok(blocks(late));
+  assert.match(late.json.reason, /shell command at entry \d+ whose write target the gate could not resolve/,
+    "the event the change check blocked on is the one the intent check names");
+});
+
 // ---------- the orchestrator arms the gate too (F10c) ----------
 //
 // The orchestrator runs the whole post-setup protocol in a fresh context and
@@ -1498,6 +1698,12 @@ test("a lead edit DURING the run is refused too — the orchestrator vouches onl
   // so a mid-run lead edit could be overwritten or simply never read.
   const r = run(turn(...orch("o1"), ...write(`${PROJECT}/a.ts`), notification("o1"), ...marker()));
   assert.ok(blocks(r), "launched before the edit, so the edit is outside what it reviewed");
+});
+
+test("an orchestrator launched before a lead edit and completing after the marker is not late — it never read the edit", () => {
+  const r = run(turn(...orch("o1"), ...write(`${PROJECT}/a.ts`), ...marker(), notification("o1"), said("done")));
+  assert.ok(blocks(r), "the edit is outside what it reviewed");
+  assert.doesNotMatch(r.json.reason, /only AFTER the marker was written/, "a re-mark would clear an edit nobody read");
 });
 
 test("resuming an orchestrator cannot walk its anchor back behind a marker", () => {

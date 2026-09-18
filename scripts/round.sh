@@ -2,8 +2,20 @@
 # round — everything a review round needs before it can spawn a reviewer, in
 # ONE call.
 #
-# Usage: round.sh --work <dir> --round <n> --intent <file> [--base <ref>]
-#                 [--force S|M|L --reason "…"] [--no-preflight] [path ...]
+# Usage: round.sh --new-review --work <base> --intent <file> [options] [path ...]
+#        round.sh --work <review dir> --round <n> --intent <file> [options] [path ...]
+#   options: [--base <ref>] [--force S|M|L --reason "…"] [--no-preflight]
+#
+# `--new-review` starts a review: it allocates `<base>/review-<k>/` (the first
+# k whose plain `mkdir` succeeds), runs its round 1, and prints `work: <path>`
+# as its first line — that path is `--work` for every later round. The intent
+# is copied in; when it is `<base>/intent.md` it is MOVED, with `<base>/ticket/`,
+# once the round exists, so the next review cannot brief against this ticket.
+# One dir per review is what keeps the review's identity (findings.mjs), its
+# tier ceiling and its round budget from leaking between reviews of a session:
+# measured before it, one session's dir held round-1 … round-25 across six
+# reviews, and review 3 opened at "round 7" with a stranger's ceiling and a
+# converge that said STOP from its first look (review-identity-answer.md).
 #
 # It captures the scope, runs pre-flight (round 1 only), computes the blast
 # radius and the plan, pulls the prior findings for these files, and writes the
@@ -27,8 +39,12 @@
 # 2-line tier-S change whose round-1 fix added a 24-line test file recomputed
 # as M and spent two finders where round 1 had spent one. Fixing a finding well
 # must not cost more than finding it. `--force` still overrides.
+# From round 2 on it also runs `findings.mjs converge` for the round just
+# finished and prints its verdict above the plan: the stopping rule ran in 7 of
+# 46 measured reviews while it was a step the lead had to remember.
+#
 # Exit: 0; 2 usage (a bad flag, a missing intent file, a work dir inside the
-# repo); 4 nothing to review (an empty scope, or a change that is all assets);
+# repo, a round number the work dir does not support); 4 nothing to review (an empty scope, or a change that is all assets);
 # 3 propagated from tier.mjs or brief.mjs when an input of theirs is unreadable,
 # because those two are unguarded on purpose — without a plan or a brief there
 # is no round, so the failure must reach the caller rather than degrade.
@@ -40,7 +56,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 
 die() { echo "round.sh: $*" >&2; exit 2; }
 
-work=""; round=""; intent=""; base=""; force=""; reason=""; preflight=1
+work=""; round=""; intent=""; base=""; force=""; reason=""; preflight=1; new_review=0
 # `paths` is expanded as ${paths[@]+"${paths[@]}"} everywhere below: under
 # `set -u` in bash 3.2 — which is what macOS ships — "${empty[@]}" is an
 # unbound variable, and the empty case is the common one (review the whole
@@ -55,6 +71,7 @@ while [ $# -gt 0 ]; do
     --force)  [ $# -ge 2 ] || die "--force needs a tier";      force="$2"; shift 2 ;;
     --reason) [ $# -ge 2 ] || die "--reason needs text";       reason="$2"; shift 2 ;;
     --no-preflight) preflight=0; shift ;;
+    --new-review) new_review=1; shift ;;
     -h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0"; exit 0 ;;   # to the first non-comment line, never past it
     -*) die "unknown option: $1" ;;
     *)  paths+=("$1"); shift ;;
@@ -62,7 +79,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$work" ]   || die "--work is required"
-[ -n "$round" ]  || die "--round is required"
+if [ "$new_review" -eq 1 ]; then
+  [ -z "$round" ] || die "--new-review is round 1 of a new review; drop --round"
+  round=1
+fi
+[ -n "$round" ]  || die "--round is required (or --new-review to start a review)"
 [ -n "$intent" ] || die "--intent is required"
 case "$round" in ''|*[!0-9]*) die "--round needs a positive integer, got: $round" ;; esac
 [ "$round" -ge 1 ] || die "--round needs a positive integer, got: $round"
@@ -77,6 +98,40 @@ case "$round" in ''|*[!0-9]*) die "--round needs a positive integer, got: $round
 # it creates anything, and with round.sh's name on the message.
 if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   refuse_if_inside_repo "$work" "round.sh"
+fi
+
+# Round numbers belong to the review, and the review to its dir. A round 1
+# that already produced briefs is an earlier review: running another here is
+# the reuse this layout exists to end. A round 1 that died before its briefs
+# (a paperwork refusal, an empty scope) never reached a reviewer, so running it
+# again is a retry, not a second review — and those refusals name a retry.
+if [ "$new_review" -eq 0 ]; then
+  if [ "$round" -eq 1 ] && [ -d "$work/round-1/briefs" ]; then
+    die "$work already holds a review's round 1 — start the next review with round.sh --new-review --work <base> --intent <file>, never a reused round-1"
+  fi
+  if [ "$round" -ge 2 ] && [ ! -f "$work/round-$((round - 1))/tier.json" ]; then
+    die "round $round needs round $((round - 1)) first: there is no $work/round-$((round - 1))/tier.json — --work is the review dir --new-review printed (work: …)"
+  fi
+fi
+
+consume_base_intent=0
+if [ "$new_review" -eq 1 ]; then
+  review_base="$work"
+  mkdir -p "$review_base"
+  # Plain mkdir, never -p: its failure on an existing dir IS the allocation.
+  # The existence check turns an unwritable base into a message instead of a
+  # loop that never ends.
+  k=1
+  until mkdir "$review_base/review-$k" 2>/dev/null; do
+    [ -e "$review_base/review-$k" ] || die "cannot create $review_base/review-$k"
+    k=$((k + 1))
+  done
+  work="$(abs_path "$review_base/review-$k")"
+  echo "work: $work"
+  # By inode, not by spelling: /var and /private/var are one file on macOS.
+  if [ "$intent" -ef "$review_base/intent.md" ]; then consume_base_intent=1; fi
+  cp "$intent" "$work/intent.md"
+  intent="$work/intent.md"
 fi
 
 dir="$work/round-$round"
@@ -406,6 +461,24 @@ if [ "$reviewable" != "yes" ]; then
   esac
   exit 4
 fi
+# The stopping rule's verdict on the round just finished, where the next round
+# starts — above the plan, because it is what decides whether to spend it.
+# Printed, never enforced: the exit code is the round's, not the rule's. A
+# round with no records is a clean round or an unrecorded one; either way W
+# has nothing to weigh, and no verdict is printed as if it had.
+if [ "$round" -ge 2 ]; then
+  prev=$((round - 1))
+  if converged="$("$here/findings.mjs" converge --work "$work" --round "$prev" ${repo_root:+--repo "$repo_root"} 2>"$dir/converge.err")"; then
+    if printf '%s\n' "$converged" | grep -q "^round $prev  W=0  angles: none\$"; then
+      echo "converge: no records for round $prev — W cannot be computed"
+    else
+      verdict="$(printf '%s\n' "$converged" | grep -E '^(CONTINUE|ESCALATE|STOP) — ' || true)"
+      echo "converge (round $prev): ${verdict:-no verdict line — run findings.mjs converge --work $work --round $prev}"
+    fi
+  else
+    echo "round.sh: findings.mjs converge failed (${dir}/converge.err) — round $prev's verdict is unknown" >&2
+  fi
+fi
 printf '%s\n' "$plan_out"
 
 # Written even when empty, so the chain does not break on a repo with no memory.
@@ -496,6 +569,13 @@ fi
 "$here/brief.mjs" --round "$round" --plan "$dir/tier.json" --intent "$intent" \
   --scope "$scope" ${impact_md:+--impact "$dir/impact.md"} --prior "$dir/prior.md" --ledger "$ledger" \
   ${cold:+--cold "$cold"} --out "$dir/briefs/"
+
+# The base intent becomes this review's only once the round it briefs exists;
+# moved earlier, a refused round 1 would strand it in a review that never ran.
+if [ "$consume_base_intent" -eq 1 ]; then
+  rm "$review_base/intent.md"
+  if [ -d "$review_base/ticket" ]; then mv "$review_base/ticket" "$work/ticket"; fi
+fi
 
 [ -z "${coldout:-}" ] || echo "$coldout"
 # Where pre-flight ran is part of reading its verdict: a FAIL from the install

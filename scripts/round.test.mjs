@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROUND = path.join(HERE, "round.sh");
+const FINDINGS = path.join(HERE, "findings.mjs");
+// Every round's `prior`, `engagement` and (from round 2) `converge` call writes
+// under the log dir; the suite must not write into the developer's own memory.
+process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "round-log-"));
 
 /** A repo with one committed file and a small uncommitted edit to it. */
 const fixture = () => {
@@ -600,4 +604,186 @@ test("the tripwire is silent when pre-flight ran from the checkout, where there 
   assert.match(done.stderr, /could not stage the install copy/, "the staging-failure path is the one under test");
   assert.doesNotMatch(done.stdout, /TRIP/,
     `no link was crossed, so there is nothing to report:\n${done.stdout}`);
+});
+
+// --- D1: one work dir per review (docs/design-notes/questions/review-identity-answer.md)
+// A session's reviews used to share one work dir: review 3 opened at "round 7",
+// got no pre-flight, a tapered finder plan, a tier ceiling from an unrelated
+// change, and a converge that said STOP from its first look.
+
+const newReview = (repo, base, intent, extra = []) =>
+  run(repo, ["--new-review", "--work", base, "--intent", intent, "--no-preflight", ...extra]);
+const workLine = (done) => /^work: (.+)$/.exec(done.stdout.split("\n")[0])?.[1];
+
+/** Every file under `dir` with its bytes, so "left untouched" is a comparison. */
+const snapshot = (dir) => Object.fromEntries(
+  readdirSync(dir, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const file = path.join(entry.parentPath, entry.name);
+      return [path.relative(dir, file), readFileSync(file, "utf8")];
+    }));
+
+test("D1: each --new-review allocates its own review dir with its own round 1, and says where", () => {
+  const { repo, work } = fixture();
+  mkdirSync(path.join(work, "ticket"));
+  writeFileSync(path.join(work, "ticket", "verdict.json"), "{}\n");
+
+  const first = newReview(repo, work, path.join(work, "intent.md"));
+  assert.equal(first.status, 0, first.stderr);
+  const one = workLine(first);
+  assert.ok(one && path.isAbsolute(one), `the first stdout line names the review dir:\n${first.stdout}`);
+  assert.equal(realpathSync(one), realpathSync(path.join(work, "review-1")));
+  assert.ok(existsSync(path.join(one, "round-1", "briefs")), "round 1 ran inside it");
+  assert.equal(existsSync(path.join(work, "round-1")), false, "and nothing ran in the base");
+
+  // The base intent belongs to the review that consumed it; review 2 must not
+  // brief its finders against review 1's ticket.
+  assert.equal(readFileSync(path.join(one, "intent.md"), "utf8"), "intent\n");
+  assert.equal(existsSync(path.join(work, "intent.md")), false, "the base intent.md is moved, not copied");
+  assert.ok(existsSync(path.join(one, "ticket", "verdict.json")), "and the ticket's paperwork goes with it");
+  assert.equal(existsSync(path.join(work, "ticket")), false);
+
+  const elsewhere = path.join(mkdtempSync(path.join(tmpdir(), "round-intent-")), "intent.md");
+  writeFileSync(elsewhere, "second intent\n");
+  const second = newReview(repo, work, elsewhere);
+  assert.equal(second.status, 0, second.stderr);
+  const two = workLine(second);
+  assert.equal(realpathSync(two), realpathSync(path.join(work, "review-2")));
+  assert.ok(existsSync(path.join(two, "round-1", "briefs")), "review 2 has a round 1 of its own");
+  assert.equal(readFileSync(path.join(two, "intent.md"), "utf8"), "second intent\n");
+  assert.equal(readFileSync(elsewhere, "utf8"), "second intent\n", "an intent from outside the base is copied and left");
+});
+
+test("D1: a review whose round 1 failed keeps the base intent, so the retry can use it", () => {
+  // The intent moves only once the round it briefs exists: a round refused for
+  // its scope (paperwork, an empty scope) would otherwise strand the ticket in
+  // a review that never ran, and the retry would die on a missing intent.
+  const { repo, work } = fixture();
+  const empty = newReview(repo, work, path.join(work, "intent.md"), ["src/nothing-here.mjs"]);
+  assert.equal(empty.status, 4, empty.stderr);
+  assert.equal(readFileSync(path.join(work, "intent.md"), "utf8"), "intent\n", "the base intent is still there");
+
+  const retry = newReview(repo, work, path.join(work, "intent.md"));
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(existsSync(path.join(work, "intent.md")), false);
+});
+
+test("D1: the allocator takes the next free number and writes nothing into the reviews before it", () => {
+  const { repo, work } = fixture();
+  for (const k of [1, 2]) {
+    mkdirSync(path.join(work, `review-${k}`, "round-1"), { recursive: true });
+    writeFileSync(path.join(work, `review-${k}`, "round-1", "tier.json"), `{"k":${k}}\n`);
+  }
+  const before = snapshot(work);
+  const done = newReview(repo, work, path.join(work, "intent.md"));
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(realpathSync(workLine(done)), realpathSync(path.join(work, "review-3")));
+  for (const k of [1, 2]) {
+    const prefix = `review-${k}${path.sep}`;
+    const kept = (tree) => Object.entries(tree).filter(([file]) => file.startsWith(prefix));
+    assert.deepEqual(kept(snapshot(work)), kept(before), `review-${k} is untouched`);
+  }
+});
+
+test("D1: a review's later rounds are capped by its own round 1, not by an earlier review's", () => {
+  const { repo, work } = fixture();
+  const first = newReview(repo, work, path.join(work, "intent.md"), ["--force", "L", "--reason", "an earlier, bigger change"]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(tierOf(workLine(first), 1).tier, "L");
+
+  const intent = path.join(workLine(first), "intent.md");
+  const second = newReview(repo, work, intent);
+  assert.equal(second.status, 0, second.stderr);
+  const two = workLine(second);
+  assert.equal(tierOf(two, 1).tier, "S");
+
+  mkdirSync(path.join(repo, "test"), { recursive: true });
+  writeFileSync(path.join(repo, "test/cli.test.mjs"), Array.from({ length: 24 }, (_, i) => `// test line ${i}`).join("\n"));
+  const again = run(repo, ["--work", two, "--round", "2", "--intent", intent, "--no-preflight"]);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(tierOf(two, 2).tier, "S", "held at review 2's round 1, not lifted to review 1's L");
+});
+
+test("D1: round numbers are the script's, not the lead's to reuse", () => {
+  const { repo, work } = fixture();
+  const intent = path.join(work, "intent.md");
+  assert.equal(run(repo, ["--work", work, "--round", "1", "--intent", intent, "--no-preflight"]).status, 0,
+    "a fresh dir with --round 1 still works: the evals and the fallback path depend on it");
+
+  const before = snapshot(work);
+  const reused = run(repo, ["--work", work, "--round", "1", "--intent", intent, "--no-preflight"]);
+  assert.equal(reused.status, 2, "a second round 1 in one work dir is a second review");
+  assert.match(reused.stderr, /--new-review/, "and the refusal names the way to start one");
+  assert.deepEqual(snapshot(work), before, "refused before it writes a byte");
+
+  const skipped = run(repo, ["--work", work, "--round", "3", "--intent", intent, "--no-preflight"]);
+  assert.equal(skipped.status, 2, "round 3 needs a round 2");
+  assert.match(skipped.stderr, /round-2\/tier\.json/);
+
+  const both = newReview(repo, work, intent, ["--round", "1"]);
+  assert.equal(both.status, 2, "--new-review is round 1 by definition");
+  assert.equal(existsSync(path.join(work, "review-1")), false, "and a usage error allocates nothing");
+});
+
+// --- D2: the stopping rule's verdict is printed where the next round starts
+// `findings.mjs converge` ran in 7 of 46 measured reviews. round.sh now runs it
+// for the round just finished and prints the verdict above the Agent-call table,
+// with no new obligation and no change to its exit code.
+
+/** A review whose round 1 ran, with `records` recorded per round number. */
+const reviewWithRecords = (records) => {
+  const { repo, work } = fixture();
+  const done = newReview(repo, work, path.join(work, "intent.md"));
+  assert.equal(done.status, 0, done.stderr);
+  const review = workLine(done);
+  for (const [round, entries] of Object.entries(records)) {
+    const rec = spawnSync(process.execPath, [FINDINGS, "record", "--work", review, "--round", round, "--repo", repo],
+      { input: JSON.stringify(entries), encoding: "utf8", cwd: repo });
+    assert.equal(rec.status, 0, rec.stderr);
+  }
+  return { repo, review, intent: path.join(review, "intent.md") };
+};
+const finding = (severity) => ({
+  verdict: "fixed", file: "src/cli.mjs", line: 1, severity, class: "correctness",
+  angle: "A", summary: `a ${severity} finding`, mechanism: "m", proof: "p",
+});
+/** A round-2 plan written by hand, so round 3 can be asked for. */
+const planRound2 = (review, roundsCap) => {
+  mkdirSync(path.join(review, "round-2"), { recursive: true });
+  writeFileSync(path.join(review, "round-2", "tier.json"), JSON.stringify({ tier: "S", round: 2, roundsCap }));
+};
+const verdictAboveTable = (done, pattern) => {
+  assert.equal(done.status, 0, done.stderr);
+  const lines = done.stdout.split("\n");
+  const at = lines.findIndex((line) => pattern.test(line));
+  assert.ok(at >= 0, `the verdict is printed:\n${done.stdout}`);
+  assert.ok(at < lines.findIndex((line) => /^tier /.test(line)), `above the plan:\n${done.stdout}`);
+};
+
+test("D2: round 2 prints converge's verdict on round 1 — CONTINUE", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("major")] });
+  const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge \(round 1\): CONTINUE — round 1 is the first change-round/);
+});
+
+test("D2: round 3 prints converge's verdict on round 2 — ESCALATE on a plateau", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("major")], 2: [finding("major")] });
+  planRound2(review, 6);
+  const done = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge \(round 2\): ESCALATE — /);
+});
+
+test("D2: round 3 prints converge's verdict on round 2 — STOP on a spent budget", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("major"), finding("major")], 2: [finding("minor")] });
+  planRound2(review, 2);
+  const done = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge \(round 2\): STOP — /);
+});
+
+test("D2: with no records for the round just finished, it says W cannot be computed", () => {
+  const { repo, review, intent } = reviewWithRecords({});
+  const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge: no records for round 1 — W cannot be computed$/);
+  assert.doesNotMatch(done.stdout, /CONTINUE|ESCALATE|STOP/, "and no verdict it could not compute");
 });

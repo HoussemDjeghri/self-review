@@ -36,8 +36,9 @@ one, and every per-tier average carried them.
 ## Where it counts
 
 The file form counts only when the Write succeeded, the body parses as a JSON
-object holding the record, and the path is `…/self-review/CONVERGED.json` under
-a scratch prefix — the session scratchpad, `/tmp`, a `mktemp -d`, or
+object holding the record, and the path is `…/self-review/CONVERGED.json` or
+`…/self-review/review-<k>/CONVERGED.json` (the review dir `round.sh --new-review`
+printed) under a scratch prefix — the session scratchpad, `/tmp`, a `mktemp -d`, or
 `~/.claude/self-review/`. A `CONVERGED.json` inside the project is not a marker
 (it would clear the gate while leaving no trace). If `<work>` is a bare
 `mktemp -d`, put the file in a `self-review/` subdirectory of it. The gate

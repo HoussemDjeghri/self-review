@@ -89,6 +89,19 @@ test("no arguments is a usage error that writes nothing", () => {
   assert.equal(existsSync(path.join(logDir, "log.jsonl")), false);
 });
 
+// Sessions reached for `--help` six times in ten days of field use and got
+// "unknown flag" plus the usage — the answer, reported as a failure.
+for (const flag of ["--help", "-h"]) {
+  test(`${flag} prints the usage and succeeds without marking anything`, () => {
+    const logDir = freshLogDir();
+    const result = run([flag], logDir);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /usage: converged\.sh/);
+    assert.doesNotMatch(result.stdout, /CONVERGED/);
+    assert.equal(existsSync(path.join(logDir, "log.jsonl")), false);
+  });
+}
+
 test("every defect is listed in one message — three rejections cost a review", () => {
   const result = run(["--converged", "--rounds", "2of3"], freshLogDir());
   assert.equal(result.status, 2);

@@ -81,6 +81,57 @@ export function afterSubstitution(cmd, i) {
   return i;
 }
 
+// Replaces quoted strings — and bare `$( … )` or backtick bodies, which
+// splitSegments judges on their own — with Q's of the same length, so operators inside them are not
+// read as shell syntax and positions still line up with the raw text. A scanner
+// rather than a regex because a double-quoted string may hold
+// a $( … ) substitution that itself holds quotes — `echo "n: $(jq '…"…"…' f)"`
+// is a common shape, and a regex loses phase at its inner quote, exposing a `>`
+// inside <task-notification> as a redirect.
+export function maskQuotes(cmd) {
+  let out = "";
+  for (let i = 0; i < cmd.length;) {
+    const ch = cmd[i];
+    // A backslash at top level escapes the next character, so neither is shell
+    // syntax — mask both. Without this the scan had no escape awareness at all
+    // and read `\"` as OPENING a quoted region: `echo a\"b | grep "x>y"` lost
+    // phase and exposed the `>` inside the later quoted string as a redirect,
+    // reporting a read-only pipeline as a write. `echo a\>b` was the same hole
+    // one step shorter — an escaped operator read as an operator. The quote fix
+    // below only stopped one way of INJECTING a stray quote; this is the defect
+    // both spellings reached. `afterDoubleQuoted` already handles an escape
+    // inside an open string; top level was the gap.
+    if (ch === "\\" && i + 1 < cmd.length) { out += "QQ"; i += 2; continue; }
+    const end = ch === "'" ? afterSingleQuoted(cmd, i + 1) : ch === '"' ? afterDoubleQuoted(cmd, i + 1)
+      : ch === "`" ? afterBacktick(cmd, i + 1) : ch === "$" && cmd[i + 1] === "(" ? afterSubstitution(cmd, i + 2) : 0;
+    if (end) { out += "Q".repeat(end - i); i = end; }
+    else { out += ch; i++; }
+  }
+  return out;
+}
+
+// The text of the simple command a heredoc's `<<` belongs to. Boundaries are
+// read on the masked line, so a `;` inside a quoted argument is not one, and a
+// redirect's `&` (`2>&1`) is not one either. A heredoc inside a still-open
+// `$(` — `X=$(python3 - <<EOF` — is masked to the end of the line, so its
+// feeder is looked for inside the substitution. The same holds one quote
+// deeper: in `X="$(python3 - <<EOF` the masked run starts at the `"`, and
+// stopping there hid the feeder, so a double quote still open at the end of
+// the line is entered too (its `$(` is live). Only a still-open one: a closed
+// `"…"` right before `<<` (`bash -c "true"<<EOF`) is an argument of the feeder,
+// and entering it lost the feeder. A trailing space swallowed by the mask is
+// how "still open" is read. A single quote is not entered: nothing inside runs.
+const FEEDER_BOUNDARIES = ["(", ";", "&", "|"];
+export function feederLead(line) {
+  const masked = maskQuotes(line);
+  const open = masked.search(/Q*$/);
+  if (line.startsWith("$(", open)) return feederLead(line.slice(open + 2));
+  const stillOpen = maskQuotes(`${line} `).endsWith("Q");
+  if (line[open] === '"' && stillOpen) return feederLead(line.slice(open + 1));
+  const bounds = masked.replace(/[<>]&|&>>?/g, (op) => "R".repeat(op.length));
+  return line.slice(Math.max(...FEEDER_BOUNDARIES.map((c) => bounds.lastIndexOf(c))) + 1);
+}
+
 // The words of a segment, quotes removed but each quoted span kept whole — a
 // sed expression or a path with spaces is one word, not several. Empty spans
 // (`-i ''`) are dropped.

@@ -117,8 +117,9 @@ export const reviewId = (value) => clean(value ?? "", LIMITS.review);
 
 /**
  * The review's identity, derived from the directory the round already lives in
- * rather than retyped: `<session-uuid>/self-review` for the loop's work dir,
- * the last two path components for anything else. DESIGN §4.4 always said the
+ * rather than retyped: `self-review/review-<k>` for the loop's work dir (one
+ * per review, allocated by `round.sh --new-review`), the last two path
+ * components for anything else. DESIGN §4.4 always said the
  * id is "the marker id or the scratch dir name" — this makes the second one
  * structural, so passing the wrong `--work` is visible (the briefs and the
  * scope would be somewhere else too) instead of silently excluding nothing.

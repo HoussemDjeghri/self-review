@@ -496,6 +496,50 @@ test("CLI: converge says the guard proved nothing when no engagement log was ope
   assert.match(opened.stdout, /# tree-guard/, "an open log still gets a line of its own");
 });
 
+// D1 (docs/design-notes/questions/review-identity-answer.md). A session's
+// reviews used to share one work dir, so the third review of a session opened
+// at "round 7": converge compared it against another review's last round, found
+// its budget spent at every round, and said STOP from its first look. Each
+// review now gets `<base>/review-<k>/`, and the identity is that directory.
+const reviewDirs = () => {
+  const base = path.join(workdir(), "scratchpad", "self-review");
+  const [one, two] = ["review-1", "review-2"].map((name) => path.join(base, name));
+  for (const dir of [one, two]) mkdirSync(path.join(dir, "round-1"), { recursive: true });
+  return { one, two };
+};
+
+test("D1: a second review in the same session starts at its own round 1, with its budget unspent", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const { one, two } = reviewDirs();
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  for (let round = 1; round <= 5; round += 1) {
+    run(["record", "--work", one, "--round", String(round), "--log-dir", logDir], JSON.stringify([candidate({ severity: "minor" })]));
+  }
+  run(["record", "--work", two, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate({ severity: "major" })]));
+  writeFileSync(path.join(two, "round-1", "tier.json"), JSON.stringify({ tier: "S", round: 1, roundsCap: 2 }));
+
+  const out = run(["converge", "--work", two, "--round", "1", "--log-dir", logDir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^CONTINUE — round 1 is the first change-round/m, "review 1's five rounds are not review 2's predecessors");
+  assert.doesNotMatch(out.stdout, /budget of \d+ is spent/, "and review 2 has spent none of its own budget");
+});
+
+test("D1: prior for review 2 carries review 1's records; each review hides only its own", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const { one, two } = reviewDirs();
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  assert.notEqual(reviewFromWork(one), reviewFromWork(two), "sibling review dirs are two reviews");
+  run(["record", "--work", one, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()]));
+  const scope = path.join(two, "scope.diff");
+  writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n context\n+added\n");
+  const out = path.join(two, "prior.md");
+
+  run(["prior", "--scope", scope, "--out", out, "--work", two, "--log-dir", logDir]);
+  assert.match(readFileSync(out, "utf8"), /null deref/, "an earlier review of the session is prior work to the next");
+  run(["prior", "--scope", scope, "--out", out, "--work", one, "--log-dir", logDir]);
+  assert.equal(readFileSync(out, "utf8").trim(), "", "and still hidden from the review that recorded it");
+});
+
 test("CLI: converge takes the round cap from tier.json, so forgetting a flag cannot disable it", () => {
   // The cap already existed — tier.mjs computes it and writes `roundsCap` into
   // the round's plan. Requiring it to be retyped as `--budget` meant that

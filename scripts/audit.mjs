@@ -33,7 +33,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { isMain } from "../hooks/lib/config.mjs";
 import { COUNTS, LABELS, OUTCOMES as MARKER_OUTCOMES, fieldsFromFlags, formatSummary, isCounted, validateMarker } from "../hooks/lib/marker.mjs";
-import { words } from "../hooks/lib/shell.mjs";
+import { SHELL_INTERPRETERS, afterPrefixes, commandOf, feederLead, inlineShell, maskQuotes, words } from "../hooks/lib/shell.mjs";
 import { readRecords, reviewFromWork } from "./findings.mjs";
 
 const DEFAULT_PROJECTS = path.join(homedir(), ".claude", "projects");
@@ -42,7 +42,8 @@ const DEFAULT_LOG_DIR = process.env.SELF_REVIEW_LOG_DIR || path.join(homedir(), 
 const MARKER_GRACE_MS = 10 * 60 * 1000;
 // The loop's own files: reading these is the cost of running the review, not of reviewing.
 const TOOLING_PATHS = /scope\.diff|impact\.(md|json)|tier\.json|\/briefs\/|\/state\/|salvage\.mjs|converged\.sh|prior\.md|ledger\.md/;
-const MARKER_FILE = /(^|\/)self-review\/CONVERGED\.json$/;
+// The gate's marker-file shape, plus the optional per-review `review-<k>/` segment.
+const MARKER_FILE = /(^|\/)self-review\/(review-\d+\/)?CONVERGED\.json$/;
 // The vocabulary is the grammar's, imported rather than copied: a third
 // spelling of the same list is how the script, the gate and this referee drift.
 const COUNT_KEYS = COUNTS;
@@ -125,7 +126,23 @@ function usageOf(entries) {
 // record of the agent's name and the subagent type it was spawned as. That is the
 // authority; the brief-text heuristics below are for transcripts written before
 // the sidecar existed, and for reviewers dispatched as `general-purpose`.
-const ROLE_OF_TYPE = { "self-review-finder": "finder", "self-review-verifier": "verifier", "self-review-applier": "applier" };
+//
+// The sidecar's type is matched by its role PREFIX, not looked up whole: an
+// agent launched as a named teammate carries its name as `agentType`
+// (`self-review-finder-r1-abd`), and an exact lookup dropped every one of them
+// — windows reported zero finders. A cold-grader is a finder for angle X
+// (tier.mjs plans it as a finder row), so it is counted as one.
+const ROLE_PREFIX = /^self-review-(finder|cold-grader|verifier|applier)(?:-|$)/;
+const ROLE_OF_PREFIX = { finder: "finder", "cold-grader": "finder", verifier: "verifier", applier: "applier" };
+
+// `self-review:self-review-finder` is the plugin-qualified spelling of the same type.
+function declaredRole(meta) {
+  for (const label of [meta?.customAgentType, meta?.agentType, meta?.name]) {
+    const found = ROLE_PREFIX.exec(String(label ?? "").replace(/^.*:/, ""));
+    if (found) return ROLE_OF_PREFIX[found[1]];
+  }
+  return null;
+}
 
 function metaOf(file) {
   const sidecar = file.replace(/\.jsonl$/, ".meta.json");
@@ -134,17 +151,13 @@ function metaOf(file) {
 }
 
 function roleOf(entries, meta) {
-  const declared = ROLE_OF_TYPE[meta?.customAgentType] ?? ROLE_OF_TYPE[meta?.agentType];
+  const declared = declaredRole(meta);
   if (declared) return declared;
   const first = entries.find((entry) => entry.type === "user");
   const head = textOf(first?.message).slice(0, 1500);
   // A brief handed over as a file pointer ("Read …/round-1/briefs/r1-ab.md")
   // contains no angle text at all, so the path is the transcript's only evidence.
   const pointer = /self-review\/round-\d+\/briefs\//.test(head);
-  // A named agent's type is its name, so the declared map misses every applier
-  // the loop actually launched (`self-review-applier-r2`). The name is the
-  // evidence; its brief is a directives file, not a brief.
-  if (/(^|:)self-review-applier(-|$)/.test(String(meta?.name ?? meta?.agentType ?? ""))) return "applier";
   if (!pointer && !/self-review/i.test(head)) return null;
   if (/\bverif(y|ier)\b/i.test(head) || /\bREFUTED\b/.test(head)) return "verifier";
   if (pointer || /reviewer \d|YOUR ANGLE|round \d/i.test(head)) return "finder";
@@ -434,34 +447,171 @@ const summaryOfFields = (fields) => {
   return record ? formatSummary(record) : null;
 };
 
-// The marker ends a review: converged.sh at command position, or a Write of the
-// scratch CONVERGED.json. Since 0.5.0 both carry the typed record, so both are
+// A marker file's parsed body as a summary: the legacy `{"summary": "…"}` as
+// written, the typed record through the grammar, anything else as a marker
+// with nothing readable in it.
+function summaryOfBody(body) {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return "";
+  if (typeof body.summary === "string") return body.summary;
+  return summaryOfFields(body);
+}
+
+// ── Reading a Bash command for the marker ──────────────────────────────────
+// The gate answers the same question with private helpers
+// (self-review-gate.mjs: separateHeredocs, substitutionBodies, splitSegments).
+// Only maskQuotes and feederLead are shared (lib/shell.mjs). Moving the rest is
+// deferred to its own change (docs/design-notes/questions/
+// shared-segmenter-answer.md). For audit, that move changes behaviour. It is
+// not a pure refactor, because the copies differ:
+// - The gate's splitSegments is a hand-written quote scanner that also
+//   recurses into `$( )` and backtick bodies. This one splits on the
+//   maskQuotes output and never looks inside a substitution, so a marker at
+//   a substitution head is not counted. Measured 2026-09-18: no such marker
+//   in any transcript.
+// - The gate's interpreter list also has osascript.
+// When the move lands, re-run the audit over the same corpus and diff the
+// counts.
+// One difference is deliberate: the gate compares the script against THIS
+// install's absolute path. A transcript was written by whatever install ran
+// it, so the audit matches the script's basename.
+
+const MARKER_SCRIPT = "converged.sh";
+const INTERPRETER = /^(python[\d.]*|node|deno|bun|ruby|perl|php|bash|sh|zsh)$/;
+const HEREDOC = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
+// The marker path as it appears inside a script's source, not as a whole word.
+const MARKER_PATH_IN_TEXT = /self-review\/(review-\d+\/)?CONVERGED\.json/;
+// `.write(` alone is not here: `sys.stdout.write(open(p).read())` only reads.
+const WRITE_CALL = /write_text|writeFileSync|writeFile\b|open\([^)]*['"][wa]/;
+
+// Heredoc bodies leave the shell text: a body is data (a commit message that
+// mentions converged.sh is not an invocation) unless it feeds an interpreter,
+// in which case it is kept as that interpreter's script.
+// The feeder is the simple command the `<<` belongs to: `cd x; python3 - <<EOF`
+// feeds python3, as the gate reads it — through the same shared `feederLead`.
+function separateHeredocs(command) {
+  const scripts = [];
+  const text = command.replace(/\r\n?/g, "\n");
+  const shell = text.replace(HEREDOC, (whole, _quote, _word, offset) => {
+    const head = whole.slice(0, whole.indexOf("\n"));
+    const line = text.slice(text.lastIndexOf("\n", offset - 1) + 1, offset);
+    const interpreter = commandOf(words(feederLead(line))).match(INTERPRETER)?.[1];
+    if (interpreter) scripts.push({ interpreter, body: whole.slice(head.length + 1, whole.lastIndexOf("\n")) });
+    return head;
+  });
+  return { shell, scripts };
+}
+
+// Simple commands: split at newline, `;`, `|` and `&` outside quotes.
+function splitSegments(text) {
+  const masked = maskQuotes(text);
+  const segments = [];
+  let start = 0;
+  for (let i = 0; i <= masked.length; i++) {
+    if (i < masked.length && !/[\n;|&]/.test(masked[i])) continue;
+    segments.push(text.slice(start, i).trim());
+    start = i + 1;
+  }
+  return segments.filter(Boolean);
+}
+
+// The segments a command runs as shell: its own, and those of a heredoc fed to a shell.
+function shellSegments(command) {
+  const { shell, scripts } = separateHeredocs(command);
+  const texts = [shell, ...scripts.filter((s) => SHELL_INTERPRETERS.has(s.interpreter)).map((s) => s.body)];
+  return { segments: texts.flatMap(splitSegments), scripts };
+}
+
+// The script's arguments when the segment runs converged.sh at command
+// position — through prefixes, `bash script`, or `bash -c "…"` — else null.
+// Tokenising the whole segment, not the text after the name, is what keeps
+// a quoted path's closing quote out of the first argument.
+function scriptArgs(segment) {
+  const ws = words(segment);
+  const inline = inlineShell(ws);
+  if (inline !== null) return invocationArgs(inline);
+  let at = afterPrefixes(ws);
+  if (SHELL_INTERPRETERS.has(ws[at])) at++;
+  return path.basename(ws[at] ?? "") === MARKER_SCRIPT ? ws.slice(at + 1) : null;
+}
+
+function invocationArgs(command) {
+  for (const segment of shellSegments(command).segments) {
+    const args = scriptArgs(segment);
+    if (args) return args;
+  }
+  return null;
+}
+
+// Whether the segment sends output to a marker path: a `>`/`>>` redirect
+// outside quotes, or `tee` naming it.
+function redirectsToMarker(segment) {
+  const masked = maskQuotes(segment);
+  for (const found of masked.matchAll(/>>?\|?/g)) {
+    if (MARKER_FILE.test(words(segment.slice(found.index + found[0].length))[0] ?? "")) return true;
+  }
+  const ws = words(segment);
+  const at = afterPrefixes(ws);
+  return ws[at] === "tee" && ws.slice(at + 1).some((word) => MARKER_FILE.test(word));
+}
+
+// A non-shell interpreter whose source names the marker path and writes a file.
+const scriptWritesMarker = (source) => MARKER_PATH_IN_TEXT.test(source) && WRITE_CALL.test(source);
+
+function writesMarkerFile(command) {
+  const { segments, scripts } = shellSegments(command);
+  if (segments.some(redirectsToMarker)) return true;
+  if (scripts.some((s) => !SHELL_INTERPRETERS.has(s.interpreter) && scriptWritesMarker(s.body))) return true;
+  return segments.some((segment) => {
+    const word = commandOf(words(segment));
+    return INTERPRETER.test(word) && !SHELL_INTERPRETERS.has(word) && scriptWritesMarker(segment);
+  });
+}
+
+// The body a Bash-written marker carried: the last JSON object in the command
+// text, wherever it sits (a heredoc, an echo argument, a Python literal).
+// String literals are skipped whole, so a brace inside one never counts.
+function lastJsonObject(text) {
+  let last = null;
+  for (let open = text.indexOf("{"); open !== -1; open = text.indexOf("{", open + 1)) {
+    for (let depth = 0, i = open; i < text.length; i++) {
+      if (text[i] === '"') while (++i < text.length && text[i] !== '"') if (text[i] === "\\") i++;
+      depth += text[i] === "{" ? 1 : text[i] === "}" ? -1 : 0;
+      if (depth > 0) continue;
+      try { last = JSON.parse(text.slice(open, i + 1)); } catch { /* not JSON: try the next brace */ }
+      break;
+    }
+  }
+  return last;
+}
+
+// The marker ends a review: converged.sh at command position, or a write of
+// the scratch CONVERGED.json — by the Write tool or by Bash (`cat > … <<EOF`,
+// a Python `write_text`). Since 0.5.0 all carry the typed record, so all are
 // read through the shared grammar — the script's flags and the file's fields
 // are the same record in two spellings. The legacy shapes stay readable
 // because old transcripts are the whole reason this script has legacy rules:
 // one hand-typed summary string, quoted after the script name or under
-// `summary` in the JSON.
+// `summary` in the JSON. A command that only MENTIONS the script or the path
+// (a commit message, a grep, a `cat` of the file) is not a marker.
 function markerOf(entry) {
   for (const use of toolUses(entry)) {
-    if (use.name === "Bash" && /converged\.sh/.test(use.input?.command ?? "")) {
-      const command = use.input.command;
-      const tail = command.slice(command.indexOf("converged.sh") + "converged.sh".length);
-      // `words` is the tokenizer the gate already reads commands with: a quoted
-      // span stays one word, so the legacy summary survives either spelling.
-      const argv = words(tail);
-      if (!argv.length) return "";
-      // The legacy form is one hand-typed summary, and the old script took it
-      // unquoted just as happily (`summary="$*"`). A leading flag is the only
-      // thing that makes this the typed record.
-      if (!argv[0].startsWith("--")) return argv.join(" ");
-      return summaryOfFields(fieldsFromFlags(argv).fields);
+    if (use.name === "Bash") {
+      const command = use.input?.command ?? "";
+      const argv = invocationArgs(command);
+      if (argv) {
+        if (!argv.length) return "";
+        // The legacy form is one hand-typed summary, and the old script took it
+        // unquoted just as happily (`summary="$*"`). A leading flag is the only
+        // thing that makes this the typed record.
+        if (!argv[0].startsWith("--")) return argv.join(" ");
+        return summaryOfFields(fieldsFromFlags(argv).fields);
+      }
+      if (writesMarkerFile(command)) return summaryOfBody(lastJsonObject(command));
     }
     if (use.name === "Write" && MARKER_FILE.test(use.input?.file_path ?? "")) {
       let body;
       try { body = JSON.parse(use.input.content ?? ""); } catch { return ""; }
-      if (body === null || typeof body !== "object" || Array.isArray(body)) return "";
-      if (typeof body.summary === "string") return body.summary;
-      return summaryOfFields(body);
+      return summaryOfBody(body);
     }
   }
   return null;

@@ -34,12 +34,12 @@ clause was not a decision.
 
 ## 1 · Write the ticket
 
-The ticket **is** the INTENT block, at `<work>/intent.md` — the file the
+The ticket **is** the INTENT block, at `<reviews>/intent.md` — the file the
 self-review skill's §0 otherwise writes, and every brief carries. There is no
 second file on purpose: two would drift, and the finders would review against
 whichever one got copied.
 
-`<work>` is `<scratchpad>/self-review/` — the session scratchpad from your
+`<reviews>` is `<scratchpad>/self-review/` — the session scratchpad from your
 system prompt, else `mktemp -d` — outside the repository, for the loop's own
 reason (§0). Fill the template from
 `${CLAUDE_PLUGIN_ROOT}/skills/self-review/references/briefs.md`, "The intent
@@ -56,14 +56,14 @@ recognises, the name is what `wait.mjs` finds the transcript by, and both
 spellings keep it under tree-guard. Its prompt carries three things and
 nothing else:
 
-- the absolute path to `<work>/intent.md`
+- the absolute path to `<reviews>/intent.md`
 - the user's request, verbatim — the thing the ticket claims to serve
 - the repository root, so it can grep the premise
 
 Then, as the very next call with nothing in between, Bash `timeout` `600000`:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/wait.mjs" --work <work>/ticket --round 1 <name> \
+"${CLAUDE_PLUGIN_ROOT}/scripts/wait.mjs" --work <reviews>/ticket --round 1 <name> \
   && "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id> <name>
 ```
 
@@ -71,7 +71,7 @@ Then, as the very next call with nothing in between, Bash `timeout` `600000`:
 longer active; `salvage.mjs` then prints its last message, which is the report
 — nothing else carries it (2026-09-03: three reviewers reported through
 SendMessage with `success:true` and nothing arrived for 2h49m). The session id
-is the UUID in your scratchpad path; a `<work>` outside the scratchpad needs
+is the UUID in your scratchpad path; a `<reviews>` outside the scratchpad needs
 `--session <id>` on `wait.mjs`. The ticket waits in a directory of its own
 because `wait.mjs` keeps its state under `round-<n>/` and numbers from 1, and
 the ticket is not round 1 of anything. Exit 1 means call it again, now; exit 3
@@ -89,7 +89,7 @@ recorded as `author` with a `--note` saying who read it.
 ## 3 · Act on the verdict
 
 - **`sound`** — build it.
-- **`revise`** — overwrite `<work>/intent.md` with the `intent` block the
+- **`revise`** — overwrite `<reviews>/intent.md` with the `intent` block the
   validator returned, in full, and build against that. The finders review the
   file `round.sh` is given, so the corrected block has to be that file; your
   version is not lost — it sits in the validator's transcript beside its
@@ -107,8 +107,10 @@ recorded as `author` with a `--note` saying who read it.
 
 ## 4 · At the end of the task
 
-The self-review skill's §0 finds `<work>/intent.md` already written and runs
-`round.sh --intent <work>/intent.md` against it — do not write a second block.
+The self-review skill's §0 finds `<reviews>/intent.md` already written and runs
+`round.sh --new-review --work <reviews> --intent <reviews>/intent.md`, which moves
+`intent.md` and `ticket/` into the review dir it allocates — do not write a
+second block.
 The marker then says who read the ticket, in either form the self-review skill's §4 gives:
 
 ```bash

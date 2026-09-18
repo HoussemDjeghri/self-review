@@ -47,6 +47,7 @@ function log(record, summary) {
 
 const argv = process.argv.slice(2);
 if (argv.length === 0) die(["a marker needs an outcome."]);
+if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { console.log(USAGE); process.exit(0); }
 
 const { fields, problems: argProblems } = fieldsFromFlags(argv);
 const { record, problems } = validateMarker(fields);
