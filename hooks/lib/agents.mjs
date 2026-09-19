@@ -2,6 +2,8 @@
 //
 // Two scripts need this and they used to disagree. `salvage.mjs` recovers a
 // dead reviewer's work; `wait.mjs` blocks until a round's reviewers are done.
+// The Stop gate reads it too, to date a reviewer's completion when the
+// harness's notice arrives after the marker — see settleFromTranscripts.
 // Both answer the same question — is this agent finished, stalled, dead or
 // still going — from the same file, so the answer lives here once.
 //
@@ -109,6 +111,10 @@ export function readAgent(file) {
     // When this agent's first message was written, so a caller can tell a
     // re-spawn from the attempt it replaced: both carry the same name.
     startedMs: Date.parse(entries[0]?.timestamp ?? "") || 0,
+    // When its last entry was written — the moment a report was finished, when
+    // `endsWithReport` holds. NaN, not 0, without a timestamp: the Stop gate
+    // compares it against a marker, and 0 would read as "long before".
+    lastMs: Date.parse(last?.timestamp ?? ""),
   };
 }
 
@@ -144,6 +150,14 @@ export function agentStatus(agent, now, config = {}) {
 // that decides, and the caller has it once it reads the file. An exact
 // `<name>-<hash>` match outranks a longer stem that merely starts with the name,
 // which is another agent the harness renamed off a collision.
+// `agent-a<name>-<hex>.jsonl` is `name`'s own transcript; a longer stem that
+// starts the same way belongs to another agent.
+export function isOwnTranscript(file, name) {
+  const prefix = `agent-a${name}-`;
+  const stem = path.basename(file, ".jsonl");
+  return stem.startsWith(prefix) && /^[0-9a-f]+$/.test(stem.slice(prefix.length));
+}
+
 export function findAgentFiles(dir, name, sinceMs = 0) {
   if (!existsSync(dir) || !statSync(dir).isDirectory()) return [];
   const prefix = `agent-a${name}-`;
@@ -153,11 +167,10 @@ export function findAgentFiles(dir, name, sinceMs = 0) {
   // rank rather than exclude: an exact match wins if one exists, and the
   // renamed transcript still answers when it does not. No regex escaping: the
   // remainder is tested, not the name.
-  const isExact = (file) => /^[0-9a-f]+$/.test(path.basename(file, ".jsonl").slice(prefix.length));
   return readdirSync(dir)
     .filter((f) => f.startsWith(prefix) && f.endsWith(".jsonl"))
     .map((f) => path.join(dir, f))
-    .map((f) => [f, statSync(f).mtimeMs, isExact(f) ? 0 : 1])
+    .map((f) => [f, statSync(f).mtimeMs, isOwnTranscript(f, name) ? 0 : 1])
     .filter(([, mtime]) => mtime >= sinceMs)
     .sort((a, b) => a[2] - b[2] || b[1] - a[1])
     .map(([f]) => f);

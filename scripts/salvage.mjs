@@ -7,7 +7,7 @@
 // already paid for, and a finished agent's report is sitting in its last
 // message — so the lead salvages before re-spawning anything. Read-only.
 //
-// The three-way verdict is `scripts/lib/agents.mjs`'s, shared with wait.mjs so
+// The three-way verdict is `hooks/lib/agents.mjs`'s, shared with wait.mjs so
 // the two cannot disagree about what "finished" means. This script used to
 // decide it alone and require `stop_reason: "end_turn"`, which only 16 of 119
 // transcripts sampled on 2026-09-03 carried: it called roughly three finished
@@ -20,7 +20,7 @@
 //   --all-text  print every text block instead (an unfinished agent's interim notes)
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { agentStatus, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
+import { agentStatus, readAgent, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
 import { isMain, loadConfig } from "../hooks/lib/config.mjs";
 import { gitRoot } from "./lib/repo.mjs";
 

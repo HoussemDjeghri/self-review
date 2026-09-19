@@ -33,7 +33,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isMain, loadConfig } from "../hooks/lib/config.mjs";
-import { agentStatus, findAgentFiles, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
+import { agentStatus, findAgentFiles, readAgent, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
 import { gitRoot } from "./lib/repo.mjs";
 
 const POLL_MS = 5000;

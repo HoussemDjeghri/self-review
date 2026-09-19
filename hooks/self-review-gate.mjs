@@ -111,13 +111,14 @@
  * A gate must never break the session: every failure path is a silent exit 0.
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
 import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, skillName } from "./lib/config.mjs";
 import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
+import { findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
@@ -906,6 +907,7 @@ function scanAgents(entries, results) {
     const resumes = own.filter((e) => e.resume);
     const interjections = humanAt.filter((i) => i > at).length;
     agents.push({
+      id: agentId,
       type: typeOf.get(agentId) ?? "",
       name: nameOf.get(agentId) ?? "",
       launchedAt: at,
@@ -924,6 +926,62 @@ function scanAgents(entries, results) {
     });
   }
   return agents;
+}
+
+// ---------- a notice that lands after the marker ----------
+//
+// `doneAt` is where the harness DELIVERED an agent's completion notice, and the
+// skill tells the lead not to wait on those: wait.mjs reads the reviewer's own
+// transcript, and on 2026-09-03 notices trailed finished transcripts by 2h49m.
+// So a lead that followed the skill exactly could read a report, write the
+// marker, and be refused — "late" for a finder, "none" for a verifier — because
+// the notice came afterwards, with an identical re-mark as the only way out.
+//
+// Consulted only when the notice-based answer would not pass, so every verdict
+// that passes today is untouched. For each reviewer or verifier with no
+// completion before the marker, its own transcript — harness-written, like the
+// notice — is read; if it ends in a report timestamped before the marker, the
+// completion moves to the first lead entry at or after that time, and the
+// ordering rules (fresh, vouches, the verifier window) judge it exactly as they
+// judge a notice. Ruled C by a Fable subagent on 2026-09-19, after the draft
+// existed (ask.sh was refused): docs/design-notes/questions/late-notice-answer.md.
+//
+// KNOWN LIMIT: the transcript proves the report existed before the marker, not
+// that the lead read it — which is also all a delivered notice ever proved.
+function settleFromTranscripts(agents, entries, markerAt, transcriptPath) {
+  const msOf = (entry) => Date.parse(entry?.timestamp ?? "");
+  const markerMs = msOf(entries[markerAt]);
+  const dir = resolveSubagentsDir(transcriptPath);
+  return agents.map((a) => {
+    const unsettled = a.doneAt === -1 || a.doneAt > markerAt;
+    if (!unsettled || !(REVIEWER_TYPES.test(a.type) || isVerifier(a))) return a;
+    const finishedMs = reportFinishedMs(a, dir, msOf(entries[a.launchedAt]));
+    if (!(finishedMs < markerMs)) return a;
+    const doneAt = entries.findIndex((e, i) => i > a.launchedAt && msOf(e) >= finishedMs);
+    return doneAt !== -1 && doneAt < markerAt ? { ...a, doneAt, pending: false } : a;
+  });
+}
+
+// When this agent's own transcript says it finished its report, or NaN when it
+// does not say so: no transcript, only an earlier launch's under the same name,
+// or a last entry that is not a report. A named agent's file carries the name
+// the harness GAVE it — the launch's `name` gains a `-2` on a collision, and the
+// id (`<name>@session-…`) is what carries the result — and only its exact
+// `<name>-<hex>` file counts: a longer stem is another agent. An unnamed agent's
+// file carries its id, which is checked for shape before it becomes a path.
+function reportFinishedMs(agent, dir, launchMs) {
+  const [given, session] = agent.id.split("@");
+  const files = session !== undefined
+    ? findAgentFiles(dir, given, launchMs).filter((file) => isOwnTranscript(file, given))
+    : [path.join(dir, `agent-${agent.id}.jsonl`)].filter((file) => /^[\w-]+$/.test(agent.id) && existsSync(file));
+  for (const file of files) {
+    let read;
+    // Unreadable is no evidence, and no evidence leaves the refusal standing;
+    // letting it throw would fail the hook open, which releases the turn.
+    try { read = readAgent(file); } catch { continue; }
+    if (read.startedMs >= launchMs) return read.endsWithReport ? read.lastMs : NaN;
+  }
+  return NaN;
 }
 
 // ---------- did an independent reader exist? ----------
@@ -1299,7 +1357,7 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
 
 // ---------- decision ----------
 
-function evaluate(entries, cwd) {
+function evaluate(entries, cwd, transcriptPath) {
   const lastMessage = [...entries].reverse().find((e) => e.type === "user" || e.type === "assistant");
   if (!lastMessage || isInterrupt(lastMessage)) return null;
 
@@ -1449,9 +1507,15 @@ function evaluate(entries, cwd) {
     // is the applier-aware change point, so `converged` after an applier needs
     // a finder that completed after the APPLIER finished, not merely after the
     // lead's own last edit.
-    const state = outcome === "converged"
+    // Read only when the notices alone would not pass — see settleFromTranscripts.
+    let settled;
+    const settledAgents = () => (settled ??= settleFromTranscripts(agents, entries, markerAtW, transcriptPath));
+    let state = outcome === "converged"
       ? reviewerState(agents, externalChangeAt, changeAtW, markerAtW, prevMarkerAt)
       : "ok";
+    if (state !== "ok" && state !== "applying") {
+      state = reviewerState(settledAgents(), externalChangeAt, changeAtW, markerAtW, prevMarkerAt);
+    }
     // A reviewer still working is not a missing one, and this loop waits by
     // ending turns: release, exactly as the pending branch below does.
     if (state === "running") {
@@ -1479,7 +1543,8 @@ function evaluate(entries, cwd) {
         decision: "block",
         reason: unreviewedReason(state, inFrame, changeAtW, cwd, {
           hasOrchestrator: orchestrators.length > 0,
-          midFlight: agents.some((a) => REVIEWER_TYPES.test(a.type) && a.launchedAt <= changeAtW && a.doneAt > changeAtW),
+          // The agents the state was judged on: settled ones when the transcripts were read.
+          midFlight: (settled ?? agents).some((a) => REVIEWER_TYPES.test(a.type) && a.launchedAt <= changeAtW && a.doneAt > changeAtW),
         }),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
       };
@@ -1492,7 +1557,8 @@ function evaluate(entries, cwd) {
     // all is told to review before it is told who should rule on the verdicts.
     const need = outcome === "converged" ? verifierNeed(counts) : null;
     if (need) {
-      const verified = verifierState(agents, prevMarkerAt, markerAtW);
+      let verified = verifierState(agents, prevMarkerAt, markerAtW);
+      if (verified !== "ok") verified = verifierState(settledAgents(), prevMarkerAt, markerAtW);
       // Same release as the reviewer branch, same reason: this loop waits by
       // ending turns, and a verifier still working is not a missing one.
       if (verified === "running") {
@@ -1712,5 +1778,5 @@ function rejectionReason(problems) {
 
 runHook("SELF_REVIEW_GATE", "self-review-gate", (payload) => {
   if (typeof payload.transcript_path !== "string") return null;
-  return evaluate(readMainChain(payload.transcript_path), payload.cwd ?? process.cwd());
+  return evaluate(readMainChain(payload.transcript_path), payload.cwd ?? process.cwd(), payload.transcript_path);
 });

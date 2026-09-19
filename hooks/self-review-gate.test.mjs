@@ -94,10 +94,17 @@ function agent(toolStats) {
     toolResult(id, "done", { agentId: "a1", agentType: "general-purpose", status: "completed", toolStats })];
 }
 
-function run(entries, { env = {}, payload = {}, gate = GATE } = {}) {
+// `subagents` maps a transcript file name to its entries, laid out where the
+// harness writes them: beside the lead's transcript, under <stem>/subagents/.
+function run(entries, { env = {}, payload = {}, gate = GATE, subagents = {} } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "srg-"));
   const transcript = path.join(dir, "t.jsonl");
-  writeFileSync(transcript, entries.flat().map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("\n") + "\n");
+  const jsonl = (list) => list.flat().map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("\n") + "\n";
+  writeFileSync(transcript, jsonl(entries));
+  for (const [file, list] of Object.entries(subagents)) {
+    mkdirSync(path.join(dir, "t", "subagents"), { recursive: true });
+    writeFileSync(path.join(dir, "t", "subagents", file), jsonl(list));
+  }
   // Every run gets its own log dir. The gate APPENDS its marker log there, so
   // the default one is the developer's real `~/.claude/self-review/log.jsonl`
   // and a shared one lets cases read each other's lines.
@@ -890,6 +897,79 @@ test("a reviewer that completed AFTER the marker asks only for a re-mark, not fo
   assert.match(r.json.reason, /only AFTER the marker was written/);
   assert.match(r.json.reason, /Do not launch another one/);
   assert.doesNotMatch(r.json.reason, /launch one self-review-finder/);
+});
+
+// A notice is the harness's courtesy, and the skill tells the lead to wait on the
+// reviewer's own transcript instead (wait.mjs). So a notice delivered after the
+// marker does not make a review that finished before it late: the transcript's
+// report, timestamped before the marker, is the completion.
+const subagentReport = () => ({
+  type: "assistant", timestamp: stamp(),
+  message: { role: "assistant", stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 }, content: [{ type: "text", text: "[]" }] },
+});
+
+test("a reviewer whose transcript finished before the marker is not late because its notice came after", () => {
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("rvRead"), said("reading its report")];
+  const finished = subagentReport();
+  const tail = [...bash("wait.mjs --work w --round 1", "rvRead  finished"), ...marker(), notification("rvRead"), said("done")];
+  const r = run([...head, ...tail], { subagents: { "agent-rvRead.jsonl": [finished] } });
+  assert.equal(r.json, null, JSON.stringify(r.json));
+});
+
+test("a reviewer whose transcript finished only after the marker is still late", () => {
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("rvAfter"), said("waiting"), ...marker()];
+  const finished = subagentReport();
+  const r = run([...head, notification("rvAfter"), said("done")], { subagents: { "agent-rvAfter.jsonl": [finished] } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /only AFTER the marker was written/);
+});
+
+test("a transcript that finished before the marker does not let a reviewer vouch for a change it was launched before", () => {
+  const head = [human("go"), ...launch("rvOld"), said("reviewing"), ...write(`${PROJECT}/src/a.ts`)];
+  const finished = subagentReport();
+  const r = run([...head, ...bash("wait.mjs --work w --round 1", "rvOld  finished"), ...marker(), notification("rvOld"), said("done")],
+    { subagents: { "agent-rvOld.jsonl": [finished] } });
+  assert.ok(blocks(r));
+  // No notice at all yet: the transcript alone places it mid-flight, and the
+  // refusal says so rather than "landed after it finished".
+  const unnoticed = run([...head, ...bash("wait.mjs --work w --round 1", "rvOld  finished"), ...marker(), said("done")],
+    { subagents: { "agent-rvOld.jsonl": [finished] } });
+  assert.match(unnoticed.json?.reason ?? "", /never saw/);
+});
+
+test("a transcript that is no evidence leaves the refusal standing: no timestamp, or an earlier attempt's", () => {
+  const stale = subagentReport(); // written before this launch: a previous attempt under the same id
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("rvNone"), said("reading its report")];
+  const undated = { ...subagentReport(), timestamp: undefined };
+  const tail = [...bash("wait.mjs --work w --round 1", "rvNone  finished"), ...marker(), notification("rvNone"), said("done")];
+  for (const report of [undated, stale]) {
+    const r = run([...head, ...tail], { subagents: { "agent-rvNone.jsonl": [report] } });
+    assert.match(r.json?.reason ?? "", /only AFTER the marker was written/, JSON.stringify(report));
+  }
+});
+
+test("a named verifier whose transcript finished before the marker satisfies a dismissal", () => {
+  const name = "self-review-verifier-r1-b1";
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name }, SPAWNED(name)), said("reading its verdicts")];
+  const finished = subagentReport();
+  const tail = [...bash("wait.mjs --work w --round 1", `${name}  finished`), ...writeMarker({ ...CONVERGED_RECORD, fixed: 1, dismissed: 1 }), idle(name), said("done")];
+  const file = `agent-a${name}-0123456789abcdef.jsonl`;
+  assert.equal(run([...head, ...tail], { subagents: { [file]: [finished] } }).json, null);
+  // Without the transcript the notice alone is after the marker: refused.
+  assert.match(run([...head, ...tail]).json.reason, /no self-review-verifier completed/);
+});
+
+test("a renamed verifier is found by the name the harness gave it, and never by another agent's longer name", () => {
+  const asked = "self-review-verifier-r1-b1";
+  const given = `${asked}-2`; // the harness's rename on a collision; the idle notice and the file carry it
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name: asked }, SPAWNED(given)), said("reading its verdicts")];
+  const finished = subagentReport();
+  const tail = [...bash("wait.mjs --work w --round 1", `${given}  finished`), ...writeMarker({ ...CONVERGED_RECORD, fixed: 1, dismissed: 1 }), idle(given), said("done")];
+  assert.equal(run([...head, ...tail], { subagents: { [`agent-a${given}-0123456789abcdef.jsonl`]: [finished] } }).json, null);
+  const other = run([...head, ...tail], { subagents: { [`agent-a${given}-3-0123456789abcdef.jsonl`]: [finished] } });
+  assert.match(other.json?.reason ?? "", /no self-review-verifier completed/);
 });
 
 // A finder's scope is frozen when it is LAUNCHED, so completing after a change

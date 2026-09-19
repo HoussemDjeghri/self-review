@@ -103,8 +103,8 @@ export function noteEngagement(repoRoot, agentType, matched, { session = null, l
 // A name this plugin generated, asked INDEPENDENTLY of the regex under audit.
 // `tier.mjs` emits `<agent-type>-r<round>-<angles>` and a spawn with no name
 // sends the registered type, so both begin with the agent's own type — that
-// prefix is the claim, and whether tree-guard's REVIEWER matched it is the
-// measurement. Deliberately not tree-guard's regex: a check written in the
+// prefix is the claim, and whether tree-guard's REVIEWER or SHELL_LESS matched it
+// is the measurement. Deliberately not tree-guard's regex: a check written in the
 // terms of the thing it checks passes whenever that thing is consistent with
 // itself, which is exactly the failure being audited. Every name here is one
 // tree-guard is meant to cover — since 0.8.2 that includes the applier — so an

@@ -1,4 +1,4 @@
-// Run: node --test plugin/scripts/lib/agents.test.mjs   (or ./test.sh for everything)
+// Run: node --test plugin/hooks/lib/agents.test.mjs   (or ./test.sh for everything)
 //
 // The status predicate is the whole reason wait.mjs is safe to block on, and
 // every case below is one that was got wrong in the field: `end_turn` treated
@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { agentStatus, findAgentFiles, readAgent } from "./agents.mjs";
+import { agentStatus, findAgentFiles, isOwnTranscript, readAgent } from "./agents.mjs";
 
 const CONFIG = { settleSeconds: 60, staleSeconds: 660 };
 let seq = 0;
@@ -208,4 +208,14 @@ test("an API-error shape this plugin has not measured is `unknown`, never assume
     apiError("Request throttled by the upstream gateway", { status: "throttled" })]);
   assert.equal(at(agent, 0), "stalled");
   assert.equal(agent.apiError.kind, "unknown");
+});
+
+test("a transcript is an agent's own only at its exact <name>-<hex> stem, and lastMs is when its last entry was written", () => {
+  assert.equal(isOwnTranscript("/d/agent-afinder-r1-0123abcd.jsonl", "finder-r1"), true);
+  assert.equal(isOwnTranscript("/d/agent-afinder-r1-2-0123abcd.jsonl", "finder-r1"), false, "a renamed sibling");
+  assert.equal(isOwnTranscript("/d/agent-afinder-r1-2-0123abcd.jsonl", "finder-r1-2"), true);
+  const last = said([text("[]")], "end_turn");
+  assert.equal(transcript("dated", [said([uses("Read")]), toolResult(), last]).lastMs, Date.parse(last.timestamp));
+  assert.ok(Number.isNaN(transcript("undated", [{ ...said([text("[]")]), timestamp: undefined }]).lastMs),
+    "no timestamp is no time, not the epoch");
 });
