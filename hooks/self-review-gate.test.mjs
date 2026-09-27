@@ -2713,8 +2713,11 @@ test("#11: a variable set in two branches is unknown, not whichever assignment i
   const r = run(turn(bash(`if true; then X=${PROJECT}/f.mjs; else X=/private/tmp/scratch.txt; fi; printf x > "$X"`, "")));
   assert.ok(blocks(r), "the nearer assignment is scratch, but the other branch writes code");
   assert.match(r.json.reason, /could not determine which files/);
-  assert.equal(run(turn(bash(`f=/private/tmp/a.md; printf x > "$f"; f=/private/tmp/b.md; printf y > "$f"`, ""))).stdout, "",
-    "a name reassigned after it was read still resolves each read");
+  const guarded = run(turn(bash(`X=${PROJECT}/real.mjs; if [ -z "$X" ]; then X=/private/tmp/scratch.txt; fi; printf x > "$X"`, "")));
+  assert.ok(blocks(guarded), "a read in the guard is not a use: the default idiom stays unknown");
+  assert.match(guarded.json.reason, /could not determine which files/);
+  assert.equal(run(turn(bash(`f=/private/tmp/a.md; printf x > "$f"`, ""))).stdout, "",
+    "a name assigned once still resolves");
 });
 
 test("#11: a patch applied from a temp file is an unknown write, not the temp file", () => {

@@ -12,8 +12,9 @@
  * WHAT COUNTS AS A CHANGE (all from the transcript, main chain only):
  *   - Write / Edit / MultiEdit / NotebookEdit tool calls, by file_path
  *   - Bash commands that write files: redirects (not /dev/null or fd dups),
- *     sed -i, tee, cp/mv/rm/ln/patch/rsync at command position, git rm/mv/
- *     apply, package-manager add/remove, and scripted writes (python open(w),
+ *     sed -i, tee, cp/mv/rm/ln/rsync at command position, git rm/mv,
+ *     patch and git apply/am (targets unknown: the operand is the patch read),
+ *     package-manager add/remove, and scripted writes (python open(w),
  *     fs.writeFile...). Heredoc bodies and quoted strings are masked first, so
  *     `grep ">"` and a Python body with `a > b` do not trigger. Heuristic by
  *     nature — the dedicated tools are the precise signal.
@@ -360,14 +361,14 @@ const REFERENCE = /\$\{?([A-Za-z_]\w*)\}?/g;
 
 function expandLocalAssignments(cmd) {
   const assignments = [];
-  const reads = [...cmd.matchAll(REFERENCE)].map((m) => ({ name: m[1], at: m.index }));
-  // The assignment a reference sees, or null. Two assignments with no read
-  // between (`then X=a; else X=b; fi`) leave which one ran out of the text, so
-  // the reference stays unknown rather than taking the nearer one on faith.
+  // The assignment a reference sees, or null. A name assigned more than once
+  // before it may have taken either value: `then X=a; else X=b; fi`, and the
+  // default idiom `X=a; [ -z "$X" ] && X=b`, whose read between the two is a
+  // guard, not a use. Which one ran is not in the text, so the reference stays
+  // unknown rather than taking the nearer one on faith.
   const valueAt = (name, at) => {
-    const lastRead = reads.findLast((r) => r.name === name && r.at < at)?.at ?? -1;
     const made = assignments.filter((a) => a.name === name && a.at < at);
-    if (made.filter((a) => a.at > lastRead).length > 1) return null;
+    if (made.length > 1) return null;
     const latest = made.at(-1);
     return latest && !latest.opaque ? latest.value : null;
   };
