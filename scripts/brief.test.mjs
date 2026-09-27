@@ -1,12 +1,12 @@
 // Run: node --test plugin/scripts/brief.test.mjs   (or ./test.sh for everything)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief } from "./brief.mjs";
+import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief, writeBriefs } from "./brief.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "brief.mjs");
@@ -270,8 +270,14 @@ test("the CLI writes one brief per plan row, creates the state directory, and pr
   );
   assert.equal(results.length, 6);
   assert.ok(lines.length <= 8, `${lines.length} stdout lines`);
-  assert.match(lines[0], /^# 6 briefs for round 1, tier L .* verifier: agent$/);
-  assert.match(lines[1], /^self-review-finder-r1-ab {2}self-review-finder {2}sonnet\/high {2}40 calls {2}\S+self-review-finder-r1-ab\.md/);
+  assert.match(lines[0], /^# 6 briefs for round 1, tier L .* verifier: agent — spawn each line as printed/);
+  // The exact call, so the agent runs under the row's name: the guards match it
+  // and wait.mjs finds the state file by it.
+  const call = JSON.parse(/^Agent (\{.*\})  # 40 calls, \d+ tok$/.exec(lines[1])[1]);
+  assert.equal(call.name, "self-review-finder-r1-ab");
+  assert.match(call.subagent_type, /^(self-review:)?self-review-finder$/);
+  assert.equal(call.model, "sonnet");
+  assert.equal(call.prompt, `Read ${path.join(dir, "round-1", "briefs", "self-review-finder-r1-ab.md")} and follow it.`);
   assert.ok(existsSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md")));
   assert.ok(existsSync(path.join(dir, "round-1", "state")), "the state directory exists before the finder appends to it");
   assert.match(readFileSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md"), "utf8"), /ship phase 2/);
@@ -289,7 +295,7 @@ test("a tier.json plan drives the briefs, including its own names and models", (
   main(["--plan", path.join(dir, "tier.json"), "--intent", path.join(dir, "intent.md"),
         "--scope", path.join(dir, "scope.diff"), "--out", path.join(dir, "briefs")], { log: (l) => lines.push(l) });
   assert.match(lines[0], /round 2, tier M/);
-  assert.match(lines[1], /^r2-custom {2}self-review-finder {2}opus\/high {2}25 calls/);
+  assert.match(lines[1], /^Agent \{"subagent_type":"(self-review:)?self-review-finder","name":"r2-custom","model":"opus",.*\}  # 25 calls/);
   assert.match(readFileSync(path.join(dir, "briefs", "r2-custom.md"), "utf8"), /C · Cross-file tracer/);
 });
 
@@ -386,4 +392,61 @@ test("usage errors exit 2, unreadable inputs exit 3, and neither writes a brief"
   assert.equal(run(["--plan", badRound, "--intent", path.join(dir, "intent.md"), "--scope", path.join(dir, "intent.md"), "--out", path.join(dir, "out")]).status, 3, "a plan round is validated like --round");
   assert.match(missing.stderr, /cannot read the intent block/);
   assert.ok(!existsSync(path.join(dir, "out")), "a failed run leaves no half-written round behind");
+});
+
+test("--verify writes the verifier brief and prints its call under a guarded name", () => {
+  const dir = workdir();
+  mkdirSync(path.join(dir, "round-2"), { recursive: true });
+  writeFileSync(path.join(dir, "intent.md"), "INTENT\nUser asked: \"fix it\"\n");
+  writeFileSync(path.join(dir, "cands.json"), JSON.stringify([{ id: "r2-1", title: "x" }]));
+  const lines = [];
+  const { file } = main(["--verify", path.join(dir, "cands.json"), "--work", dir, "--round", "2", "--batch", "3", "--live", dir],
+    { log: (l) => lines.push(l) });
+  assert.equal(lines.length, 1);
+  const call = JSON.parse(lines[0].replace(/^Agent /, ""));
+  assert.equal(call.name, "self-review-verifier-r2-b3", "the name tree-guard matches, never the registered type");
+  assert.match(call.subagent_type, /^(self-review:)?self-review-verifier$/);
+  assert.equal(call.prompt, `Read ${file} and follow it.`);
+  const brief = readFileSync(file, "utf8");
+  assert.match(brief, /^Verify these 1 candidate findings from round 2/);
+  assert.match(brief, /fix it/);
+  assert.match(brief, /"id": "r2-1"/);
+  assert.ok(brief.includes(path.join(dir, "round-2", "state", "self-review-verifier-r2-b3.jsonl")));
+  assert.ok(existsSync(path.join(dir, "round-2", "state")));
+
+  writeFileSync(path.join(dir, "nine.json"), JSON.stringify(Array.from({ length: 9 }, (_, i) => ({ id: `r2-${i}` }))));
+  assert.throws(() => main(["--verify", path.join(dir, "nine.json"), "--work", dir, "--round", "2"], { log() {} }), /at most 8/);
+});
+
+test("the compact brief's cold-run section follows what the round planned", () => {
+  // A compact row with nothing runnable planned no cold run, so saying one
+  // "did not run" is false — and the reviewer filed that sentence as a finding.
+  const compact = { name: "r1-compact", angles: ["compact"], agent: "self-review-finder", model: "sonnet", effort: "high", calls: 40, impact: "full" };
+  const none = renderBrief(briefArgs({ row: compact, coldPlanned: false }));
+  assert.doesNotMatch(none.text, /THE COLD RUN/, "nothing runnable, nothing missing");
+
+  const skipped = renderBrief(briefArgs({ row: compact, coldPlanned: true, coldSkipped: "coldrun.sh failed — see /w/round-1/coldrun.err" }));
+  assert.match(skipped.text, /No cold run this round \(coldrun\.sh failed — see \/w\/round-1\/coldrun\.err\)/);
+  assert.match(skipped.text, /do not file it as a finding/);
+  assert.match(skipped.text, /do not run the artifact/, "the skip is never made up for uncontained");
+
+  const ran = renderBrief(briefArgs({ row: compact, cold: "/w/round-1/cold run/transcript.md" }));
+  assert.match(ran.text, /THE COLD RUN \(already performed/);
+});
+
+test("writeBriefs reads the cold-run plan from tier.json, and keeps the section when the plan cannot say", () => {
+  const dir = workdir();
+  const row = { name: "r1-compact", angles: ["compact"], agent: "self-review-finder", model: "sonnet", effort: "high", calls: 40, impact: "full" };
+  const write = (plan, sub) => {
+    const [brief] = writeBriefs({
+      plan: { round: 1, finders: [row], ...plan }, outDir: path.join(dir, sub), stateDir: path.join(dir, sub, "state"),
+      angles, intent: "INTENT\n", scope: "/w/scope.diff", live: "/repo", impactText: "", prior: [], dismissed: [],
+      config: budget, cold: "",
+    });
+    return readFileSync(brief.file, "utf8");
+  };
+  assert.doesNotMatch(write({ kinds: { executable: [] } }, "none"), /THE COLD RUN/);
+  assert.match(write({ kinds: { executable: ["bin/x.sh"] }, coldSkipped: "the cold run executed nothing" }, "skipped"),
+    /No cold run this round \(the cold run executed nothing\)/);
+  assert.match(write({}, "unknown"), /No cold run this round \(no transcript was produced\)/, "a --tier plan has no kinds");
 });

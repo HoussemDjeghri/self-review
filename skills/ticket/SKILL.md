@@ -1,6 +1,6 @@
 ---
 name: ticket
-description: Grooms the ticket before the code exists. The session writes the INTENT block the self-review loop later reviews against, and one fresh self-review-ticket-validator reads it — request fidelity, premise, invariant, scope — while the code can still change; the session then builds against the verdict. Use at the start of any task that will write or change code, before the first edit, and whenever the user says "/ticket" or "groom the ticket". The self-review loop runs at the end of the task and finds the ticket already written. Skipping is allowed and is recorded in the convergence marker.
+description: Grooms the ticket before the code exists: writes the INTENT block the self-review loop reviews against and has one fresh validator read it. Use at the start of any task that will write or change code, before the first edit, or when the user says "/ticket" or "groom the ticket".
 ---
 
 # Ticket
@@ -9,9 +9,8 @@ The self-review loop reviews a change faithfully against its INTENT block, and
 every finder is told that the block's "out of scope on purpose" line is
 deliberate and not to be flagged — so the author's own scoping is exempt from
 review by construction, and the premise is questioned only after the author is
-invested. The 2026-08-22 allowlist-guard review ran six rounds hardening a hook
-against bypasses the platform already blocked: a correct implementation of a
-wrong ticket, reviewed correctly, six times. A team's ticket is independent
+invested — and a correct implementation of a wrong ticket survives any number
+of correct review rounds. A team's ticket is independent
 because someone else groomed it. This skill is that someone: one fresh reader,
 before the first edit, who may question exactly that line. It costs one Sonnet
 agent reading a nine-line block and the request — not a diff — and three tool
@@ -69,8 +68,8 @@ Then, as the very next call with nothing in between, Bash `timeout` `600000`:
 
 `wait.mjs` blocks on the validator's own transcript and exits 0 once it is no
 longer active; `salvage.mjs` then prints its last message, which is the report
-— nothing else carries it (2026-09-03: three reviewers reported through
-SendMessage with `success:true` and nothing arrived for 2h49m). The session id
+— nothing else carries it (a report sent through SendMessage may never arrive).
+The session id
 is the UUID in your scratchpad path; a `<reviews>` outside the scratchpad needs
 `--session <id>` on `wait.mjs`. The ticket waits in a directory of its own
 because `wait.mjs` keeps its state under `round-<n>/` and numbers from 1, and

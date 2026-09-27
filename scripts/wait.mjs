@@ -168,11 +168,31 @@ export function render(rows, verdict, extra = [], sessionId = undefined) {
 // looking at different names. Naming the orphans is what makes them
 // collectable instead of merely confusing, because `salvage.mjs` can still
 // read them.
-export function orphanAdvice(rows, stateDir, files) {
+//
+// A file named after a row of this round's plan is not an earlier attempt: it
+// is a finder that writes under its row's name while it was spawned under
+// another, so the lead is waiting on a name the state file does not carry.
+export function orphanAdvice(rows, stateDir, files, planned = []) {
   const waited = new Set(rows.map((r) => r.name));
-  const orphans = files
+  const unwaited = files
     .filter((f) => f.endsWith(".jsonl") && !waited.has(f.slice(0, -".jsonl".length)))
     .sort();
+  const rowNames = new Set(planned);
+  const misnamed = unwaited.filter((f) => rowNames.has(f.slice(0, -".jsonl".length)));
+  const orphans = unwaited.filter((f) => !misnamed.includes(f));
+  return [...misnamedAdvice(stateDir, misnamed), ...earlierAttempts(stateDir, orphans)];
+}
+
+function misnamedAdvice(stateDir, files) {
+  if (files.length === 0) return [];
+  return [
+    `# ${files.length} plan row${files.length === 1 ? "" : "s"} filed under ${files.length === 1 ? "its" : "their"} own name, which no reviewer above carries —`,
+    "# spawned under another name. Spawn with the name brief.mjs printed; the candidates are here:",
+    ...files.map((f) => `#   ${path.join(stateDir, f)}`),
+  ];
+}
+
+function earlierAttempts(stateDir, orphans) {
   if (orphans.length === 0) return [];
   // Both sentences agree with the count, not just the noun: the second line is
   // as singular as the first ("an earlier attempt … Its candidates"), so
@@ -185,6 +205,14 @@ export function orphanAdvice(rows, stateDir, files) {
     ...orphans.map((f) => `#   ${path.join(stateDir, f)}`),
   ];
 }
+
+const plannedNames = (roundDir) => {
+  try {
+    return JSON.parse(readFileSync(path.join(roundDir, "tier.json"), "utf8")).finders.map((row) => row.name);
+  } catch {
+    return [];
+  }
+};
 
 // A dead reviewer's remedy is a command, and SKILL.md §2f tells the lead the
 // tool prints it with the names already substituted — so it has to, or that
@@ -297,7 +325,7 @@ export async function main(argv, {
   const orphans = () => {
     let files = [];
     try { files = readdirSync(stateDir); } catch { return []; }
-    return orphanAdvice(rows, stateDir, files);
+    return orphanAdvice(rows, stateDir, files, plannedNames(roundDir));
   };
   let rows = snapshot();
   // The table is worth printing even when the tool timeout, not this script,

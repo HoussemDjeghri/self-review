@@ -390,6 +390,20 @@ test("the orphan advice agrees with the count in both branches, not just on the 
   assert.doesNotMatch(advice, /\bIts\b/);
 });
 
+test("a plan row's state file under a finder spawned by another name is named as that, not as an earlier attempt", () => {
+  // `self-review-finder-r1-cb` spawned for the row `self-review-finder-r1-compact`:
+  // the brief writes under the row's name, so the lead was told its live
+  // finder's candidates came "from an earlier attempt".
+  const rows = [{ name: "self-review-finder-r1-cb", status: "finished", lastAt: "—", calls: 1, stateLines: null, note: "" }];
+  const advice = orphanAdvice(rows, "/w/round-1/state", ["self-review-finder-r1-compact.jsonl", "old.jsonl"],
+    ["self-review-finder-r1-compact"]).join("\n");
+  assert.match(advice, /1 plan row filed under its own name, which no reviewer above carries/);
+  assert.match(advice, /Spawn with the name brief\.mjs printed/);
+  assert.match(advice, /self-review-finder-r1-compact\.jsonl/);
+  assert.match(advice, /1 state file in this round belongs to no reviewer above — an earlier attempt/, "a true orphan keeps its own line");
+  assert.doesNotMatch(advice.split("earlier attempt")[1], /r1-compact/, "the row is not listed as an earlier attempt");
+});
+
 test("a round where every state file is accounted for adds nothing to the table", () => {
   const rows = [{ name: "f-ab", status: "finished", lastAt: "—", calls: 1, stateLines: 1, note: "" }];
   assert.deepEqual(orphanAdvice(rows, "/w/round-1/state", ["f-ab.jsonl"]), []);

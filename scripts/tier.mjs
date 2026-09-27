@@ -502,9 +502,13 @@ export function dominantDirectory(perFile, { share = 0.6, floor = 1000 } = {}) {
 }
 
 export function plan({ scope, impact, round = 1, compact = false, force = null, reason = null, cap = null, capMarkers = [], config, exempt }) {
+  // A mixed scope lists its repositories first and the files outside any
+  // repository last, in a plain section of their own. Both halves are the
+  // change, so both are weighed; the first repository's root still classifies.
   const repo = scope.repos[0];
-  const files = repo?.files ?? [];
-  const diff = parseDiff(repo?.diff ?? []);
+  const weighed = [repo, ...scope.repos.filter((entry) => entry.plain && entry !== repo)].filter(Boolean);
+  const files = weighed.flatMap((entry) => entry.files);
+  const diff = parseDiff(weighed.flatMap((entry) => entry.diff));
   const kinds = classifyChanged(files, config, exempt, repo?.root || null);
   const metrics = measure({ scope, files, diff, kinds, impact });
   // Which new code files have no test naming them: the M → L modifier's input.

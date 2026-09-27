@@ -317,14 +317,18 @@ const TEE_RE = /\btee\b/;
 // its getopt_long prefixes, rsync's unrelated `-t`, BSD's lack of both — a
 // deny-list that lost four rounds of review for the one case it bought
 // (`cp a.mjs docs/a.md` gating). Over-inclusive fails toward a review.
-const COMMAND_WRITERS = new Set(["cp", "mv", "rm", "rmdir", "ln", "install", "truncate", "dd", "rsync", "patch"]);
+const COMMAND_WRITERS = new Set(["cp", "mv", "rm", "rmdir", "ln", "install", "truncate", "dd", "rsync"]);
 // … or anywhere in the segment.
 const ARG_WRITE_PATTERNS = [
   /\bsed\b(?=[^|;&\n]*(?:\s-[A-Za-z]*i\b|--in-place))/, // sed in place
-  /\bgit\s+(rm|mv|apply|am)\b/,
+  /\bgit\s+(rm|mv)\b/,
   /\b(npm|pnpm|yarn|bun)\s+(?:(?:i|install|add)\b(?:\s+-\S+)*\s+[^-\s]|(?:remove|rm|uninstall|un|init|link|update|up)\b)/,
   /\bcargo\s+(add|remove|init|new)\b|\bgo\s+(get|mod\s+(tidy|edit|init))\b|\b(poetry|uv)\s+(add|remove|init)\b/,
 ];
+// patch and `git apply|am` name the patch they read, not the files it rewrites,
+// which only its content says: the write is unknown, never the operand. Taken
+// as a target, a patch in a temp file resolved to scratch and passed.
+const PATCH_APPLIERS = /\bgit\s+(apply|am)\b/;
 // Matched with quotes intact: these live inside quoted -c/-e snippets and code
 // heredocs, where the target is computed by the script and unknowable here.
 const SCRIPT_WRITE_PATTERNS = [
@@ -349,14 +353,76 @@ const SCRIPT_WRITE_PATTERNS = [
 // is what an unknown value has always meant here.
 const OPAQUE_VALUE = /\$\(|`/;
 
+// `tmp=$(mktemp)` is the one substitution whose value is known in kind: a new
+// file under the temp directory. With a template or `-p`, it is not.
+const BARE_MKTEMP = /^"?\$\(\s*mktemp(?:\s+-[dqtu]+)*\s*\)"?$/;
+const REFERENCE = /\$\{?([A-Za-z_]\w*)\}?/g;
+
 function expandLocalAssignments(cmd) {
-  const assignments = [...cmd.matchAll(/(?:^|[\s;&|])([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|]+)/g)]
-    .map((m) => ({ at: m.index, name: m[1], raw: m[2], value: m[2].replace(/^["']|["']$/g, "") }));
-  return cmd.replace(/\$\{?([A-Za-z_]\w*)\}?/g, (whole, name, at) => {
-    const latest = assignments.findLast((a) => a.name === name && a.at < at);
-    if (!latest || OPAQUE_VALUE.test(latest.raw)) return whole;
-    return latest.value;
-  });
+  const assignments = [];
+  const reads = [...cmd.matchAll(REFERENCE)].map((m) => ({ name: m[1], at: m.index }));
+  // The assignment a reference sees, or null. Two assignments with no read
+  // between (`then X=a; else X=b; fi`) leave which one ran out of the text, so
+  // the reference stays unknown rather than taking the nearer one on faith.
+  const valueAt = (name, at) => {
+    const lastRead = reads.findLast((r) => r.name === name && r.at < at)?.at ?? -1;
+    const made = assignments.filter((a) => a.name === name && a.at < at);
+    if (made.filter((a) => a.at > lastRead).length > 1) return null;
+    const latest = made.at(-1);
+    return latest && !latest.opaque ? latest.value : null;
+  };
+  // Values are resolved in order, so `R=$S/x` after `S=/tmp/s` is `/tmp/s/x`,
+  // not the literal `$S/x` a single pass left behind.
+  const resolve = (text, before) => text.replace(REFERENCE, (whole, name) => valueAt(name, before) ?? whole);
+  for (const m of cmd.matchAll(/(?:^|[\s;&|])([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|]+)/g)) {
+    const raw = m[2];
+    if (BARE_MKTEMP.test(raw)) { assignments.push({ at: m.index, name: m[1], value: path.join(tmpdir(), "mktemp.XXXXXX") }); continue; }
+    const opaque = OPAQUE_VALUE.test(raw);
+    const literal = raw.replace(/^["']|["']$/g, "");
+    assignments.push({ at: m.index, name: m[1], opaque, value: opaque || raw.startsWith("'") ? literal : resolve(literal, m.index) });
+  }
+  return cmd.replace(REFERENCE, (whole, name, at) => valueAt(name, at) ?? whole);
+}
+
+// A target still holding a `$NAME` after expansion is not a path: the value
+// comes from somewhere this command does not say, so the write is unknown.
+const UNEXPANDED = /\$\{?[A-Za-z_]/;
+
+// The session's own tree: the cwd's repository, or the cwd itself outside git.
+function sessionRoot(cwd) {
+  const top = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  return top.status === 0 ? top.stdout.trim() : path.resolve(cwd);
+}
+
+// A path through the realpath of its nearest existing ancestor, so a deleted
+// target and a realpath'd repository top compare in one spelling.
+function realish(p) {
+  let dir = p;
+  while (!existsSync(dir)) {
+    const up = path.dirname(dir);
+    if (up === dir) return p;
+    dir = up;
+  }
+  try { return path.join(realpathSync(dir), path.relative(dir, p)); } catch { return p; }
+}
+
+function inWorkTree(p) {
+  let dir = realish(p);
+  while (!existsSync(dir) || !statSync(dir).isDirectory()) dir = path.dirname(dir);
+  const inside = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
+  return inside.status === 0 && inside.stdout.trim() === "true";
+}
+
+// A removed path outside the session's tree and outside every repository has
+// nothing left to review: it is gone, and no diff can show what it held.
+// Inside either, a deletion is a change like any other.
+const DELETERS = new Set(["rm", "rmdir"]);
+function deletedOutside(target, acc) {
+  if (!acc.cwd || existsSync(target)) return false;
+  acc.root ??= realish(sessionRoot(acc.cwd));
+  const rel = path.relative(acc.root, realish(target));
+  const withinRoot = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return !withinRoot && !inWorkTree(target);
 }
 
 const expandHome = (p) => (p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p.replace(/^\$HOME\//, HOME + "/").replace(/^\$\{?TMPDIR\}?/, tmpdir()));
@@ -402,6 +468,7 @@ function segmentWriteTargets(segment, ws) {
     const after = (re) => [...masked.matchAll(re)].map((m) => wordAt(segment, m.index + m[0].length));
     return [...after(/(?:^|[^<>&0-9])>{1,2}(?!&)\s*/g), ...after(/\btee\b(?:\s+-\w+)*\s+/g)].filter((p) => p && p !== "/dev/null");
   }
+  if (commandOf(ws) === "patch" || PATCH_APPLIERS.test(masked)) return [];
   if (COMMAND_WRITERS.has(commandOf(ws)) || ARG_WRITE_PATTERNS.some((re) => re.test(masked))) return pathOperands(ws);
   if (INTERPRETER_RE.test(commandOf(ws)) && SCRIPT_WRITE_PATTERNS.some((re) => re.test(segment))) return [];
   return null;
@@ -421,9 +488,15 @@ function analyzeShell(text, dir, acc) {
     }
     const found = segmentWriteTargets(segment, ws);
     if (found === null) continue;
+    const opaque = found.filter((t) => UNEXPANDED.test(expandHome(t)));
+    let named = found.filter((t) => !opaque.includes(t)).map((t) => ({ t, at: path.resolve(dir, expandHome(t)) }));
+    if (DELETERS.has(commandOf(ws)) && opaque.length === 0 && named.length) {
+      named = named.filter(({ at }) => !deletedOutside(at, acc));
+      if (named.length === 0) continue; // every removal was outside: nothing written to review
+    }
     acc.writes = true;
-    if (found.length === 0) acc.unknown = true;
-    acc.targets.push(...found.map((t) => path.resolve(dir, expandHome(t)) + (t.endsWith("/") ? "/" : "")));
+    if (found.length === 0 || opaque.length) acc.unknown = true;
+    acc.targets.push(...named.map(({ t, at }) => at + (t.endsWith("/") ? "/" : "")));
   }
   return dir;
 }
@@ -442,7 +515,7 @@ function analyzeShell(text, dir, acc) {
 // decides on what the turn actually wrote rather than on what was parseable.
 function bashWrites(command, cwd) {
   if (typeof command !== "string") return null;
-  const acc = { writes: false, unknown: false, targets: [] };
+  const acc = { writes: false, unknown: false, targets: [], cwd, root: undefined };
   const { shell, scripts } = separateHeredocs(command);
   const dir = analyzeShell(shell, cwd, acc);
   for (const { interpreter, body } of scripts) {
@@ -479,14 +552,16 @@ function statusPaths(stdout) {
 }
 
 /**
- * The turn's writes by EVIDENCE rather than by command shape: the files git
- * reports as changed whose mtime is at or after the turn's first message.
+ * Writes by EVIDENCE rather than by command shape: every file git reports as
+ * changed, with its mtime. Which of them a given call wrote is decided per call
+ * by `callWindow`, in memory, so a Stop still costs one git call however many
+ * events ask.
  *
- * Returns a file list, or the REASON there is nothing to ask — which is a
- * different answer from "nothing was written", and the reason is which of the
- * three it was. It used to return a bare null and the caller named the third
- * cause for all of them, so a transcript whose turn has no parseable timestamp
- * reported "no git repository" from inside a checkout.
+ * Returns `{ file, mtimeMs }` records, or the REASON there is nothing to ask —
+ * which is a different answer from "nothing was written". It used to return a
+ * bare null and the caller named one cause for all of them, so a transcript
+ * whose turn has no parseable timestamp reported "no git repository" from
+ * inside a checkout.
  *
  * This is the fallback for a write whose target the command parser cannot
  * resolve: a heredoc into an interpreter, a project script at command position.
@@ -494,9 +569,8 @@ function statusPaths(stdout) {
  * that motivated this was one the gate could never have heard of — and every
  * extension is another heuristic to keep.
  */
-function writesSince(cwd, since) {
+function changedFiles(cwd) {
   if (!cwd) return "no working directory to ask git about";
-  if (!Number.isFinite(since)) return "no timestamp for the start of this turn";
   // Porcelain paths are relative to the repository's top, never to the cwd, so
   // from a subdirectory they used to resolve to files that do not exist: the
   // stat below missed every one and the evidence came back silently empty.
@@ -515,9 +589,53 @@ function writesSince(cwd, since) {
     // this fallback is for: the question is what the turn WROTE.
     let stat;
     try { stat = statSync(file); } catch { continue; }
-    if (stat.mtimeMs >= since) files.push(file);
+    files.push({ file, mtimeMs: stat.mtimeMs });
   }
   return files;
+}
+
+/**
+ * The execution window of one shell call, by the transcript's own clock: from
+ * the assistant entry that holds the tool_use to the user entry that holds its
+ * result. A file is that call's evidence only if its mtime falls inside.
+ *
+ * It used to be the whole turn, and a turn is long enough for another writer to
+ * land in it: a session whose only write was a heredoc into a doc in ANOTHER
+ * repository was blocked twice in 45 s for `.tsx` files a concurrent process
+ * wrote — one 2.4 s before the call began, one 7.4 s after its result
+ * (slim plan #10). Measured over 218 once-written files, no mtime came before its
+ * tool_use stamp and none came after its result but for later rewrites, which
+ * is what makes 100 ms enough slack on a fine-grained filesystem. A whole-second
+ * mtime is a coarse filesystem (HFS+, FAT) or a time some tool set, so it gets
+ * two seconds.
+ *
+ * A missing start falls back to the turn's; a missing end, or a call run in the
+ * background (whose result is only its launch), runs to the Stop — a wider
+ * window blames more, which is the direction to fail in. `null` when there is
+ * no start at all.
+ */
+function callWindow(event, turn, since, finishedAt) {
+  const start = Date.parse(turn[event.index]?.timestamp ?? "");
+  const from = Number.isFinite(start) ? start : since;
+  if (!Number.isFinite(from)) return null;
+  const end = event.background ? NaN : finishedAt.get(event.id);
+  return { from, to: Number.isFinite(end) ? end : Infinity };
+}
+
+function inWindow({ from, to }, mtimeMs) {
+  const slack = mtimeMs % 1000 === 0 ? 2000 : 100;
+  return from - slack <= mtimeMs && mtimeMs <= to + slack;
+}
+
+// When each tool call's result came back, by tool_use id.
+function resultTimes(entries) {
+  const at = new Map();
+  for (const entry of entries) {
+    if (entry.type !== "user" || !hasToolResult(entry)) continue;
+    const ms = Date.parse(entry.timestamp ?? "");
+    for (const block of entry.message.content) if (block?.type === "tool_result") at.set(block.tool_use_id, ms);
+  }
+  return at;
 }
 
 function agentEdited(entry) {
@@ -566,9 +684,10 @@ function* writeEvents(entries, from, to, cwd) {
         // empty `targets` is a write whose targets did not resolve, a list names
         // them. A writer with no path operand at all resolved nothing either.
         const blind = writes.unknown || writes.named.length === 0;
+        const background = use.input?.run_in_background === true;
         yield blind || writes.gated.length
-          ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named }
-          : { index, kind: "exempt", id: use.id, explains: writes.named, shell: true };
+          ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named, background }
+          : { index, kind: "exempt", id: use.id, explains: writes.named, shell: true, background };
       }
     }
     if (entry.type === "user" && agentEdited(entry)) {
@@ -601,15 +720,24 @@ function succeededToolUses(entries) {
 function collectChanges(turn, cwd, since) {
   const changes = [];
   const events = [...writeEvents(turn, -1, turn.length, cwd)];
-  // One git call per Stop at most, and only when a command shape needs it.
+  // One git call per Stop at most, and only when a command shape needs it; each
+  // event then keeps the files whose mtime falls inside its own call's window.
   let evidence;
-  const witnessed = () => (evidence === undefined ? (evidence = writesSince(cwd, since)) : evidence);
-  // The git evidence covers the whole turn but the verdict is per event, so a
-  // file some other successful call already accounts for — exempt ones included,
-  // wherever in the turn it landed — cannot clear an unresolved write. Crediting
-  // it did exactly that: a heredoc rewrote a hook outside the repo, git saw only
-  // the two `.md` files a Write and a redirect had made, and the all-exempt rule
-  // below read that as "the artifact was prose" (unresolved-write ruling §1).
+  const finishedAt = resultTimes(turn);
+  const witnessed = (event) => {
+    const window = callWindow(event, turn, since, finishedAt);
+    if (cwd && !window) return "no timestamp for the start of this turn";
+    if (evidence === undefined) evidence = changedFiles(cwd);
+    if (!Array.isArray(evidence)) return evidence;
+    return evidence.filter(({ mtimeMs }) => inWindow(window, mtimeMs)).map(({ file }) => file);
+  };
+  // The explaining calls are counted turn-wide but the verdict is per event, so
+  // a file some other successful call already accounts for — exempt ones
+  // included, wherever in the turn it landed — cannot clear an unresolved
+  // write. Crediting it did exactly that: a heredoc rewrote a hook outside the
+  // repo, git saw only the two `.md` files a Write and a redirect had made, and
+  // the all-exempt rule below read that as "the artifact was prose"
+  // (unresolved-write ruling §1).
   const succeeded = succeededToolUses(turn);
   const explained = new Set(events.filter((e) => e.explains && succeeded.has(e.id))
     .flatMap((e) => e.explains.map((p) => path.resolve(p))));
@@ -630,7 +758,7 @@ function collectChanges(turn, cwd, since) {
   // shipping. What stays invisible: a mis-parse whose real target is outside
   // the repo, ignored, or unrelated to anything it named.
   const vetoExempt = (event) => {
-    const written = witnessed();
+    const written = witnessed(event);
     if (!Array.isArray(written)) return;
     const named = event.explains.map((p) => path.resolve(p));
     const beside = unexplainedCode(written).filter((file) =>
@@ -644,7 +772,7 @@ function collectChanges(turn, cwd, since) {
     // A resolvable target decides on its own: it may be outside the repo,
     // where git has nothing to say about it.
     if (!event.unresolved) { changes.push({ index: event.index, kind: "bash", files: event.targets }); continue; }
-    const written = witnessed();
+    const written = witnessed(event);
     if (!Array.isArray(written)) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: written }); continue; }
     const unexplained = written.filter((file) => !explained.has(file));
     const gated = unexplainedCode(written);
@@ -655,8 +783,8 @@ function collectChanges(turn, cwd, since) {
     // for, and the gate falls back to blocking. The two empty cases get two
     // texts, because "nothing changed" is the one leads have learned to answer
     // with `not-applicable`, and here something did change — just not visibly.
-    if (!written.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "nothing in the working tree changed since this turn began" });
-    else if (!unexplained.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "every file changed in the working tree is accounted for by another tool call, so this one wrote somewhere git cannot see from here — outside this repository, or into a file another call also wrote" });
+    if (!written.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "nothing in the working tree changed while this command ran" });
+    else if (!unexplained.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "every file changed in the working tree while this command ran is accounted for by another tool call, so this one wrote somewhere git cannot see from here — outside this repository, or into a file another call also wrote" });
   }
   return changes;
 }
@@ -1367,8 +1495,8 @@ function evaluate(entries, cwd, transcriptPath) {
   entries.forEach((entry, index) => { if (isHumanPrompt(entry)) humanAt.push(index); });
   const boundary = humanAt.length ? humanAt[humanAt.length - 1] : -1;
   const turn = entries.slice(boundary + 1);
-  // When the turn began, by the transcript's own clock: the cutoff for
-  // "this turn wrote it" in writesSince().
+  // When the turn began, by the transcript's own clock: where a shell call's
+  // evidence window starts when its own entry has no timestamp (callWindow).
   const since = Date.parse(entries[boundary]?.timestamp ?? turn[0]?.timestamp ?? "");
   const changes = collectChanges(turn, cwd, since);
 

@@ -1526,17 +1526,34 @@ const SCRIPTED = (root) => [
   `python3 - <<'EOF'\nopen('${root}/anything.txt','w').write('x')\nEOF`,
   `node scripts/new-decision.mjs "a decision"`,
 ];
+// A file is evidence only for the shell call whose execution window holds its
+// mtime (slim plan #10), and the synthetic clock is 2023 while a fixture file is
+// written now. So a file the story says a call wrote is stamped to that call's
+// tool_use + 400 ms — sub-second, so the fine slack applies. A fixture change,
+// not a behaviour change: the verdict under test is the same one.
+const during = (call, ...files) => {
+  const at = new Date(Date.parse(call[0].timestamp) + 400);
+  for (const file of files) utimesSync(file, at, at);
+  return call;
+};
+// The SCRIPTED calls, with the repo-relative `files` stamped into the heredoc's
+// window: `node scripts/…` is not a write the parser sees, so the heredoc is the
+// one call whose window the evidence is read in.
+const scripted = (repo, ...files) => {
+  const [python, node] = SCRIPTED(repo).map((cmd) => bash(cmd));
+  return [during(python, ...files.map((file) => path.join(repo, file))), node];
+};
 
 test("F7: a scripted write whose artifact is prose passes, and the gate says nothing", () => {
   const { repo } = repoFixture({ "docs/decision-0012.md": "# a decision\n" });
-  const r = run(turn(...SCRIPTED(repo).map((cmd) => bash(cmd))), { payload: { cwd: repo } });
+  const r = run(turn(...scripted(repo, "docs/decision-0012.md")), { payload: { cwd: repo } });
   assert.equal(blocks(r), false, r.json?.reason);
   assert.equal(r.stdout, "", "the exact turn D4 blocked");
 });
 
 test("F7: a scripted write whose artifact is code blocks, and names the file", () => {
   const { repo } = repoFixture({ "docs/decision-0012.md": "# a decision\n", "src/generated.mjs": "export const x = 1;\n" });
-  const r = run(turn(...SCRIPTED(repo).map((cmd) => bash(cmd))), { payload: { cwd: repo } });
+  const r = run(turn(...scripted(repo, "docs/decision-0012.md", "src/generated.mjs")), { payload: { cwd: repo } });
   assert.ok(blocks(r), "a scripted write that produced code is a change");
   assert.match(r.json.reason, /src\/generated\.mjs/, "named, not counted: the block used to say only 'N shell command(s)'");
   assert.doesNotMatch(r.json.reason, /decision-0012\.md/, "the exempt half is not evidence of a change");
@@ -1551,7 +1568,7 @@ test("F7: a non-ASCII filename is evidence too", () => {
   // decomposition, so the assertion does not depend on the filesystem's
   // normalisation.
   const { repo } = repoFixture({ "docs/decision-0012.md": "# a decision\n", "src/\u03bb-guard.mjs": "export const x = 1;\n" });
-  const r = run(turn(...SCRIPTED(repo).map((cmd) => bash(cmd))), { payload: { cwd: repo } });
+  const r = run(turn(...scripted(repo, "docs/decision-0012.md", "src/\u03bb-guard.mjs")), { payload: { cwd: repo } });
   assert.ok(blocks(r), "a scripted write that produced code is a change, whatever the file is called");
   assert.match(r.json.reason, /\u03bb-guard\.mjs/, "named, not silently dropped");
 });
@@ -1561,8 +1578,9 @@ test("F7: a turn whose start has no timestamp says that, not \"no git repository
   // caller named the third for all of them, so this read as a missing
   // repository from inside a perfectly good checkout.
   const { repo } = repoFixture({ "src/generated.mjs": "export const x = 1;\n" });
-  const entries = turn(bash(SCRIPTED(repo)[0]));
+  const entries = turn(...during(bash(SCRIPTED(repo)[0]), path.join(repo, "src/generated.mjs")));
   entries[0] = { ...entries[0], timestamp: "not a date" };   // the turn's own boundary
+  entries[1] = { ...entries[1], timestamp: "not a date" };   // and the call's, where its window would start
   const r = run(entries, { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /could not determine which files — no timestamp for the start of this turn/);
@@ -1581,7 +1599,7 @@ test("F7: a mixed turn counts the blind commands, not all of them", () => {
 test("F7: a code file left dirty BEFORE the turn is not this turn's write", () => {
   const { repo } = repoFixture({ "docs/note.md": "prose\n", "src/old.mjs": "export const old = 1;\n" });
   aged(path.join(repo, "src/old.mjs"));
-  const r = run(turn(...SCRIPTED(repo).map((cmd) => bash(cmd))), { payload: { cwd: repo } });
+  const r = run(turn(...scripted(repo, "docs/note.md")), { payload: { cwd: repo } });
   assert.equal(blocks(r), false, r.json?.reason);
 });
 
@@ -1615,7 +1633,8 @@ test("F7: a resolvable PROSE target beside an unresolvable write is still prose"
   // ONE command: the two writes have to share a Bash call. Split across two
   // calls each is analysed on its own, the resolvable half returns null as a
   // pure prose write, and the defect never arises.
-  const r = run(turn(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`)), { payload: { cwd: repo } });
+  const r = run(turn(during(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`),
+    path.join(repo, "docs/notes.md"), path.join(repo, "anything.txt"))), { payload: { cwd: repo } });
   assert.equal(blocks(r), false, r.json?.reason);
   assert.equal(r.stdout, "", "a prose-only turn says nothing");
 });
@@ -1628,7 +1647,8 @@ test("F7: a resolvable prose target does not hide a code artifact beside it", ()
   // ONE command: the two writes have to share a Bash call. Split across two
   // calls each is analysed on its own, the resolvable half returns null as a
   // pure prose write, and the defect never arises.
-  const r = run(turn(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`)), { payload: { cwd: repo } });
+  const r = run(turn(during(bash(`python3 -c "open('${repo}/anything.txt','w').write('x')" && cat > ${repo}/docs/notes.md <<'EOF'\n# notes\nEOF`),
+    path.join(repo, "docs/notes.md"), path.join(repo, "src/generated.mjs"))), { payload: { cwd: repo } });
   assert.ok(blocks(r), "the unresolvable write really did produce code");
   assert.match(r.json.reason, /src\/generated\.mjs/);
   assert.doesNotMatch(r.json.reason, /notes\.md/, "the exempt half is not evidence of a change");
@@ -1665,35 +1685,38 @@ function failed(name, input) {
 
 test("an unresolved write whose only evidence other tools already explain blocks, with its own reason", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n", "docs/b.md": "# b\n" });
-  const r = run(turn(...write(`${repo}/docs/a.md`), bash(`cat > ${repo}/docs/b.md <<'EOF'\n# b\nEOF`), bash(HEREDOC_OUTSIDE)),
-    { payload: { cwd: repo } });
+  // Both files are stamped inside the heredoc's own window: evidence is per call
+  // now, and this case is the one where all of it is explained by other calls.
+  const r = run(turn(...write(`${repo}/docs/a.md`), bash(`cat > ${repo}/docs/b.md <<'EOF'\n# b\nEOF`),
+    during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"), path.join(repo, "docs/b.md"))), { payload: { cwd: repo } });
   assert.ok(blocks(r), "the field case: the .md files were written by the Write and the redirect, not by the heredoc");
-  assert.match(r.json.reason, /could not determine which files — every file changed in the working tree is accounted for by another tool call/);
+  assert.match(r.json.reason, /could not determine which files — every file changed in the working tree while this command ran is accounted for by another tool call/);
   assert.doesNotMatch(r.json.reason, /nothing in the working tree changed/, "leads have learned to answer that one with not-applicable");
 });
 
 test("an unresolved write whose evidence is an unexplained exempt file still records no change", () => {
   const { repo } = repoFixture({ "config/settings.json": "{}\n" });
-  assert.equal(run(turn(bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } }).stdout, "");
+  assert.equal(run(turn(during(bash(HEREDOC_OUTSIDE), path.join(repo, "config/settings.json"))), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("a failed Write explains nothing: its file stays evidence for the heredoc after it", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n" });
-  const r = run(turn(...failed("Write", { file_path: `${repo}/docs/a.md`, content: "x" }), bash(HEREDOC_OUTSIDE)),
+  const r = run(turn(...failed("Write", { file_path: `${repo}/docs/a.md`, content: "x" }), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"))),
     { payload: { cwd: repo } });
   assert.equal(r.stdout, "", r.json?.reason);
 });
 
 test("a successful Edit and a heredoc on the same exempt file block — the accepted false arm", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n" });
-  const r = run(turn(...edit(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } });
+  const r = run(turn(...edit(`${repo}/docs/a.md`), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"))), { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /accounted for by another tool call/);
 });
 
 test("explained exempt evidence beside an unexplained code file names the code file", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n", "src/gen.mjs": "export {};\n" });
-  const r = run(turn(...write(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE)), { payload: { cwd: repo } });
+  const r = run(turn(...write(`${repo}/docs/a.md`), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"), path.join(repo, "src/gen.mjs"))),
+    { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
   assert.doesNotMatch(r.json.reason, /docs\/a\.md/);
@@ -1704,7 +1727,7 @@ test("from a subdirectory cwd the git evidence is read against the repository's 
   // a subdirectory they named files that do not exist, every stat missed, and a
   // scripted code write read as "nothing in the working tree changed".
   const { repo } = repoFixture({ "src/generated.mjs": "export const x = 1;\n" });
-  const r = run(turn(bash(SCRIPTED(repo)[0])), { payload: { cwd: path.join(repo, "src") } });
+  const r = run(turn(during(bash(SCRIPTED(repo)[0]), path.join(repo, "src/generated.mjs"))), { payload: { cwd: path.join(repo, "src") } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /Changed: generated\.mjs/, r.json.reason);
 });
@@ -1718,7 +1741,7 @@ test("from a subdirectory cwd the git evidence is read against the repository's 
 
 test("the veto: an exempt redirect beside unexplained code arms, and says why", () => {
   const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
-  const r = run(turn(bash(`printf x > ${repo}/src/notes.md`)), { payload: { cwd: repo } });
+  const r = run(turn(during(bash(`printf x > ${repo}/src/notes.md`), path.join(repo, "src/gen.mjs"))), { payload: { cwd: repo } });
   assert.ok(blocks(r), "the parser said prose; the tree says code changed beside it");
   assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
   assert.match(r.json.reason, /read as prose-only/);
@@ -1727,7 +1750,7 @@ test("the veto: an exempt redirect beside unexplained code arms, and says why", 
 
 test("the veto: the same stem in another directory arms too", () => {
   const { repo } = repoFixture({ "out/gen.txt": "x\n", "src/gen.mjs": "export {};\n" });
-  const r = run(turn(bash(`printf x > ${repo}/out/gen.txt`)), { payload: { cwd: repo } });
+  const r = run(turn(during(bash(`printf x > ${repo}/out/gen.txt`), path.join(repo, "src/gen.mjs"))), { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
 });
@@ -1736,12 +1759,13 @@ test("the veto: unexplained code nowhere near what the command named does not ar
   // Narrowed by the replay: 8 of 352 eligible turns had evidence another
   // session or a `git reset --hard` could have produced, and none was a hit.
   const { repo } = repoFixture({ "docs/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
-  assert.equal(run(turn(bash(`printf x > ${repo}/docs/notes.md`)), { payload: { cwd: repo } }).stdout, "");
+  assert.equal(run(turn(during(bash(`printf x > ${repo}/docs/notes.md`), path.join(repo, "src/gen.mjs"))), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("the veto: code a successful Edit explains adds no second change", () => {
   const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
-  const r = run(turn(...edit(`${repo}/src/gen.mjs`), bash(`printf x > ${repo}/src/notes.md`)), { payload: { cwd: repo } });
+  const r = run(turn(...edit(`${repo}/src/gen.mjs`), during(bash(`printf x > ${repo}/src/notes.md`), path.join(repo, "src/gen.mjs"))),
+    { payload: { cwd: repo } });
   assert.ok(blocks(r), "the Edit is the change");
   assert.doesNotMatch(r.json.reason, /shell command|read as prose-only/, r.json.reason);
 });
@@ -1753,8 +1777,9 @@ test("the veto: no repository or no turn timestamp keeps today's pass", () => {
   writeFileSync(path.join(dir, "src", "gen.mjs"), "export {};\n");
   assert.equal(run(turn(bash(`printf x > ${dir}/src/notes.md`)), { payload: { cwd: dir } }).stdout, "", "no git to ask");
   const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/gen.mjs": "export {};\n" });
-  const entries = turn(bash(`printf x > ${repo}/src/notes.md`));
+  const entries = turn(...during(bash(`printf x > ${repo}/src/notes.md`), path.join(repo, "src/gen.mjs")));
   entries[0] = { ...entries[0], timestamp: "not a date" };
+  entries[1] = { ...entries[1], timestamp: "not a date" };   // the call's own start is the other fallback
   assert.equal(run(entries, { payload: { cwd: repo } }).stdout, "", "no turn start to date the evidence against");
 });
 
@@ -1770,6 +1795,100 @@ test("the intent check and the change check agree: an exempt write is not a firs
   assert.ok(blocks(late));
   assert.match(late.json.reason, /shell command at entry \d+ whose write target the gate could not resolve/,
     "the event the change check blocked on is the one the intent check names");
+});
+
+// ---------- each shell call's evidence is its own execution window (#10) ----------
+//
+// Observed twice in 45 s: a heredoc into a doc in ANOTHER repository, and the
+// gate named `.tsx` files a concurrent process wrote 2.4 s before the call and
+// 7.4 s after its result — the turn-wide window made them this call's writes.
+
+const setMtime = (file, ms) => utimesSync(file, new Date(ms), new Date(ms));
+const startOf = (call) => Date.parse(call[0].timestamp);
+const endOf = (call) => Date.parse(call[1].timestamp);
+
+test("#10: a concurrent writer after the call is not its evidence, and the block says so", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n" });
+  const call = bash(HEREDOC_OUTSIDE);
+  setMtime(path.join(repo, "src/a.tsx"), endOf(call) + 4000);
+  const r = run(turn(call), { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the write is still unresolved");
+  assert.doesNotMatch(r.json.reason, /a\.tsx/);
+  assert.match(r.json.reason, /nothing in the working tree changed while this command ran/);
+});
+
+test("#10: a concurrent writer before the call is not its evidence", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n" });
+  const call = bash(HEREDOC_OUTSIDE);
+  setMtime(path.join(repo, "src/a.tsx"), startOf(call) - 3000);
+  const r = run(turn(call), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.doesNotMatch(r.json.reason, /a\.tsx/);
+});
+
+test("#10: an exempt file inside the window clears the call, whatever landed outside it", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n", "docs/a.md": "# a\n" });
+  const call = during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"));
+  setMtime(path.join(repo, "src/a.tsx"), endOf(call) + 4000);
+  assert.equal(run(turn(call), { payload: { cwd: repo } }).stdout, "");
+});
+
+test("#10: residual — a concurrent write inside the call's own window is still charged", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n" });
+  const r = run(turn(during(bash(HEREDOC_OUTSIDE), path.join(repo, "src/a.tsx"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /Changed: src\/a\.tsx/);
+});
+
+test("#10: the veto reads the exempt call's own window", () => {
+  const { repo } = repoFixture({ "src/notes.md": "# n\n", "src/a.tsx": "x\n" });
+  const outside = bash(`printf x > ${repo}/src/notes.md`);
+  setMtime(path.join(repo, "src/a.tsx"), endOf(outside) + 4000);
+  assert.equal(run(turn(outside), { payload: { cwd: repo } }).stdout, "", "beside it, but not while it ran");
+  const inside = during(bash(`printf x > ${repo}/src/notes.md`), path.join(repo, "src/a.tsx"));
+  const r = run(turn(inside), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /Changed: src\/a\.tsx/);
+  assert.match(r.json.reason, /read as prose-only/);
+});
+
+test("#10: a call with no timestamp starts at the turn's; one with no end runs to the Stop", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n" });
+  const file = path.join(repo, "src/a.tsx");
+  // Built in order, so the human prompt's stamp comes before the call's.
+  const prompt = human("do the thing");
+  const call = bash(HEREDOC_OUTSIDE);
+  setMtime(file, Date.parse(prompt.timestamp) + 400);
+  assert.doesNotMatch(run([prompt, call, said("done")], { payload: { cwd: repo } }).json.reason, /a\.tsx/,
+    "with its own stamp the call starts after the file");
+  const unstamped = [{ ...call[0], timestamp: undefined }, call[1]];
+  assert.match(run([prompt, unstamped, said("done")], { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/,
+    "without one it starts where the turn does");
+
+  const open = bash(HEREDOC_OUTSIDE);
+  setMtime(file, endOf(open) + 4000);
+  assert.match(run(turn(open[0]), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/, "no result");
+  const id = `Bash${++seq}`;
+  const background = [toolUse("Bash", { command: HEREDOC_OUTSIDE, run_in_background: true }, id),
+    toolResult(id, "Command running in background with ID: b1", { stdout: "", stderr: "", backgroundTaskId: "b1" })];
+  setMtime(file, endOf(background) + 4000);
+  assert.match(run(turn(background), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/,
+    "a background call's result is only its launch");
+});
+
+test("#10: a whole-second mtime gets the coarse slack; a sub-second one does not", () => {
+  const { repo } = repoFixture({ "src/a.tsx": "x\n" });
+  const file = path.join(repo, "src/a.tsx");
+  const coarse = bash(HEREDOC_OUTSIDE);
+  const t = startOf(coarse);
+  coarse[0] = { ...coarse[0], timestamp: new Date(t + 500).toISOString() };
+  setMtime(file, t - 1000);                                  // 1.5 s before, on a whole second
+  assert.match(run(turn(coarse), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/);
+  const fine = bash(HEREDOC_OUTSIDE);
+  const u = startOf(fine);
+  fine[0] = { ...fine[0], timestamp: new Date(u + 600).toISOString() };
+  setMtime(file, u - 900);                                   // 1.5 s before, sub-second
+  assert.doesNotMatch(run(turn(fine), { payload: { cwd: repo } }).json.reason, /a\.tsx/);
 });
 
 // ---------- the orchestrator arms the gate too (F10c) ----------
@@ -2568,4 +2687,49 @@ test("a finder still running in this task releases the marker", () => {
     ...write(`${PROJECT}/src/b.ts`), ...writeMarker(), said("done")]);
   assert.ok(!blocks(r), "a reviewer still working is not a missing one");
   assert.match(r.json.systemMessage, /a reviewer is still running/);
+});
+
+// --- slim plan #11: shell variables and deletions ----------------------------
+//
+// A turn that wrote only .md and .json was blocked for "~/.claude/$tmp" and two
+// removed plugin directories: the parser took an unexpanded `$tmp` as a literal
+// path, and counted deleted extensionless directories as code.
+
+test("#11: a variable is resolved from the command's own assignments, a bare mktemp included", () => {
+  assert.equal(run(turn(bash(`tmp=$(mktemp); jq '.a=1' ~/.claude.json > "$tmp" && mv "$tmp" ~/.claude.json`, "")),
+    { env: HOME_ENV, payload: { cwd: REAL_HOME } }).stdout, "", "the temp file is scratch and the target is .json");
+  assert.equal(run(turn(bash(`S=/private/tmp/claude-501/x/scratchpad; R=$S/repro; printf x > "$R/a.sh"`, ""))).stdout, "",
+    "an assignment built from an earlier one resolves through it");
+});
+
+test("#11: a variable the command never assigns is an unknown write, never a literal path", () => {
+  const r = run(turn(bash(`printf x > "$OUT/a.sh"`, "")));
+  assert.ok(blocks(r), "unknown is not scratch: it still gates");
+  assert.doesNotMatch(r.json.reason, /\$OUT/, "and no `$OUT` path is reported as changed");
+  assert.match(r.json.reason, /could not determine which files/);
+});
+
+test("#11: a variable set in two branches is unknown, not whichever assignment is nearer", () => {
+  const r = run(turn(bash(`if true; then X=${PROJECT}/f.mjs; else X=/private/tmp/scratch.txt; fi; printf x > "$X"`, "")));
+  assert.ok(blocks(r), "the nearer assignment is scratch, but the other branch writes code");
+  assert.match(r.json.reason, /could not determine which files/);
+  assert.equal(run(turn(bash(`f=/private/tmp/a.md; printf x > "$f"; f=/private/tmp/b.md; printf y > "$f"`, ""))).stdout, "",
+    "a name reassigned after it was read still resolves each read");
+});
+
+test("#11: a patch applied from a temp file is an unknown write, not the temp file", () => {
+  for (const apply of [`patch -p1 < "$tmp"`, `git apply "$tmp"`]) {
+    const r = run(turn(bash(`tmp=$(mktemp); git diff > "$tmp"; ${apply}`, "")));
+    assert.ok(blocks(r), `${apply} rewrites files the patch names`);
+    assert.match(r.json.reason, /could not determine which files/);
+  }
+});
+
+test("#11: removing a path outside the session's tree and every repository is not a change", () => {
+  const gone = [atHome(".claude/plugins/cache/srg-gone-plugin"), atHome(".claude/plugins/data/srg-gone-data")];
+  assert.equal(run(turn(bash(`rm -rf ${gone.join(" ")}`, "")), { env: HOME_ENV }).stdout, "");
+  // Inside the session's tree, and inside another repository, a removal still counts.
+  assert.ok(blocks(run(turn(bash(`rm ${PROJECT}/old.ts`, "")))));
+  const { repo } = repoFixture({ "keep.mjs": "x\n" });
+  assert.ok(blocks(run(turn(bash(`rm -rf ${repo}/lib`, "")), { env: HOME_ENV })), "a deletion inside any repository gates");
 });

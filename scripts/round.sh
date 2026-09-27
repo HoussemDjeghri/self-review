@@ -95,8 +95,9 @@ case "$round" in ''|*[!0-9]*) die "--round needs a positive integer, got: $round
 [ -z "$force" ] || [ -n "$reason" ] || die "--force needs --reason \"…\": a tier set by hand has to be auditable"
 
 # Checked here as well as inside scope.sh (lib/path.sh) so the round dies before
-# it creates anything, and with round.sh's name on the message.
-if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+# it creates anything, and with round.sh's name on the message. This is the
+# cwd's repository; the one under review is read from the scope below.
+if git rev-parse --show-toplevel >/dev/null 2>&1; then
   refuse_if_inside_repo "$work" "round.sh"
 fi
 
@@ -141,6 +142,19 @@ mkdir -p "$dir/state"   # reviewers append their lifeboat lines here
 # them can be looking at a different change from the others.
 scope="$dir/scope.diff"
 "$here/scope.sh" --work "$work" ${base:+--base "$base"} ${paths[@]+"${paths[@]}"} > "$scope"
+
+# The repository under review is the scope's, never the cwd's: given paths are
+# resolved to the repo each lives in, so a round run from anywhere else used to
+# stage, pre-flight and cold-run the cwd — which refused ("--out is inside the
+# repository") or was simply the wrong tree. The first `# repo:` is the one
+# tier.mjs and impact.mjs analyse. None means every path is in no repository:
+# there is no project to pre-flight and no tree to stage, and the round says so.
+# The plain section is printed last and holds raw file text, so reading stops at
+# its header — a scoped file containing a `# repo: ` line must not name the repository.
+repo_root="$(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; s/^# repo: //p' "$scope" | head -1)"
+if [ -n "$repo_root" ]; then
+  ( cd "$repo_root" && refuse_if_inside_repo "$work" "round.sh" ) || exit 2
+fi
 
 # An earlier review's work dir left inside the repository is scoped like any
 # other untracked file. Measured 2026-08-30: 4,337 lines of one, tier L, six
@@ -188,7 +202,10 @@ fi
 # Pre-flight belongs to round 1: a reviewer that reports a failing test is a
 # wasted agent, and by round 2 the suite has already been run on the fix.
 pf=""; pf_from=""
-if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
+if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ] && [ -z "$repo_root" ]; then
+  pf_from="no repository"
+  pf="# no checks run — every path in the scope is outside a repository, so there is no project to pre-flight"
+elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # From the install copy, not from the checkout. Eleven files in this plugin
   # resolved their own root with `new URL(import.meta.url).pathname`, which keeps
   # percent-encoding: any path with a space became `cold%20run` and everything
@@ -239,7 +256,7 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   #
   # A staging failure is reported, not fatal: pre-flight from the checkout is
   # what every release until now did, and it is worth more than no pre-flight.
-  pf_from="${repo_root:-$(pwd)}"
+  pf_from="$repo_root"
   stage="$dir/cold run – ü"
   if ship="$("$here/coldrun.sh" --root "$pf_from" --stage-only --out "$stage" 2>"$dir/stage.err")" && [ -d "$ship" ]; then
     pf_from="$ship"
@@ -299,8 +316,8 @@ if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # links, so the enumeration never walks into a dependency tree; the trailing
   # slash below is what makes the second `find` descend into one.
   tripped=""
-  if [ "$pf_from" != "${repo_root:-$(pwd)}" ]; then
-    checkout="$(cd -P "${repo_root:-$(pwd)}" && pwd)"
+  if [ "$pf_from" != "$repo_root" ]; then
+    checkout="$(cd -P "$repo_root" && pwd)"
     while IFS= read -r link; do
       [ -n "$link" ] || continue
       target="$(cd -P "$link" 2>/dev/null && pwd || true)"
@@ -328,11 +345,11 @@ EOF
   # failed stage does — and says which of the two happened, because "the stage is
   # broken for this project" is a defect in the plugin and "your suite is red" is
   # not, and the report must not let the lead confuse them.
-  if [ "$pf_from" != "${repo_root:-$(pwd)}" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
+  if [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
     echo "round.sh: no check could start in the install copy — a defect in this plugin's staging, not in the project. Re-running pre-flight from the checkout; report both." >&2
     mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
     # The same pnpm switch as the first run, for the same reason.
-    if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "${repo_root:-$(pwd)}" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
+    if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$repo_root" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
       echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
     fi
     tripped="$tripped
@@ -341,7 +358,7 @@ INFRA staging  no check could start in the install copy (${dir}/preflight-stage.
     # comment above it says why that is load-bearing. Rewriting preflight.txt
     # without moving `pf_from` printed the stage's path over the checkout's
     # verdicts — contradicting, four lines apart, the INFRA line just appended.
-    pf_from="${repo_root:-$(pwd)}"
+    pf_from="$repo_root"
   fi
 
   pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|INFRA|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
@@ -377,14 +394,14 @@ INFRA staging  no check could start in the install copy (${dir}/preflight-stage.
   # only when the runner's own TAP plan says a suite ran and none of it failed —
   # `node --test` writes no TAP at all when NODE_TEST_CONTEXT is set, and exits
   # 0 while doing it.
-  artifact_root="$(SELF_REVIEW_LIB="$here/../hooks/lib/config.mjs" SELF_REVIEW_ROOT="${repo_root:-$(pwd)}" node -e '
+  artifact_root="$(SELF_REVIEW_LIB="$here/../hooks/lib/config.mjs" SELF_REVIEW_ROOT="$repo_root" node -e '
     import(process.env.SELF_REVIEW_LIB)
       .then((m) => process.stdout.write(String(m.loadConfig(process.env.SELF_REVIEW_ROOT).preflight?.artifactRoot ?? "")))
       .catch(() => {});' 2>/dev/null || true)"
-  if [ -n "$artifact_root" ] && [ -d "${repo_root:-$(pwd)}/$artifact_root" ]; then
+  if [ -n "$artifact_root" ] && [ -d "$repo_root/$artifact_root" ]; then
     ship_root="$dir/artifact-root"
     rm -rf "$ship_root"
-    if cp -R "${repo_root:-$(pwd)}/$artifact_root" "$ship_root" 2>"$dir/artifact.err"; then
+    if cp -R "$repo_root/$artifact_root" "$ship_root" 2>"$dir/artifact.err"; then
       ship_tests=()
       while IFS= read -r -d "" f; do ship_tests+=("$f"); done < <(
         find "$ship_root" -name '.*' -prune -o -name '*.test.mjs' -print0 2>/dev/null | sort -z)
@@ -529,10 +546,12 @@ cold=""; cold_skipped=""
 # a shell to run the changed script itself, uncontained. The surface is the
 # question; who grades it is a separate one.
 if node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).kinds.executable?.length?0:1)}catch{process.exit(1)}' "$dir/tier.json"; then
-  # Reported, not swallowed, and never fatal: without a transcript angle X
-  # files "could not be exercised", which is a true statement about the review.
-  # Losing the round over it would not be.
-  if "$here/coldrun.sh" --root "${repo_root:-$(pwd)}" --scope "$scope" --out "$dir/cold run" >"$dir/coldrun.txt" 2>"$dir/coldrun.err"; then
+  # Reported, not swallowed, and never fatal: the skip is recorded in tier.json
+  # and printed below, which is a true statement about the review. Losing the
+  # round over it would not be.
+  if [ -z "$repo_root" ]; then
+    cold_skipped="every path in the scope is outside a repository — there is no tree to stage for a cold run"
+  elif "$here/coldrun.sh" --root "$repo_root" --scope "$scope" --out "$dir/cold run" >"$dir/coldrun.txt" 2>"$dir/coldrun.err"; then
     cold="$dir/cold run/transcript.md"
     # A grader with no transcript is a spawn that can only file "not exercised":
     # measured 2026-08-30 at 237k tokens and four tool calls for that sentence.
@@ -557,8 +576,8 @@ fi
 # plans BEFORE the run happens: the plan says "X if there is a runnable surface",
 # and the round says "and there was a transcript". Two questions, kept apart.
 #
-# The compact path is untouched: there the transcript goes to the single finder
-# as a section, and an absent section already reads as "not exercised".
+# On the compact path the single finder gets the transcript as a section; with
+# none, brief.mjs tells it the round reports the skip, so it files nothing.
 if [ -n "$cold_skipped" ]; then
   cold=""
   dropped="$(node -e '

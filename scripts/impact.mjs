@@ -62,14 +62,60 @@ export function parseStatusLine(line) {
   return { path: unquote(file), status, ...(from ? { from } : {}) };
 }
 
+// A path in no repository is printed in full under `==> path <==` (scope.sh
+// emit_plain). It is read as a pseudo-repository whose files were all added, so
+// the file list and the line counts come from the bundle itself — returning no
+// repos for it made tier.mjs plan zero finders and round.sh call a two-file
+// scope "empty". Its diff is synthesised in unified form so parseDiff counts it.
+const PLAIN_HEADER = /^# self-review scope \(not a git repo/;
+
+function plainRepo() {
+  return { root: "", base: null, plain: true, files: [], diff: [], pending: null };
+}
+
+function closePlainFile(repo) {
+  const file = repo.pending;
+  if (!file) return;
+  repo.pending = null;
+  // emit_plain prints one blank line before every header; it is not content.
+  if (file.lines.length && file.lines[file.lines.length - 1] === "") file.lines.pop();
+  if (file.status !== "A") return;
+  repo.diff.push("--- /dev/null", `+++ b/${file.path}`, `@@ -0,0 +1,${file.lines.length} @@`, ...file.lines.map((line) => `+${line}`));
+}
+
 export function parseScope(text) {
   const truncated = /^# TRUNCATED:/m.test(text);
-  if (/^# self-review scope \(not a git repo/m.test(text)) return { plain: true, truncated, repos: [] };
   const repos = [];
   let repo = null, section = null;
   for (const line of text.split("\n")) {
-    if (line === "# self-review scope") { repo = { root: "", base: "HEAD", files: [], diff: [] }; repos.push(repo); section = null; continue; }
+    // Plain content is raw file text, so after the plain header only `==>` and
+    // `# TRUNCATED:` are structure.
+    if (!repo?.plain && line === "# self-review scope") { repo = { root: "", base: "HEAD", files: [], diff: [] }; repos.push(repo); section = null; continue; }
+    if (!repo?.plain && PLAIN_HEADER.test(line)) { repo = plainRepo(); repos.push(repo); section = null; continue; }
     if (!repo) continue;
+    if (repo.plain) {
+      if (/^# TRUNCATED:/.test(line)) { closePlainFile(repo); continue; }
+      const header = line.match(/^==> (.+) <==$/);
+      if (header) {
+        closePlainFile(repo);
+        repo.pending = { path: header[1], status: "A", lines: [] };
+        repo.files.push(repo.pending.entry = { path: header[1], status: "A" });
+        continue;
+      }
+      const file = repo.pending;
+      if (!file) continue;
+      // The first line after a header says what the path was: a directory
+      // lists its files (their contents are not in the bundle), a missing path
+      // was deleted, anything else is the file's own first line.
+      if (!file.lines.length && file.status === "A") {
+        const inside = line.match(/^ {2}\(dir contains\) (.+)$/);
+        if (inside) { file.status = "dir"; repo.files.splice(repo.files.indexOf(file.entry), 1); }
+        else if (line === "  (missing — deleted this turn?)") { file.status = file.entry.status = "D"; continue; }
+      }
+      if (file.status === "dir") { const inside = line.match(/^ {2}\(dir contains\) (.+)$/); if (inside) repo.files.push({ path: inside[1], status: "A" }); continue; }
+      if (file.status === "A") file.lines.push(line);
+      continue;
+    }
     const root = line.match(/^# repo: (.+)$/);
     if (root) { repo.root = root[1].trim(); continue; }
     const base = line.match(/^# branch: .*\bbase: (\S+)/);
@@ -79,7 +125,11 @@ export function parseScope(text) {
     if (section === "files") { const entry = parseStatusLine(line); if (entry) repo.files.push(entry); continue; }
     if (section === "diff") repo.diff.push(line);
   }
-  return { plain: false, truncated, repos };
+  for (const entry of repos) if (entry.plain) { closePlainFile(entry); delete entry.pending; }
+  // `plain` still means "no repository anywhere in this scope": impact has
+  // nothing to search then. A mixed scope keeps its git repos first, as
+  // scope.sh emits them, so repos[0] is the one impact and tier analyse.
+  return { plain: repos.length > 0 && repos.every((entry) => entry.plain), truncated, repos };
 }
 
 // --- changed symbols -------------------------------------------------------
@@ -572,7 +622,7 @@ export function analyse({ scope, root: rootOverride, base: baseOverride, adapter
       summary: "IMPACT: no repository — no impact analysis",
     };
   }
-  const repo = scope.repos[0];
+  const repo = scope.repos.find((entry) => !entry.plain);
   const root = rootOverride || repo.root;
   const base = baseOverride || repo.base;
   const notes = scope.repos.length > 1

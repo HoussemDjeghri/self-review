@@ -55,9 +55,27 @@ test("the scope bundle is parsed, not re-derived from git", () => {
 
 test("a truncated scope and a plain (non-git) scope are both recognised", () => {
   assert.equal(parseScope("# self-review scope\n# repo: /r\n\n# TRUNCATED: 9000 lines total, showing 6000.").truncated, true);
-  const plain = parseScope("# self-review scope (not a git repo — full file contents)\n# generated: x\n");
+  const plain = parseScope("# self-review scope (not a git repo — full file contents)\n# generated: x\n\n==> /x/a.sh <==\necho a\n");
   assert.equal(plain.plain, true);
-  assert.deepEqual(plain.repos, []);
+  assert.deepEqual(plain.repos[0].files, [{ path: "/x/a.sh", status: "A" }], "a file outside git is a file, not nothing");
+  assert.deepEqual(plain.repos[0].diff.slice(0, 4), ["--- /dev/null", "+++ b//x/a.sh", "@@ -0,0 +1,1 @@", "+echo a"]);
+  // Git sections come first, so a mixed scope keeps its repository as repos[0].
+  const mixed = parseScope(scopeBundle("/repo", ["  M  a.mjs"], "") + "\n# self-review scope (not a git repo — full file contents)\n\n==> /x/b <==\nb\n");
+  assert.equal(mixed.plain, false);
+  assert.deepEqual(mixed.repos.map((r) => r.files.length), [1, 1]);
+});
+
+test("plain content that looks like a header stays content", () => {
+  const scope = parseScope([
+    "# self-review scope (not a git repo — full file contents)", "# generated: x", "",
+    "==> /x/notes.md <==", "# self-review scope", "# repo: /etc", "# self-review scope (not a git repo)", "last", "",
+  ].join("\n"));
+  assert.equal(scope.repos.length, 1, "a header-shaped line inside a plain file opens no new section");
+  assert.equal(scope.repos[0].plain, true);
+  assert.equal(scope.repos[0].root, "", "a `# repo: ` line in file text names no repository");
+  assert.deepEqual(scope.repos[0].files, [{ path: "/x/notes.md", status: "A" }]);
+  assert.equal(scope.repos[0].diff[2], "@@ -0,0 +1,4 @@", "the three header-shaped lines are counted as added content");
+  assert.ok(scope.repos[0].diff.includes("+# repo: /etc"));
 });
 
 test("a status line survives the porcelain spellings scope.sh produces", () => {

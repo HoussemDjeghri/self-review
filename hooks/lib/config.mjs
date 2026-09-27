@@ -274,13 +274,21 @@ export function loadConfig(repoRoot) {
   return repoRoot ? mergeRepo(config, repoRoot) : config;
 }
 
-// "self-review" when the files run from a plain skill directory, "<plugin>:self-review"
-// when they run from an installed plugin — the name the Skill tool expects.
-export function skillName() {
+// The plugin's own name, or "" when the files run from a plain skill directory.
+export function pluginName(root = PLUGIN_ROOT) {
   try {
-    const { name } = readJson(path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"));
-    return name ? `${name}:self-review` : "self-review";
+    return readJson(path.join(root, ".claude-plugin", "plugin.json")).name || "";
   } catch {
-    return "self-review";
+    return "";
   }
+}
+
+// "self-review" from a plain skill directory, "<plugin>:self-review" from an
+// installed plugin — the name the Skill tool expects.
+export const skillName = () => qualified("self-review");
+
+// A skill or agent name as the harness registers it: namespaced by the plugin.
+export function qualified(name) {
+  const plugin = pluginName();
+  return plugin ? `${plugin}:${name}` : name;
 }

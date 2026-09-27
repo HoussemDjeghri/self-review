@@ -830,3 +830,55 @@ test("D2: with no records for the round just finished, it says W cannot be compu
   verdictAboveTable(done, /^converge: no records for round 1 — W cannot be computed$/);
   assert.doesNotMatch(done.stdout, /CONTINUE|ESCALATE|STOP/, "and no verdict it could not compute");
 });
+
+test("the repository comes from the scoped paths, not from the cwd", () => {
+  // Rounds on paths outside git died "scope is empty": impact.mjs dropped every
+  // file under the plain section, and round.sh took its root from the cwd, so
+  // staging and the cold run were pointed at a tree the scope never named.
+  const outside = mkdtempSync(path.join(tmpdir(), "round-cwd-"));
+  const loose = mkdtempSync(path.join(tmpdir(), "round-loose-"));
+  writeFileSync(path.join(loose, "a.sh"), "#!/usr/bin/env bash\necho a\n");
+  chmodSync(path.join(loose, "a.sh"), 0o755);
+  writeFileSync(path.join(loose, "b.mjs"), "export const b = 1;\n");
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "round-work-")), "sr");
+  mkdirSync(work, { recursive: true });
+  writeFileSync(path.join(work, "intent.md"), "intent\n");
+
+  const plain = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md"),
+    path.join(loose, "a.sh"), path.join(loose, "b.mjs")], { cwd: outside, encoding: "utf8" });
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(tierOf(work, 1).metrics.files, 2, "both files outside git are in the round");
+  assert.match(plain.stdout, /^# no checks run — every path in the scope is outside a repository/m);
+  assert.doesNotMatch(plain.stderr, /coldrun\.sh failed|could not stage/, "nothing was staged from the cwd");
+
+  // A git path named from an unrelated cwd: staging and the cold run are rooted
+  // at the path's repository, so neither refuses and pre-flight runs in the copy.
+  const { repo, work: gitWork } = runnableFixture();
+  writeFileSync(path.join(repo, "test.sh"), '#!/bin/sh\necho "root: $(cd "$(dirname "$0")" && pwd)"\nexit 1\n');
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const git = spawnSync("bash", [ROUND, "--work", gitWork, "--round", "1", "--intent", path.join(gitWork, "intent.md"),
+    path.join(repo, "src/cli.mjs"), path.join(repo, "ship.sh")], { cwd: outside, encoding: "utf8" });
+  assert.equal(git.status, 0, git.stderr);
+  assert.doesNotMatch(git.stderr, /could not stage|coldrun\.sh failed/, git.stderr);
+  const ran = /^root: (.*)$/m.exec(readFileSync(path.join(gitWork, "round-1", "preflight.txt"), "utf8"))?.[1];
+  assert.equal(ran, realpathSync(path.join(gitWork, "round-1", "cold run – ü", "install")));
+  assert.doesNotMatch(tierOf(gitWork, 1).coldSkipped ?? "", /failed|outside a repository/);
+});
+
+test("a `# repo: ` line inside a plain file does not name the repository", () => {
+  // The plain section is raw file text: a scoped file that happens to hold a
+  // scope-header-shaped line must stay content, or the round is rooted at it.
+  const outside = mkdtempSync(path.join(tmpdir(), "round-cwd-"));
+  const loose = mkdtempSync(path.join(tmpdir(), "round-loose-"));
+  writeFileSync(path.join(loose, "a.sh"), "#!/usr/bin/env bash\necho a\n");
+  writeFileSync(path.join(loose, "notes.md"), "# notes\n# repo: /etc\n");
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "round-work-")), "sr");
+  mkdirSync(work, { recursive: true });
+  writeFileSync(path.join(work, "intent.md"), "intent\n");
+
+  const done = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md"),
+    path.join(loose, "a.sh"), path.join(loose, "notes.md")], { cwd: outside, encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^# no checks run — every path in the scope is outside a repository/m);
+  assert.doesNotMatch(done.stdout + done.stderr, /\/etc(?![\w/-])/, "/etc is never named as the root");
+});

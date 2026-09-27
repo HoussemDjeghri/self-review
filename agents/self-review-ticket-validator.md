@@ -72,12 +72,10 @@ is malformed, exactly as a finding with no proof would be.
 Rule on the ticket in front of you. Do not ask for a better one: there is
 nobody to answer, and a `revise` with your own corrected block IS the answer.
 
-**Your last message is the report.** The caller reads it with `salvage.mjs`,
-which prints the final message of your transcript and nothing else — so the
-JSON must be that message, with no summary sentence after it. Never deliver it
-through `SendMessage` or any other channel: on 2026-09-03 three reviewers
-reported that way, every call returned `success:true`, nothing was delivered,
-and the lead sat idle for 2h49m over reports that were already on disk.
+**Your last message is the report.** Put the JSON in it with no summary
+sentence after it, because the caller reads only that message (`salvage.mjs`).
+Never send it through `SendMessage` or any other channel — a report sent there
+may never arrive.
 
 ## Output — exactly this JSON, nothing after it
 

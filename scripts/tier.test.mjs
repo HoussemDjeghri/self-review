@@ -370,6 +370,14 @@ test("a truncated scope is L and says it must be split", () => {
   assert.equal(result.split, true);
 });
 
+test("a mixed scope weighs the files outside any repository too", () => {
+  const plainSection = ["# self-review scope (not a git repo — files in full)", "", "==> /private/tmp/loose.mjs <==", "one", "two", "three", "four", "five"].join("\n");
+  const scope = parseScope(`${bundle(["M  README.md"], hunk("README.md", ["a", "b", "c"]))}\n${plainSection}`);
+  const result = plan({ scope, impact: IMPACT(), config: TIER, exempt: EXEMPT });
+  assert.equal(result.metrics.files, 2);
+  assert.equal(result.metrics.lines.code, 5);
+});
+
 test("a new code file with no test in a tested project is L, not M", () => {
   const impact = IMPACT({ symbols: [{ name: "handler", file: "src/new.ts", test_refs: 0 }], project_has_tests: true });
   const result = planFor(["A  src/new.ts", "M  src/old.ts"], hunk("src/new.ts", ["export function handler() {}"]), impact);
