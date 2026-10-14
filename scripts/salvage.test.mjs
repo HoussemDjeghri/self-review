@@ -108,6 +108,18 @@ test("a tilde CLAUDE_CONFIG_DIR is expanded, like the sibling hooks do", () => {
   assert.match(run(["sess-7"], { HOME: home, CLAUDE_CONFIG_DIR: "~/cfg" }).stdout, /atil/);
 });
 
+test("--help and -h print the usage and exit 0; an unknown flag exits 2 naming it", () => {
+  for (const flag of ["--help", "-h"]) {
+    const help = run([flag]);
+    assert.equal(help.status, 0, flag);
+    assert.match(help.stdout, /^usage: salvage\.mjs /, flag);
+  }
+  const { dir } = layout();
+  const typo = run([dir, "--all-txt"]);
+  assert.equal(typo.status, 2);
+  assert.match(typo.stderr, /unknown flag --all-txt/);
+});
+
 test("an unknown place fails loudly and an unknown name is reported", () => {
   const missing = run(["/nope/nothing-here"]);
   assert.equal(missing.status, 2);
@@ -116,4 +128,30 @@ test("an unknown place fails loudly and an unknown name is reported", () => {
   const miss = run([dir, "ghost"]);
   assert.notEqual(miss.status, 0);
   assert.match(miss.stderr, /ghost/);
+});
+
+test("a name finds a transcript the harness filed as bare hex, through its sidecar", () => {
+  const { dir } = layout();
+  writeFileSync(path.join(dir, "agent-a1489047d40a07e99.jsonl"), jsonl([entry([text("the sidecar report")], "end_turn")]));
+  writeFileSync(path.join(dir, "agent-a1489047d40a07e99.meta.json"), JSON.stringify({ name: "self-review-finder-r1-compact" }));
+  const r = run([dir, "self-review-finder-r1-compact"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /the sidecar report/);
+});
+
+test("a name launched more than once prints its newest launch, warns, and an older one is reached by its stem", () => {
+  // B7: a name reused across reviews returned another review's report, once
+  // from two days earlier, noticed only by reading timestamps.
+  const { dir } = layout();
+  writeFileSync(path.join(dir, "agent-aself-review-finder-r1-ab-1111111111111111.jsonl"), jsonl([entry([text("the OLD review's report")], "end_turn")]));
+  writeFileSync(path.join(dir, "agent-aself-review-finder-r1-ab-2222222222222222.jsonl"), jsonl([entry([text("this review's report")], "end_turn")]));
+  writeFileSync(path.join(dir, "agent-aself-review-finder-r1-ab-2-3333333333333333.jsonl"), jsonl([entry([text("a renamed sibling")], "end_turn")]));
+  const r = run([dir, "self-review-finder-r1-ab"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /this review's report/);
+  assert.doesNotMatch(r.stdout, /OLD review|renamed sibling/, "one report per name, and an exact name outranks X-2");
+  assert.match(r.stderr, /"self-review-finder-r1-ab" was launched 2 times — printing the newest; older \(pass a stem to print one\): aself-review-finder-r1-ab-1111111111111111/);
+  const older = run([dir, "aself-review-finder-r1-ab-1111111111111111"]);
+  assert.match(older.stdout, /the OLD review's report/);
+  assert.equal(older.stderr, "");
 });

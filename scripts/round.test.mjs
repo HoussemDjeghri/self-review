@@ -44,6 +44,14 @@ const run = (repo, args) =>
 const tierOf = (work, round) =>
   JSON.parse(readFileSync(path.join(work, `round-${round}`, "tier.json"), "utf8"));
 
+/** `findings.mjs record` for one round — a later round refuses to plan over an unrecorded one. */
+const recordRound = (repo, work, round, entries = []) => {
+  const done = spawnSync(process.execPath, [FINDINGS, "record", "--work", work, "--round", String(round)],
+    { input: JSON.stringify(entries), encoding: "utf8", cwd: repo });
+  assert.equal(done.status, 0, done.stderr);
+  return done;
+};
+
 test("a change that ships something runnable gets a cold run, and its verdict reaches the caller", () => {
   // coldrun.sh keeps its stdout to a few lines so they can land in the calling
   // session; round.sh redirected them into a file nothing ever read. That hid
@@ -104,6 +112,7 @@ test("a later round inherits round 1's tier as a ceiling", () => {
   const { repo, work } = fixture();
   run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight"]);
   assert.equal(tierOf(work, 1).tier, "S");
+  recordRound(repo, work, 1);
 
   mkdirSync(path.join(repo, "test"), { recursive: true });
   writeFileSync(path.join(repo, "test/cli.test.mjs"), Array.from({ length: 24 }, (_, i) => `// test line ${i}`).join("\n"));
@@ -394,6 +403,30 @@ test("pre-flight runs with pnpm's pre-run install off, and the tripwire watches 
     `a write through a package's link must trip like one through the root's:\n${done.stdout}`);
 });
 
+test("B6: writes through many staged links are one TRIP line, with every link in a file", () => {
+  // vite writes `node_modules/.vite-temp` in every workspace package it loads a
+  // config from, so one round printed one TRIP line per package — ~85 lines over
+  // nine sessions, filtered out with `grep -v` until the filter hit SIGPIPE. The
+  // writes are real, so they are still reported; once, not once per package.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  for (const pkg of ["a", "b", "c"]) {
+    mkdirSync(path.join(repo, "packages", pkg, "node_modules"), { recursive: true });
+    writeFileSync(path.join(repo, "packages", pkg, "index.js"), "export default 1;\n");
+  }
+  writeFileSync(path.join(repo, "test.sh"),
+    "#!/bin/sh\nfor p in a b c; do mkdir -p packages/$p/node_modules/.vite-temp; done\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  const trips = done.stdout.split("\n").filter((line) => line.startsWith("TRIP"));
+  assert.equal(trips.length, 1, done.stdout);
+  assert.match(trips[0], /^TRIP {2}3 linked trees {4}pre-flight wrote into the checkout through the staged links — first: packages\/a\/node_modules: .*; all 3 in .*tripwire\.txt$/);
+  const listed = readFileSync(path.join(work, "round-1", "tripwire.txt"), "utf8");
+  for (const pkg of ["a", "b", "c"]) assert.match(listed, new RegExp(`^TRIP {2}packages/${pkg}/node_modules {4}`, "m"), listed);
+});
+
 test("a symlink the repository itself commits is not a path into the checkout", () => {
   // The tripwire walks every link in the stage at any depth, and the copy keeps
   // the repo's own links. A relative `current -> releases/v1` lands pointing
@@ -512,6 +545,31 @@ test("a failing pre-flight is reported, not swallowed", () => {
   assert.match(readFileSync(path.join(work, "round-1", "preflight.err"), "utf8"), /crash/);
 });
 
+test("B4: a scope larger than the pipe buffer is truncated and the round still runs", () => {
+  // The field shape: `--round N` with no paths over a tree holding an untracked
+  // scratch dir. scope.sh's truncation died of SIGPIPE under pipefail and
+  // round.sh with it, exit 141 and not a word on stderr.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "scratch.txt"), "line\n".repeat(100000));
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight"]);
+  assert.equal(done.status, 0, `exit ${done.status}: ${done.stderr}`);
+  assert.match(readFileSync(path.join(work, "round-1", "scope.diff"), "utf8"), /^# TRUNCATED: /m);
+});
+
+test("B4: a step that dies is named on stderr, and its exit code is kept", () => {
+  // 30 field failures were a bare exit 141: no message, and three to five turns
+  // of `bash -x` each to find which step it was. Whatever the next one is, it
+  // says where it stopped.
+  for (const [name, code] of [["scope.sh", 141], ["tier.mjs", 3]]) {
+    const { repo, work } = fixture();
+    const round = shadowRound(work, { [name]: `#!/bin/sh\nexit ${code}\n` });
+    const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight"],
+      { cwd: repo, encoding: "utf8" });
+    assert.equal(done.status, code, done.stderr);
+    assert.match(done.stderr, new RegExp(`^round\\.sh: stopped at line \\d+ \\(exit ${code}[^)]*\\): .*${name.replace(".", "\\.")}`, "m"), done.stderr);
+  }
+});
+
 test("an asset-only change is not reported as an empty scope", () => {
   // Zero finders has two causes. tier.mjs lists assets and deliberately does
   // not review them, so a round whose only remaining diff is a regenerated
@@ -601,9 +659,11 @@ test("no artifactRoot means the check does not run at all", () => {
 test("every check failing to start in the copy falls back to the checkout and names the cause", () => {
   // All-INFRA is the staging failure discovered one step later: the reviewers
   // still need a real verdict on the code, and the checkout is where the checks
-  // are known to run. It must also say WHICH of the two happened — "the stage is
-  // broken for this project" is a defect in this plugin and "your suite is red"
-  // is not, and a report that lets the lead confuse them is worse than silent.
+  // are known to run. It must also say WHICH of the two happened — and an exit
+  // 127 is "a tool was not found", which is a fact about the toolchain before it
+  // is anything else. Worded as "a defect in this plugin" it was printed ~55
+  // times over venv projects whose tools were simply not on PATH, and nobody
+  // reported it, because it was not one.
   const { repo, work } = fixture();
   // A shebang naming an interpreter that does not exist: the shell answers 127,
   // which is exactly "this never ran" and needs no per-tool knowledge to read.
@@ -612,10 +672,12 @@ test("every check failing to start in the copy falls back to the checkout and na
 
   const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
   assert.equal(done.status, 0, done.stderr);
-  assert.match(done.stderr, /no check could start in the install copy — a defect in this plugin's staging/, done.stderr);
+  assert.match(done.stderr, /no check could start in the install copy — a tool not found or not executable there \(exit 127\/126\)/, done.stderr);
+  assert.doesNotMatch(done.stderr, /defect in this plugin/, done.stderr);
   assert.ok(existsSync(path.join(work, "round-1", "preflight-stage.txt")),
-    "the copy's own report is kept: it is the evidence for the plugin defect");
-  assert.match(done.stdout, /INFRA staging {2}no check could start in the install copy/, done.stdout);
+    "the copy's own report is kept: it is the evidence for whichever cause it was");
+  // The checkout could not start them either, so the stage is not the cause.
+  assert.match(done.stdout, /INFRA staging {2}no check could start in the install copy or in the checkout .*not a staging defect/, done.stdout);
   // The header names where the verdicts under it came from. Rewriting
   // preflight.txt from the checkout without moving `pf_from` printed the stage's
   // path over the checkout's verdicts, contradicting the INFRA line four rows
@@ -625,6 +687,53 @@ test("every check failing to start in the copy falls back to the checkout and na
   assert.match(done.stdout, /pre-flight \(from .*\/repo\):/,
     "the fallback reran from the checkout, so the header must say the checkout");
   assert.doesNotMatch(done.stdout, /pre-flight \(from .*cold run/, done.stdout);
+});
+
+test("a tool only the checkout has is named as missing from the staged copy", () => {
+  // The other half of the fallback: the checks start from the checkout and not
+  // from the copy, so something the project runs is not in the stage.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "tools/\n");
+  mkdirSync(path.join(repo, "tools"), { recursive: true });
+  writeFileSync(path.join(repo, "tools", "run"), "#!/bin/sh\necho ran\n");
+  chmodSync(path.join(repo, "tools", "run"), 0o755);
+  writeFileSync(path.join(repo, "test.sh"), "#!/bin/sh\nexec ./tools/run\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /INFRA staging {2}no check could start in the install copy, and they do from the checkout — a tool the staged copy does not have/, done.stdout);
+  assert.match(done.stdout, /^PASS\s+test\s+\.\/test\.sh/m, "the verdict is the checkout's");
+});
+
+test("B6: a Python project's checks run from its own .venv in the staged copy", () => {
+  // The tools of a uv/venv project live in the checkout's .venv/bin, which no
+  // shell in a review has activated. coldrun.sh already links `.venv` into the
+  // stage, as it links node_modules; what nothing did was put its bin on PATH,
+  // as a package manager does for node_modules/.bin. So `ruff` resolved to a
+  // pyenv shim that answers 127 in a project pinning an uninstalled Python, and
+  // every --new-review of that project blamed the plugin.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), ".venv/\n");
+  writeFileSync(path.join(repo, "pyproject.toml"), "[project]\nname = \"p\"\n");
+  const venvBin = path.join(repo, ".venv", "bin");
+  const shims = path.join(path.dirname(work), "shims");
+  mkdirSync(venvBin, { recursive: true });
+  mkdirSync(shims, { recursive: true });
+  for (const tool of ["ruff", "mypy", "pytest"]) {
+    writeFileSync(path.join(venvBin, tool), "#!/bin/sh\necho venv\n");
+    chmodSync(path.join(venvBin, tool), 0o755);
+    writeFileSync(path.join(shims, tool), `#!/bin/sh\necho "pyenv: ${tool}: command not found" >&2\nexit 127\n`);
+    chmodSync(path.join(shims, tool), 0o755);
+  }
+
+  const done = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...process.env, PATH: `${shims}:${process.env.PATH}` } });
+  assert.equal(done.status, 0, done.stderr);
+  assert.doesNotMatch(done.stderr, /no check could start/, done.stderr);
+  assert.match(done.stdout, /^pre-flight \(from .*cold run – ü\/install\):/m, done.stdout);
+  assert.match(done.stdout, /^PASS\s+test\s+pytest -q/m, done.stdout);
+  assert.match(done.stdout, /^PASS\s+lint\s+ruff check/m, done.stdout);
 });
 
 test("the tripwire is silent when pre-flight ran from the checkout, where there is no link", () => {
@@ -740,6 +849,7 @@ test("D1: a review's later rounds are capped by its own round 1, not by an earli
   assert.equal(second.status, 0, second.stderr);
   const two = workLine(second);
   assert.equal(tierOf(two, 1).tier, "S");
+  recordRound(repo, two, 1);
 
   mkdirSync(path.join(repo, "test"), { recursive: true });
   writeFileSync(path.join(repo, "test/cli.test.mjs"), Array.from({ length: 24 }, (_, i) => `// test line ${i}`).join("\n"));
@@ -781,9 +891,12 @@ const reviewWithRecords = (records) => {
   assert.equal(done.status, 0, done.stderr);
   const review = workLine(done);
   for (const [round, entries] of Object.entries(records)) {
-    const rec = spawnSync(process.execPath, [FINDINGS, "record", "--work", review, "--round", round, "--repo", repo],
-      { input: JSON.stringify(entries), encoding: "utf8", cwd: repo });
-    assert.equal(rec.status, 0, rec.stderr);
+    // `record` refuses a round with no plan; a test's planRound2 overwrites this one.
+    if (Number(round) > 1 && !existsSync(path.join(review, `round-${round}`, "tier.json"))) {
+      mkdirSync(path.join(review, `round-${round}`), { recursive: true });
+      writeFileSync(path.join(review, `round-${round}`, "tier.json"), JSON.stringify({ tier: "S", round: Number(round) }));
+    }
+    recordRound(repo, review, round, entries);
   }
   return { repo, review, intent: path.join(review, "intent.md") };
 };
@@ -817,18 +930,70 @@ test("D2: round 3 prints converge's verdict on round 2 — ESCALATE on a plateau
   verdictAboveTable(done, /^converge \(round 2\): ESCALATE — /);
 });
 
-test("D2: round 3 prints converge's verdict on round 2 — STOP on a spent budget", () => {
+test("D2: a round after a clean one prints CLEAN, and runs", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [] });
+  const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge \(round 1\): CLEAN — round 1 fixed nothing/);
+});
+
+// --- R3: a STOP ends the review; round.sh does not plan past it ------------
+// The verdict on round N-1 was printed at the top of round N — after the round
+// had been started — so a spent budget was read as advice, and the final
+// round's verdict was never computed at all.
+
+/** Exit 5, nothing created, and only the verdict and the call that acts on it. */
+const refusedAfter = (done, review, round) => {
+  assert.equal(done.status, 5, `${done.stdout}\n${done.stderr}`);
+  assert.equal(existsSync(path.join(review, `round-${round}`)), false, `round-${round}/ is not created`);
+  assert.doesNotMatch(done.stdout, /^tier /m, "no plan is printed");
+};
+
+test("R3: at the cap, a round that fixed only a minor ends the review — the next round is refused", () => {
   const { repo, review, intent } = reviewWithRecords({ 1: [finding("major"), finding("major")], 2: [finding("minor")] });
   planRound2(review, 2);
   const done = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
-  verdictAboveTable(done, /^converge \(round 2\): STOP — /);
+  refusedAfter(done, review, 3);
+  const lines = done.stdout.trim().split("\n");
+  assert.match(lines[0], /^STOP — round budget of 2 is spent/);
+  assert.match(lines[1], /^next: (?:'[^']*converged\.sh'|\S*converged\.sh) --not-converged --rounds 2 --fixed 3 --dismissed 0 --open 0 --tier S /);
+  assert.match(lines.slice(2).join("\n"), /^ {2}round 2's fixes ship unreviewed/, "and the line that says this is the honest end");
 });
 
-test("D2: with no records for the round just finished, it says W cannot be computed", () => {
+test("R3: a major fixed at the cap earns one round, and the round after it is refused", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("major"), finding("major")], 2: [finding("major")] });
+  planRound2(review, 2);
+  const extension = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
+  assert.equal(extension.status, 0, extension.stderr);
+  assert.ok(existsSync(path.join(review, "round-3", "briefs")), "the extension round runs");
+
+  recordRound(repo, review, 3, [finding("minor")]);
+  refusedAfter(run(repo, ["--work", review, "--round", "4", "--intent", intent, "--no-preflight"]), review, 4);
+});
+
+test("R3: a CONFIRMED finding left unfixed at the cap is a STOP, and the next round is refused", () => {
+  const unfixed = { ...finding("minor"), verdict: "unfixed", summary: "a confirmed defect the applier could not fix" };
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("major"), finding("major")], 2: [finding("minor"), unfixed] });
+  planRound2(review, 2);
+  const done = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
+  refusedAfter(done, review, 3);
+  assert.match(done.stdout, /^STOP — 1 CONFIRMED finding\(s\) left unfixed: \[[0-9a-f]{8}\]/m, done.stdout);
+  assert.match(done.stdout, /^ {2}round 2 leaves 1 CONFIRMED finding\(s\) unfixed \[[0-9a-f]{8}\]: list them in the report\.$/m, done.stdout);
+});
+
+test("R3: a round whose record step never ran is refused, with the record call to make", () => {
   const { repo, review, intent } = reviewWithRecords({});
   const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
-  verdictAboveTable(done, /^converge: no records for round 1 — W cannot be computed$/);
-  assert.doesNotMatch(done.stdout, /CONTINUE|ESCALATE|STOP/, "and no verdict it could not compute");
+  refusedAfter(done, review, 2);
+  assert.match(done.stdout, /^UNRECORDED — round 1 has no records/m);
+  assert.match(done.stdout, new RegExp(`findings\\.mjs'? record --work ${review.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --round 1 --in <findings\\.json>`), done.stdout);
+});
+
+test("R3: ESCALATE only prints — a user's 'run round 3' needs no flag", () => {
+  const { repo, review, intent } = reviewWithRecords({ 1: [finding("minor")], 2: [finding("minor")] });
+  planRound2(review, 6);
+  const done = run(repo, ["--work", review, "--round", "3", "--intent", intent, "--no-preflight"]);
+  verdictAboveTable(done, /^converge \(round 2\): ESCALATE — /);
+  assert.ok(existsSync(path.join(review, "round-3", "briefs")));
 });
 
 test("the repository comes from the scoped paths, not from the cwd", () => {
@@ -881,4 +1046,162 @@ test("a `# repo: ` line inside a plain file does not name the repository", () =>
   assert.equal(done.status, 0, done.stderr);
   assert.match(done.stdout, /^# no checks run — every path in the scope is outside a repository/m);
   assert.doesNotMatch(done.stdout + done.stderr, /\/etc(?![\w/-])/, "/etc is never named as the root");
+});
+
+// --- R5: round 1 is re-planned in place, never re-run as a second review ---
+// 36% of reviews forced their tier, and a force after round 1 had planned cost
+// an orphaned review dir: `--new-review` again, a second scope, a second
+// pre-flight. A re-plan re-runs only tier.mjs and brief.mjs over the scope
+// round 1 already captured.
+
+/** A review whose round 1 computed L (an auth path), with pre-flight run. */
+const reviewComputedL = () => {
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "src/auth"), { recursive: true });
+  writeFileSync(path.join(repo, "src/auth/session.mjs"), "export const ttl = 60;\n");
+  const done = run(repo, ["--new-review", "--work", work, "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  const review = workLine(done);
+  assert.equal(tierOf(review, 1).tier, "L");
+  return { repo, review, intent: path.join(review, "intent.md") };
+};
+const replan = (repo, review, intent, tier, extra = []) =>
+  run(repo, ["--work", review, "--round", "1", "--intent", intent, "--force", tier, "--reason", "a one-line change", ...extra]);
+const roundFiles = (review) => {
+  const all = snapshot(path.join(review, "round-1"));
+  return Object.fromEntries(Object.entries(all).filter(([file]) => !/^(tier|briefs)/.test(file)));
+};
+
+test("R5: --round 1 --force re-plans round 1 in place, and keeps the plan it replaced", () => {
+  const { repo, review, intent } = reviewComputedL();
+  const before = roundFiles(review);
+  assert.ok(before["scope.diff"] && before["preflight.txt"], "round 1 captured a scope and ran pre-flight");
+
+  const done = replan(repo, review, intent, "S");
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^tier S \(forced\) · round 1/m, "the new plan is printed");
+  assert.doesNotMatch(done.stdout, /^pre-flight /m, "pre-flight did not run again");
+  const plan = tierOf(review, 1);
+  assert.deepEqual([plan.tier, plan.forced, plan.computed], ["S", "S", "L"], "the computed tier is kept beside the forced one");
+  assert.equal(JSON.parse(readFileSync(path.join(review, "round-1", "tier.replaced-1.json"), "utf8")).tier, "L",
+    "the replaced plan is moved, not deleted: forcing down is what the numbers watch");
+  assert.ok(readdirSync(path.join(review, "round-1", "briefs.replaced-1")).length > 0);
+  assert.equal(readdirSync(path.join(review, "round-1", "briefs")).length, plan.finders.length, "fresh briefs for the new plan");
+  assert.deepEqual(roundFiles(review), before, "scope, pre-flight, impact and the rest are untouched");
+  assert.deepEqual(readdirSync(path.dirname(review)).filter((name) => name.startsWith("review-")), ["review-1"], "and no second review");
+
+  const again = replan(repo, review, intent, "M");
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(JSON.parse(readFileSync(path.join(review, "round-1", "tier.replaced-2.json"), "utf8")).tier, "S");
+  assert.ok(existsSync(path.join(review, "round-1", "briefs.replaced-2")));
+  assert.equal(tierOf(review, 1).tier, "M");
+});
+
+test("a round whose predecessor's verdict cannot be computed is refused, not planned past", () => {
+  const { repo, review, intent } = reviewComputedL();
+  recordRound(repo, review, 1);
+  const scope = path.join(review, "round-1", "scope.diff");
+  chmodSync(scope, 0);
+  try {
+    const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
+    assert.equal(done.status, 5, done.stderr);
+    assert.match(done.stderr, /converge failed .*converge\.err/);
+    assert.equal(existsSync(path.join(review, "round-2")), false, "nothing created");
+  } finally { chmodSync(scope, 0o644); }
+});
+
+test("R5: a round 2 after a re-plan is capped at the forced tier", () => {
+  const { repo, review, intent } = reviewComputedL();
+  assert.equal(replan(repo, review, intent, "S").status, 0);
+  recordRound(repo, review, 1);
+  const done = run(repo, ["--work", review, "--round", "2", "--intent", intent, "--no-preflight"]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(tierOf(review, 2).tier, "S");
+});
+
+test("R5: a re-plan is refused once round 2 exists, once a finder has filed, or with a new scope", () => {
+  const cases = [
+    ["round 2 exists", (review) => mkdirSync(path.join(review, "round-2")), [], /round-2\/ exists/],
+    ["a finder filed", (review) => writeFileSync(path.join(review, "round-1", "state", "A.jsonl"), "{}\n"), [], /has filed/],
+    ["round 1 recorded", (review) => writeFileSync(path.join(review, "round-1", "recorded.json"), "{}\n"), [], /already recorded/],
+    ["paths", () => {}, ["src/cli.mjs"], /re-plan reuses round 1's scope/],
+    ["--base", () => {}, ["--base", "HEAD"], /re-plan reuses round 1's scope/],
+  ];
+  for (const [name, arrange, extra, message] of cases) {
+    const { repo, review, intent } = reviewComputedL();
+    arrange(review);
+    const before = snapshot(review);
+    const done = replan(repo, review, intent, "S", extra);
+    assert.equal(done.status, 2, `${name}: ${done.stderr}`);
+    assert.match(done.stderr, message, name);
+    assert.deepEqual(snapshot(review), before, `${name}: refused before it writes a byte`);
+  }
+  // An empty state file is a finder that has not filed yet.
+  const { repo, review, intent } = reviewComputedL();
+  writeFileSync(path.join(review, "round-1", "state", "A.jsonl"), "");
+  assert.equal(replan(repo, review, intent, "S").status, 0);
+});
+
+test("R5: a --force tier other than S, M or L is refused before round 1's plan moves", () => {
+  const { repo, review, intent } = reviewComputedL();
+  const before = snapshot(review);
+  const done = replan(repo, review, intent, "X");
+  assert.equal(done.status, 2, done.stderr);
+  assert.match(done.stderr, /--force needs S, M or L, got: X/);
+  assert.deepEqual(snapshot(review), before, "round 1 is untouched");
+});
+
+test("R5: a re-plan whose brief.mjs fails puts round 1's plan and briefs back", () => {
+  const { repo, review, intent } = reviewComputedL();
+  const briefs = readdirSync(path.join(review, "round-1", "briefs")).sort();
+  const round = shadowRound(review, { "brief.mjs": "#!/bin/sh\nexit 3\n" });
+  const done = spawnSync("bash", [round, "--work", review, "--round", "1", "--intent", intent, "--force", "S", "--reason", "a one-line change"],
+    { cwd: repo, encoding: "utf8" });
+  assert.equal(done.status, 3, done.stderr);
+  assert.equal(tierOf(review, 1).tier, "L", "the plan round 1 had is back");
+  assert.deepEqual(readdirSync(path.join(review, "round-1", "briefs")).sort(), briefs, "and so are its briefs");
+  assert.equal(existsSync(path.join(review, "round-1", "tier.replaced-1.json")), false);
+  assert.equal(existsSync(path.join(review, "round-1", "briefs.replaced-1")), false);
+  assert.equal(replan(repo, review, intent, "S").status, 0, "so a retry still sees round 1 as planned");
+});
+
+test("R5: without --force a second round 1 is still refused, and the refusal names the re-plan", () => {
+  const { repo, review, intent } = reviewComputedL();
+  const done = run(repo, ["--work", review, "--round", "1", "--intent", intent, "--no-preflight"]);
+  assert.equal(done.status, 2);
+  assert.match(done.stderr, /--round 1 --intent \S+ --force S\|M\|L --reason/);
+  assert.match(done.stderr, /--new-review/);
+});
+
+test("R5: a re-plan reuses round 1's cold run — it never runs again, and its skip is kept", () => {
+  for (const ran of [true, false]) {
+    const { repo, work } = runnableFixture();
+    const count = path.join(work, "coldrun-calls");
+    const stub = [
+      "#!/bin/sh",
+      `echo x >> "${count}"`,
+      ...(ran ? [
+        'out=""',
+        'while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done',
+        'mkdir -p "$out"',
+        'printf "# Cold run\\n\\n- exit: 0\\n" > "$out/transcript.md"',
+      ] : ["exit 1"]),
+      "",
+    ].join("\n");
+    const round = shadowRound(work, { "coldrun.sh": stub });
+    const go = (...args) => spawnSync("bash", [round, "--work", work, "--round", "1",
+      "--intent", path.join(work, "intent.md"), "--no-preflight", ...args], { cwd: repo, encoding: "utf8" });
+    assert.equal(go().status, 0);
+    const done = go("--force", "M", "--reason", "re-plan");
+    assert.equal(done.status, 0, done.stderr);
+    assert.equal(readFileSync(count, "utf8"), "x\n", `ran=${ran}: coldrun.sh ran once, for round 1 itself`);
+    const graders = tierOf(work, 1).finders.filter((f) => f.agent === "self-review-cold-grader");
+    if (ran) {
+      assert.equal(graders.length, 1, "the transcript is still there to grade");
+      assert.ok(readdirSync(path.join(work, "round-1", "briefs")).some((f) => f.includes("cold")), "and the grader is briefed with it");
+    } else {
+      assert.deepEqual(graders, [], "the X row stays dropped");
+      assert.match(tierOf(work, 1).coldSkipped, /coldrun\.sh failed/, "for the reason round 1 recorded");
+    }
+  }
 });

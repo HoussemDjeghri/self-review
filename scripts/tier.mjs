@@ -25,9 +25,11 @@
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isMain, loadConfig } from "../hooks/lib/config.mjs";
+import { finderSettings } from "../hooks/lib/agent-settings.mjs";
 import { parseDiff, changedLineCounts } from "./lib/diff.mjs";
 import { classifyPath, isTestPath, matchesAnyGlob } from "./lib/paths.mjs";
 import { parseScope } from "./impact.mjs";
+import { logTier } from "./lib/review-log.mjs";
 
 const SCHEMA = 1;
 
@@ -108,8 +110,9 @@ export function declaresItselfRunnable(file, root) {
 //
 // Case was tried as a discriminator in 0.3.0 and reverted the same day (DESIGN
 // §7.6). The prose false positive is real — a comment reading "truncate the
-// summary" or "we drop the field" fires the destructive marker, and this file's
-// own `scopeTruncated` line is one of them — but case does not separate the two
+// summary" or "we drop the field" fires the destructive marker (`truncate` is
+// anchored as a word, so an identifier like `scopeTruncated` no longer does) —
+// but case does not separate the two
 // populations. Real code writes `db.raw("drop table sessions")` and
 // `db.execute("truncate table logs")` lowercase, and security tokens are
 // camelCase identifiers (`clientSecret`, `userPassword`) as often as they are
@@ -147,6 +150,12 @@ export function riskMarkers({ files, diff, kinds, config, broken, wire = [] }) {
     const pattern = anyOf(patterns);
     for (const { file, hunks } of diff) {
       if (!scanned.has(file)) continue;
+      // A test's teardown — `rm -rf` of its temp dir, `shutil.rmtree` in a
+      // fixture — was the evidenced cause of tier-L reviews over changes that
+      // deleted nothing. Destructive only: a test that spawns or awaits is
+      // still evidence for the G and H finders, and a destructive line that
+      // first appears in shipped code still lifts a round-2 ceiling.
+      if (name === "destructive" && isTestPath(file)) continue;
       for (const hunk of hunks) {
         for (const { sign, text, line } of hunk.lines) {
           if (sign !== "+") continue;
@@ -270,8 +279,8 @@ const groupsFor = (tier, kinds, markers) => {
     if (tier === "L") {
       code.push({ group: "A+B", angles: ["A", "B"] }, { group: "C+D", angles: ["C", "D"] }, { group: "E+F", angles: ["E", "F"] }, { group: "Q+V", angles: ["Q", "V"] });
       if (kinds.executable.length) code.push({ group: "X", angles: ["X"] });
-      if (markers.security.length || markers.auth.length) code.push({ group: "G", angles: ["G"], model: "opus" });
-      if (markers.concurrency.length) code.push({ group: "H", angles: ["H"], model: "opus" });
+      if (markers.security.length || markers.auth.length) code.push({ group: "G", angles: ["G"], risk: true });
+      if (markers.concurrency.length) code.push({ group: "H", angles: ["H"], risk: true });
     } else {
       code.push({ group: "A+B+D", angles: ["A", "B", "D"] });
       const verify = ["C", "E", "F"];
@@ -425,8 +434,7 @@ export function buildFinders({ tier, round, kinds, markers, config, impactConfig
     kind: row.kind,
     angles: row.angles,
     agent,
-    model: row.model ?? "sonnet",
-    effort: "high",
+    ...finderSettings(agent, row),
     // The grader's work is one transcript plus the entry points it names, not
     // the whole change: a code finder's budget would be forty calls of reading
     // it does not need to do.
@@ -583,7 +591,16 @@ const read = (file, what, exitCode) => {
   }
 };
 
+const USAGE = [
+  "usage: tier.mjs --scope round-N/scope.diff --out round-N/ [--impact round-N/impact.json]",
+  "                [--round N] [--force S|M|L --reason \"…\"] [--compact] [--cap S|M|L]",
+].join("\n");
+
 export function main(argv, { log = console.log } = {}) {
+  if (argv.some((a) => a === "--help" || a === "-h")) {
+    log(USAGE);
+    return { help: true };
+  }
   const options = parseArgs(argv);
   const usage = (message) => Object.assign(new Error(message), { exitCode: 2 });
   for (const required of ["scope", "out"]) if (!options[required]) throw usage(`--${required} is required`);
@@ -619,6 +636,7 @@ export function main(argv, { log = console.log } = {}) {
   mkdirSync(outDir, { recursive: true });
   const file = path.join(outDir, "tier.json");
   writeFileSync(file, `${JSON.stringify(result, null, 1)}\n`);
+  logTier(result, outDir);
 
   // Eight lines at most: this lands in the main session's context, where every
   // line is paid for again on every later turn.

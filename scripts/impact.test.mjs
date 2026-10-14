@@ -389,6 +389,12 @@ test("CLI: both files are written, stdout is two lines, bad usage and a missing 
   assert.equal(spawnSync(process.execPath, [SCRIPT, "--scope", "/no/such/scope", "--out", out], { encoding: "utf8" }).status, 3);
 });
 
+test("CLI: --help prints the usage and exits 0", () => {
+  const run = spawnSync(process.execPath, [SCRIPT, "--help"], { encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /usage/i);
+});
+
 // --- the code-review-graph adapter, against a stub -------------------------
 function withStub(body) {
   const bin = mkdtempSync(path.join(tmpdir(), "impact-bin-"));
@@ -525,4 +531,50 @@ test("a workflow still calling a deleted script is a broken reference, counted o
   const workflowRows = result.markdown.split("\n").filter((line) => line.includes(".github/workflows/ci.yml"));
   assert.equal(workflowRows.length, 1, "shown under Broken references, not again under docs and config");
   assert.match(result.markdown, /## Docs and config that mention the change[\s\S]*docs\/guide\.md/, "a docs mention is still a mention");
+});
+
+test("a removed __init__ is a change, not a break, when another class still defines one", () => {
+  // A name match cannot tell which class lost a protocol method: every other
+  // `__init__` in the tree read as a remaining reference to the removed one,
+  // and the contract-break marker made the change tier L.
+  const root = tree({
+    "app/a.py": "class A:\n    pass\n",
+    "app/b.py": "class B:\n    def __init__(self):\n        super().__init__()\n",
+  });
+  const scope = scopeBundle(root, ["  M  app/a.py"], [
+    "diff --git a/app/a.py b/app/a.py",
+    "--- a/app/a.py",
+    "+++ b/app/a.py",
+    "@@ -1,3 +1,2 @@",
+    " class A:",
+    "-    def __init__(self):",
+    "-        pass",
+    "+    pass",
+  ].join("\n"));
+  const result = analyse({ scope: parseScope(scope), adapter: "grep", config: CONFIG });
+  assert.equal(result.json.counts.broken, 0, result.markdown);
+  assert.equal(result.json.symbols.find((symbol) => symbol.name === "__init__")?.state, "changed");
+  for (const name of ["__eq__", "constructor", "toString"]) {
+    const diff = ["--- a/x.py", "+++ b/x.py", "@@ -1,2 +1,1 @@", `-def ${name}(self): pass`, " keep"];
+    assert.equal(changedSymbols(diff)[0].state, "changed", name);
+  }
+});
+
+test("a removed plain function still named by a caller is still a break", () => {
+  const root = tree({
+    "app/a.py": "def keep():\n    pass\n",
+    "app/caller.py": "load_rows()\n",
+  });
+  const scope = scopeBundle(root, ["  M  app/a.py"], [
+    "diff --git a/app/a.py b/app/a.py",
+    "--- a/app/a.py",
+    "+++ b/app/a.py",
+    "@@ -1,4 +1,2 @@",
+    "-def load_rows():",
+    "-    pass",
+    " def keep():",
+    "     pass",
+  ].join("\n"));
+  const result = analyse({ scope: parseScope(scope), adapter: "grep", config: CONFIG });
+  assert.equal(result.json.counts.broken, 1, result.markdown);
 });

@@ -9,8 +9,9 @@
 //   brief.mjs --verify candidates.json --work <work> --round N [--batch B]
 //
 // Each brief comes with the exact Agent call that spawns it, one line per
-// agent, so the name the agent runs under is always the plan row's name: the
-// guards match that name, and wait.mjs finds the state file by it.
+// agent, so the name the agent runs under is always the plan row's name with
+// the review number in it (see reviewName): the guards match that name, and
+// wait.mjs finds the state file by it.
 //
 // A brief is the whole world of the agent that receives it, so this script
 // assembles it from the pieces the round already produced: the verbatim angle
@@ -34,7 +35,9 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { LOG_DIR, PLUGIN_ROOT, isMain, loadConfig, qualified } from "../hooks/lib/config.mjs";
-import { gitRoot } from "./lib/repo.mjs";
+import { agentSettings, finderSettings, rowSettings } from "../hooks/lib/agent-settings.mjs";
+import { gitRoot, workRepo } from "./lib/repo.mjs";
+import { logReviewRow } from "./lib/review-log.mjs";
 
 export const estimateTokens = (text) => Math.ceil(Buffer.byteLength(text, "utf8") / 3.5);
 
@@ -89,8 +92,8 @@ const ROUND_1 = {
     { angles: ["C", "D"], impact: "full" },
     { angles: ["E", "F"], impact: "full" },
     { angles: ["Q", "V"], impact: "summary" },
-    { angles: ["G"], impact: "full", model: "opus" },
-    { angles: ["H"], impact: "full", model: "opus" },
+    { angles: ["G"], impact: "full", risk: true },
+    { angles: ["H"], impact: "full", risk: true },
   ],
 };
 const ROUND_2 = [
@@ -122,8 +125,7 @@ export function buildPlan(tier, round, config = {}) {
         kind: "code",
         angles: row.angles,
         agent,
-        model: row.model ?? "sonnet",
-        effort: "high",
+        ...finderSettings(agent, row),
         calls,
         impact: row.impact,
       };
@@ -131,10 +133,34 @@ export function buildPlan(tier, round, config = {}) {
   };
 }
 
+// --- names -----------------------------------------------------------------
+// Every name this script prints is unique within the session, because the
+// harness enforces uniqueness its own way: a name already used in the session
+// is filed as `<name>-2`, `-3`, …, and every lookup by the printed name
+// (wait.mjs, salvage.mjs) then finds no agent or another review's. A plan row's
+// name carries the round and the angles, which repeat in every review of a
+// session; the review number does not — round.sh allocates `review-<k>` once
+// per review — so it goes in right after the agent type, where every
+// `self-review-<type>(-|$)` matcher still reads it. Measured across 18 sessions
+// before this: 77 misleading wait notes, ~8 ten-minute waits on a name with no
+// transcript, and at least 5 salvages that returned another review's report.
+export const reviewNumber = (workDir) => /^review-(\d+)$/.exec(path.basename(workDir ?? ""))?.[1] ?? null;
+
+/** `self-review-finder-r1-ab` in review 3 → `self-review-finder-k3-r1-ab`. Idempotent; no review, no change. */
+export function reviewName(name, agent, review) {
+  if (review === null || review === undefined) return name;
+  const tag = `k${review}`;
+  if (agent && name.startsWith(`${agent}-`)) {
+    const rest = name.slice(agent.length + 1);
+    return rest === tag || rest.startsWith(`${tag}-`) ? name : `${agent}-${tag}-${rest}`;
+  }
+  return name.endsWith(`-${tag}`) ? name : `${name}-${tag}`;
+}
+
 /** The one-line Agent call for a brief, printed where the lead copies it from. */
-export function agentCall({ agent, name, model, description, file }) {
+export function agentCall({ agent, name, model, effort, description, file }) {
   return `Agent ${JSON.stringify({
-    subagent_type: qualified(agent), name, model, description, prompt: `Read ${file} and follow it.`,
+    subagent_type: qualified(agent), name, model, effort, description, prompt: `Read ${file} and follow it.`,
   })}`;
 }
 
@@ -407,6 +433,9 @@ export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, liv
     seen.add(row.name);
     if (!Array.isArray(row.angles) || row.angles.length === 0) reject(`finder ${row.name} has no angles[]`);
     for (const id of row.angles) if (!angles.has(id)) reject(`finder ${row.name}: no angle "${id}" in the catalogue`);
+    // A plan row is printed as the Agent call, so a row without both values would spawn
+    // the reviewer on the session's model or the frontmatter's effort, silently.
+    try { rowSettings(row.name, row); } catch (error) { reject(`finder ${row.name}: ${error.message}`); }
     // The budget is rendered into the brief verbatim, so a missing one would
     // instruct a live finder to spend "undefined tool calls".
     if (!Number.isInteger(row.calls) || row.calls < 1) {
@@ -454,10 +483,22 @@ function parseArgs(argv) {
   return options;
 }
 
-export function main(argv, { log = console.log } = {}) {
+const USAGE = [
+  "usage: brief.mjs --round N (--plan round-N/tier.json | --tier S|M|L)",
+  "                 --intent intent.md --scope round-N/scope.diff --out round-N/briefs/",
+  "                 [--impact round-N/impact.md] [--prior prior.md] [--ledger ledger.md]",
+  "                 [--angles <file>] [--live <dir>] [--cold <transcript.md>]",
+  "       brief.mjs --verify candidates.json --work <work> --round N [--batch B]",
+].join("\n");
+
+export function main(argv, { log = console.log, logDir = LOG_DIR } = {}) {
+  if (argv.some((a) => a === "--help" || a === "-h")) {
+    log(USAGE);
+    return { help: true };
+  }
   const options = parseArgs(argv);
   const usage = (message) => Object.assign(new Error(message), { exitCode: 2 });
-  if (options.verify) return verifierBrief(options, { log, usage });
+  if (options.verify) return verifierBrief(options, { log, usage, logDir });
   if (!options.plan && !options.tier) throw usage("pass --plan round-N/tier.json or --tier S|M|L");
   if (options.plan && options.tier) throw usage("--plan and --tier are alternatives; pass one");
   for (const required of ["intent", "scope", "out"]) {
@@ -467,7 +508,7 @@ export function main(argv, { log = console.log } = {}) {
   const round = Number(options.round ?? 1);
   if (!positiveInteger(round)) throw usage("--round needs a positive integer");
 
-  const config = loadConfig(gitRoot()).brief;
+  const config = loadConfig(options.work ? workRepo(options.work) : gitRoot()).brief;
   const plan = options.plan
     ? JSON.parse(read(path.resolve(options.plan), "the plan"))
     : buildPlan(options.tier.toUpperCase(), round);
@@ -483,6 +524,13 @@ export function main(argv, { log = console.log } = {}) {
     ? path.resolve(options.angles)
     : path.join(PLUGIN_ROOT, "skills", "self-review", "references", "angles.md");
   const outDir = path.resolve(options.out);
+  // `--out` is `<work>/round-N/briefs/`, so the review is two levels up. The
+  // brief, the state file and the printed call all take the renamed row, which
+  // is what keeps wait.mjs's default names (the brief stems) and the spawned
+  // names one set. A non-string name is left for writeBriefs to refuse.
+  const review = reviewNumber(path.dirname(path.dirname(outDir)));
+  plan.finders = plan.finders.map((row) =>
+    typeof row?.name === "string" ? { ...row, name: reviewName(row.name, row.agent, review) } : row);
   const ledgerPath = options.ledger ? path.resolve(options.ledger) : "the ledger";
   const ledgerText = options.ledger ? read(ledgerPath, "the ledger") : "";
   const dismissed = dismissedFrom(ledgerText);
@@ -516,7 +564,7 @@ export function main(argv, { log = console.log } = {}) {
   log(`# ${results.length} brief${results.length === 1 ? "" : "s"} for round ${plan.round}, tier ${plan.tier} (${plan.source ?? "plan"}) — verifier: ${plan.verifier ?? "author"} — spawn each line as printed, all in one message`);
   for (const { row, file, tokens, trimmedImpact } of results) {
     const description = `self-review r${plan.round} ${(row.angles ?? []).join("+")}`.trim();
-    log(`${agentCall({ agent: row.agent, name: row.name, model: row.model, description, file })}  # ${row.calls} calls, ${tokens} tok${trimmedImpact ? `, -${trimmedImpact} impact` : ""}`);
+    log(`${agentCall({ agent: row.agent, name: row.name, model: row.model, effort: row.effort, description, file })}  # ${row.calls} calls, ${tokens} tok${trimmedImpact ? `, -${trimmedImpact} impact` : ""}`);
   }
   // What the briefs carry from the ledger, said out loud. An empty dismissed
   // list reads identically whether nothing was dismissed or the lead never
@@ -531,13 +579,19 @@ export function main(argv, { log = console.log } = {}) {
   return results;
 }
 
+const VERIFIER_MAX = 8;
+
 /**
- * One verifier batch: the brief from the fixed template (intent, scope,
- * candidates, state file, output) and the Agent call that spawns it. The name
- * starts with `self-review-verifier` because tree-guard matches the name the
- * agent runs under, never its registered type.
+ * The verifier batches: one brief per batch from the fixed template (intent,
+ * scope, candidates, state file, output) and the Agent call that spawns it. The
+ * name starts with `self-review-verifier` because tree-guard matches the name
+ * the agent runs under, never its registered type.
+ *
+ * More than eight candidates are split here, into the fewest batches that fit,
+ * evenly, numbered on from `--batch`. Refusing and asking for `--batch 1, 2, …`
+ * cost the lead a refused call, a hand split and a call per batch.
  */
-export function verifierBrief(options, { log = console.log, usage }) {
+export function verifierBrief(options, { log = console.log, usage, logDir = LOG_DIR }) {
   for (const required of ["work", "round"]) {
     if (!options[required]) throw usage(`--verify needs --${required}`);
   }
@@ -554,32 +608,49 @@ export function verifierBrief(options, { log = console.log, usage }) {
     throw Object.assign(new Error(error.exitCode ? error.message : `the candidates are not JSON: ${error.message}`), { exitCode: 3 });
   }
   if (!Array.isArray(candidates) || candidates.length === 0) throw usage("--verify needs a non-empty JSON array of candidates");
-  if (candidates.length > 8) throw usage(`${candidates.length} candidates — one verifier takes at most 8; split them across --batch 1, 2, …`);
-  const name = `self-review-verifier-r${round}-b${batch}`;
+  const intent = read(path.join(work, "intent.md"), "the intent block").trimEnd();
+  const live = options.live ? path.resolve(options.live) : gitRoot();
+  const size = Math.ceil(candidates.length / Math.ceil(candidates.length / VERIFIER_MAX));
+  const batches = [];
+  for (let start = 0; start < candidates.length; start += size) batches.push(candidates.slice(start, start + size));
+  const review = reviewNumber(work);
   const stateDir = path.join(roundDir, "state");
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(path.join(roundDir, "briefs"), { recursive: true });
-  const file = path.join(roundDir, "briefs", `${name}.md`);
-  writeFileSync(file, [
-    `Verify these ${candidates.length} candidate findings from round ${round} of a self-review.`,
-    "",
-    read(path.join(work, "intent.md"), "the intent block").trimEnd(),
-    "",
-    "SCOPE",
-    `Read ${path.join(roundDir, "scope.diff")}; live files are at ${options.live ? path.resolve(options.live) : gitRoot()}.`,
-    "",
-    "CANDIDATES",
-    JSON.stringify(candidates, null, 2),
-    "",
-    "STATE FILE (crash insurance)",
-    `${path.join(stateDir, `${name}.jsonl`)} — append each verdict there as one JSON line as you reach it, batched with your next read.`,
-    "",
-    "OUTPUT",
-    "The JSON array described in your instructions — one verdict per candidate id, with quoted proof and fix_risk. Nothing after the JSON.",
-    "",
-  ].join("\n"));
-  log(agentCall({ agent: "self-review-verifier", name, model: "opus", description: `self-review verify r${round} b${batch}`, file }));
-  return { name, file };
+  if (batches.length > 1) {
+    log(`# ${candidates.length} candidates, at most ${VERIFIER_MAX} per verifier: ${batches.length} batches — spawn every line in one message, then wait.mjs on all their names`);
+  }
+  const written = batches.map((group, index) => {
+    const b = batch + index;
+    const name = reviewName(`self-review-verifier-r${round}-b${b}`, "self-review-verifier", review);
+    const file = path.join(roundDir, "briefs", `${name}.md`);
+    writeFileSync(file, [
+      `Verify these ${group.length} candidate findings from round ${round} of a self-review.`,
+      "",
+      intent,
+      "",
+      "SCOPE",
+      `Read ${path.join(roundDir, "scope.diff")}; live files are at ${live}.`,
+      "",
+      "CANDIDATES",
+      JSON.stringify(group, null, 2),
+      "",
+      "STATE FILE (crash insurance)",
+      `${path.join(stateDir, `${name}.jsonl`)} — append each verdict there as one JSON line as you reach it, batched with your next read.`,
+      "",
+      "OUTPUT",
+      "The JSON array described in your instructions — one verdict per candidate id, with quoted proof and fix_risk. Nothing after the JSON.",
+      "",
+    ].join("\n"));
+    log(agentCall({ agent: "self-review-verifier", name, ...agentSettings("verifier"), description: `self-review verify r${round} b${b}`, file }));
+    return { name, file };
+  });
+  // How the round's candidates were divided, kept past the scratchpad (see
+  // lib/review-log.mjs). The applier's directives have no row: the lead writes
+  // directives.md by hand and no script reads it.
+  logReviewRow("units", { round, stage: "verify", candidates: candidates.length, perAgent: batches.map((group) => group.length), firstBatch: batch },
+    { work, script: "brief.mjs", logDir });
+  return written;
 }
 
 if (isMain(import.meta.url)) {

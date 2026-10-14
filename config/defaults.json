@@ -1,6 +1,8 @@
 {
   "$comment": "Shipped defaults. Override per user in ~/.claude/self-review/config.json (or $SELF_REVIEW_CONFIG): objects deep-merge, arrays replace.",
   "exempt": {
+    "$comment": "paths: absolute globs for files the Stop gate never re-arms on. User-only — set it in ~/.claude/self-review/config.json; a repository's .self-review.json cannot. Read by the gate alone: the review pipeline still reviews these files when they are in scope.",
+    "paths": [],
     "extensions": [
       ".md", ".mdx", ".markdown", ".rst", ".adoc", ".txt",
       ".json", ".jsonc", ".json5", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
@@ -55,7 +57,7 @@
       "infra": ["Dockerfile", "\\.github/workflows", "\\.gitlab-ci", "terraform", "\\.tf$", "k8s", "helm", "ansible", "deploy"]
     },
     "riskContent": {
-      "destructive": ["rm -rf", "rmSync", "unlink", "DROP ", "DELETE FROM", "TRUNCATE", "--force", "force-push", "shutil\\.rmtree"],
+      "destructive": ["rm -rf", "rmSync", "unlink", "DROP ", "DELETE FROM", "\\bf?truncate(?:Sync)?\\b", "--force", "force-push", "shutil\\.rmtree"],
       "security": [
         "child_process", "exec\\(", "spawn", "subprocess", "os\\.system", "eval\\(", "new Function",
         "innerHTML", "dangerouslySetInnerHTML", "process\\.env", "getenv", "API_KEY", "SECRET", "PASSWORD",

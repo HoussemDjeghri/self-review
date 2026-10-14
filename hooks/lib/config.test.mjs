@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { isMain, loadConfig, PLUGIN_ROOT, REPO_CONFIG_FILE } from "./config.mjs";
 
@@ -169,6 +169,61 @@ test("a repository cannot excuse itself from the scan, but its words still land"
   const config = loadConfig(root);
   assert.deepEqual(config.tier.ignore, loadConfig().tier.ignore, "the ignore list is not its to write");
   assert.equal(config.tier.riskContent.security.at(-1), "sudo\\(", "the word it added is appended, still escaped");
+});
+
+// `exempt.paths` releases the gate for whatever it matches, so it is the user's
+// alone and absolute only (exempt-paths ruling): a slash-less glob matches the
+// basename in every repository, and a relative one matches in every checkout.
+const userConfig = (contents) => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "self-review-user-")), "config.json");
+  writeFileSync(file, JSON.stringify(contents));
+  process.env.SELF_REVIEW_CONFIG = file;
+};
+const warnings = (load) => {
+  const lines = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { lines.push(String(chunk)); return true; };
+  try { return { config: load(), warned: lines.join("") }; } finally { process.stderr.write = write; }
+};
+
+test("exempt.paths: a user's absolute globs load, ~/ expanded to the home directory", () => {
+  userConfig({ exempt: { paths: ["/srv/app/proto/**", "~/work/site/(proto)/**"] } });
+  const { config, warned } = warnings(() => loadConfig());
+  assert.deepEqual(config.exempt.paths, ["/srv/app/proto/**", `${homedir()}/work/site/(proto)/**`]);
+  assert.equal(warned, "");
+  noUserConfig();
+  assert.deepEqual(loadConfig().exempt.paths, [], "nothing is exempt by path unless the user says so");
+});
+
+test("exempt.paths: a relative or slash-less entry is dropped with a warning, the absolute ones survive", () => {
+  userConfig({ exempt: { paths: ["*.tsx", "app/proto/**", "/srv/app/proto/**", "./x/**"] } });
+  const { config, warned } = warnings(() => loadConfig());
+  assert.deepEqual(config.exempt.paths, ["/srv/app/proto/**"]);
+  for (const entry of ["*.tsx", "app/proto/**", "./x/**"]) assert.ok(warned.includes(JSON.stringify(entry)), `${entry} is named: ${warned}`);
+  noUserConfig();
+});
+
+test("exempt.paths: a dropped entry is warned about once per process, however often the config loads", () => {
+  userConfig({ exempt: { paths: ["warned/once/**"] } });
+  const { warned } = warnings(() => { loadConfig(); return loadConfig(); });
+  assert.equal(warned.split(JSON.stringify("warned/once/**")).length - 1, 1, warned);
+  noUserConfig();
+});
+
+test("exempt.paths: an array holding a non-string is refused whole", () => {
+  userConfig({ exempt: { paths: ["/srv/app/proto/**", 7] } });
+  const { config, warned } = warnings(() => loadConfig());
+  assert.deepEqual(config.exempt.paths, []);
+  assert.match(warned, /exempt\.paths — expected an array of strings/);
+  noUserConfig();
+});
+
+test("exempt.paths: a repository's .self-review.json cannot set it", () => {
+  noUserConfig();
+  const root = repoWith({ exempt: { paths: ["/**"] } });
+  const { config, warned } = warnings(() => loadConfig(root));
+  assert.deepEqual(config.exempt.paths, []);
+  assert.match(warned, /ignoring exempt\.paths — a repository may only add to/);
 });
 
 // isMain, and the bug it exists for. Every helper's CLI block used to sit

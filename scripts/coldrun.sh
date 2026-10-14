@@ -80,7 +80,7 @@ root="${root:-$(pwd)}"
 root="$(cd "$root" && pwd -P)"
 [ -z "$scope" ] || [ -f "$scope" ] || die "no scope bundle at $scope"
 if [ -n "$scope" ]; then
-  scope_root="$(sed -n 's/^# repo: //p' "$scope" | head -1)"
+  scope_root="$(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; /^# repo: /{s/^# repo: //p;q;}' "$scope")"
   # Compared physically on both sides: `pwd` is logical by default, so a --root
   # given as /tmp and a bundle recording /private/tmp are the same tree.
   [ -z "$scope_root" ] || ! [ -d "$scope_root" ] || scope_root="$(cd "$scope_root" && pwd -P)"

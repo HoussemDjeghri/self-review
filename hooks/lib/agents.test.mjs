@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { agentStatus, findAgentFiles, isOwnTranscript, readAgent } from "./agents.mjs";
+import { agentNameOf, agentStatus, findAgentFiles, isOwnTranscript, readAgent } from "./agents.mjs";
 
 const CONFIG = { settleSeconds: 60, staleSeconds: 660 };
 let seq = 0;
@@ -218,4 +218,34 @@ test("a transcript is an agent's own only at its exact <name>-<hex> stem, and la
   assert.equal(transcript("dated", [said([uses("Read")]), toolResult(), last]).lastMs, Date.parse(last.timestamp));
   assert.ok(Number.isNaN(transcript("undated", [{ ...said([text("[]")]), timestamp: undefined }]).lastMs),
     "no timestamp is no time, not the epoch");
+});
+
+test("a named agent the harness filed as bare hex is found by the name in its sidecar", () => {
+  // Surveyed 2026-09-28: 24 of ~1,770 named agents were written as
+  // `agent-a<hex>.jsonl` with the name only in `.meta.json`. Read by file name
+  // alone, wait.mjs saw "no transcript" and idled out three ten-minute calls.
+  const home = mkdtempSync(path.join(tmpdir(), "agents-meta-"));
+  const bare = (hex, meta, ageSeconds = 0) => {
+    const file = path.join(home, `agent-a${hex}.jsonl`);
+    writeFileSync(file, JSON.stringify(said([text("x")], "end_turn")) + "\n");
+    if (meta !== undefined) writeFileSync(path.join(home, `agent-a${hex}.meta.json`), meta);
+    const when = Date.now() / 1000 - ageSeconds;
+    utimesSync(file, when, when);
+    return file;
+  };
+  const own = bare("1489047d40a07e99", JSON.stringify({ agentType: "self-review:self-review-finder", name: "finder-r1-ab" }), 60);
+  const renamed = bare("a9c5927b3e947cef", JSON.stringify({ name: "finder-r1-ab-2" }), 5);
+  const unnamed = bare("aaade21d5ddc4ac4", JSON.stringify({ agentType: "general-purpose" }));
+  const noSidecar = bare("0000000000000001");
+  const torn = bare("0000000000000002", '{"name":"finder-r1-ab"');
+  assert.equal(agentNameOf(own), "finder-r1-ab");
+  assert.equal(isOwnTranscript(own, "finder-r1-ab"), true);
+  assert.equal(isOwnTranscript(renamed, "finder-r1-ab"), false, "a renamed sibling is another agent, sidecar or not");
+  assert.deepEqual(findAgentFiles(home, "finder-r1-ab", 0), [own, renamed], "own first, though the sibling is newer");
+  assert.equal(agentNameOf(unnamed), null, "a sidecar without a name is an unnamed agent");
+  assert.equal(agentNameOf(noSidecar), null);
+  assert.equal(agentNameOf(torn), null, "a torn sidecar is no evidence, not a crash");
+  assert.equal(readAgent(own).name, "finder-r1-ab", "readAgent carries the resolved name for salvage");
+  assert.equal(agentNameOf(path.join(home, "agent-afinder-r1-ab-0123abcd.jsonl")), "finder-r1-ab",
+    "a name in the file name wins without reading anything");
 });

@@ -1,0 +1,9 @@
+{
+  "$comment": "Model and effort per agent type — the one place to change them. Keys are the agent file names without the `self-review-` prefix; `risk-finder` is the finder when it runs a tier-L risk angle (G or H). Scripts print every Agent call they emit with both values from here. The applier and the ticket validator are spawned from skill prose with no parameters, so their agents/*.md frontmatter decides — the suite fails, naming the file, until every frontmatter equals its row. Shipped, and deliberately outside the user config merge: a per-user override would reach the script-spawned agents and not the prose-spawned ones, and half an override is worse than none. A session forces one model on every agent only with CLAUDE_CODE_SUBAGENT_MODEL plus CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1, and CLAUDE_CODE_EFFORT_LEVEL outranks every effort here.",
+  "finder":           { "model": "sonnet", "effort": "high" },
+  "risk-finder":      { "model": "opus",   "effort": "medium" },
+  "cold-grader":      { "model": "sonnet", "effort": "medium" },
+  "verifier":         { "model": "opus",   "effort": "medium" },
+  "applier":          { "model": "opus",   "effort": "medium" },
+  "ticket-validator": { "model": "sonnet", "effort": "high" }
+}

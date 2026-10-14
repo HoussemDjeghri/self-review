@@ -164,3 +164,14 @@ test("a note that looks like a flag says so, instead of claiming no value was gi
   assert.match(result.stderr, /looks like another flag/);
   assert.match(result.stderr, /CONVERGED\.json/, "the file form has no such constraint — say so");
 });
+
+test("--help anywhere in the arguments prints the usage and exits 0", () => {
+  for (const args of [["--help"], ["-h"], [...CONVERGED_ARGS, "--help"], ["--work", "x", "-h"]]) {
+    const logDir = freshLogDir();
+    const result = run(args, logDir);
+    assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+    assert.match(result.stdout, /^usage: converged\.sh --converged /m);
+    assert.doesNotMatch(result.stdout, /SELF-REVIEW CONVERGED/, "help is not a marker");
+    assert.equal(existsSync(path.join(logDir, "log.jsonl")), false, "and it logs nothing");
+  }
+});

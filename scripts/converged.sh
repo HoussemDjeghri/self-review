@@ -16,4 +16,10 @@
 #   converged.sh --converged      --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author --tier M
 #   converged.sh --not-applicable user-declined --note "<the user's words>"
 set -euo pipefail
-exec node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/marker.mjs" "$@"
+marker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/marker.mjs"
+# marker.mjs answers a lone --help; beside other flags it reported "unknown
+# flag" and dumped the usage as an error. Asking is never a marker.
+for arg in "$@"; do
+  case "$arg" in --help|-h) exec node "$marker" --help ;; esac
+done
+exec node "$marker" "$@"

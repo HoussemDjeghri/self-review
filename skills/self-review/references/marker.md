@@ -9,7 +9,7 @@ field you do not recognise, or when choosing between the two marker forms.
 | field | when | what |
 |---|---|---|
 | `outcome` | always | `converged`, `not-converged`, or `not-applicable` |
-| `rounds` `fixed` `dismissed` `open` | `converged` / `not-converged` | non-negative integers, and `rounds` is at least 1 — a review that ran no round is `not-applicable`; all four are **refused** for `not-applicable` |
+| `rounds` `fixed` `dismissed` `open` | `converged` / `not-converged` | non-negative integers, and `rounds` is at least 1 — a review that ran no round is `not-applicable`; all four are **refused** for `not-applicable`. `open` = questions put to the user in the report; an unfixed CONFIRMED is not open: CONFIRMED/design → recorded `unfixed`, the review ends `not-converged`; PLAUSIBLE/design → `open`. The gate does not check `open` as a convergence condition, but counts it with `fixed` and `dismissed` toward the candidate total that requires a verifier (more than 4) |
 | `reason` | `not-applicable` only | `no-code-changed`, `user-declined`, `scratch-only`, `other` |
 | `note` | optional; required for `reason=other` | free text — the only free text there is, and it never enters the summary |
 | `tier` `adapter` | always | `tier` is `S`, `M` or `L` from `tier.json`; `adapter` from `impact.json` (`adapter=none` when impact.mjs wrote nothing) |

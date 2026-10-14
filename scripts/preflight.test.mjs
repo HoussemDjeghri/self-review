@@ -210,12 +210,14 @@ test("a timeout stays FAIL, because a hang can be real", () => {
   assert.match(out, /# 1 run, 1 failed, 0 could not start, 0 skipped/);
 });
 
-test("every check failing to start says so, and says it is a defect in the review", () => {
+test("every check failing to start says so, and says why: a tool that could not be run", () => {
   const p = project({ "package.json": JSON.stringify({ scripts: { lint: "x", test: "x" } }) },
     { npm: "exit 127" });
   const out = run(p);
-  assert.match(out, /^# EVERY check failed to start\. This is a defect in the review, not in the project:/m);
-  assert.match(out, /nothing here is a verdict on the code/);
+  // Not "a defect in the review": 127 is a tool not found, and the field case
+  // was a project's own venv missing from PATH, which no review caused.
+  assert.match(out, /^# EVERY check failed to start \(exit 126\/127: a tool not found or not executable where they ran\)\./m);
+  assert.match(out, /^# Nothing here is a verdict on the code/m);
 });
 
 test("one check that could not start alongside a real failure is not the all-INFRA case", () => {
@@ -237,4 +239,22 @@ test("--help prints the whole header, including the last paragraph", () => {
   const out = run(project({}), ["--help"]);
   assert.match(out, /run the project's own checks before spending reviewers/);
   assert.match(out, /Exit 0 even when checks fail/);
+});
+
+test("B6: the project's own .venv/bin comes first on PATH, ahead of a shim that cannot run", () => {
+  // A uv/venv project keeps ruff and pytest in .venv/bin, and a review's shell
+  // has no venv activated — so `ruff` was a pyenv shim answering 127 for a
+  // Python the project pins and the machine does not have. npm and pnpm put
+  // node_modules/.bin on PATH for their scripts; this is the same for a venv.
+  const p = project({
+    "pyproject.toml": "[project]\nname = \"p\"\n",
+    ".venv/bin/ruff": "#!/bin/sh\necho venv ruff\n",
+    ".venv/bin/pytest": "#!/bin/sh\necho venv pytest\n",
+  }, { ruff: "exit 127", pytest: "exit 127", mypy: "exit 127" });
+  for (const tool of ["ruff", "pytest"]) chmodSync(path.join(p.root, ".venv", "bin", tool), 0o755);
+  const out = run(p);
+  assert.match(out, /^PASS {2}format {2}ruff format --check \./m, out);
+  assert.match(out, /^PASS {2}test {4}pytest -q/m, out);
+  // A tool the venv does not hold still resolves where it did before.
+  assert.match(out, /^INFRA types {3}mypy/m, out);
 });

@@ -106,6 +106,19 @@ test("every name brief.mjs's fallback plan generates is a name tree-guard recogn
   assert.ok(seen.length >= 6, `the fallback generator produced almost nothing (${seen.length} rows) — this test has stopped testing anything`);
 });
 
+test("a name with the review number in it is still the reviewer tree-guard recognises", async () => {
+  // brief.mjs inserts `k<review>` after the agent type so a name is unique in
+  // the session; the guard reads the type prefix, which that must not move.
+  const { buildPlan, reviewName } = await import("../scripts/brief.mjs");
+  const reviewers = [...buildPlan("L", 1).finders.map((row) => reviewName(row.name, row.agent, 7)),
+    reviewName("self-review-verifier-r1-b2", "self-review-verifier", 7)];
+  for (const name of reviewers) {
+    assert.match(name, /-k7-/);
+    assert.ok(denied("git stash", { agent_id: `a${name}-deadbeef`, agent_type: name }), name);
+  }
+  assert.ok(denied("ls", { agent_type: reviewName("self-review-cold-grader-r1-x", "self-review-cold-grader", 7) }), "the grader stays shell-less");
+});
+
 // Depth is NOT the variable — measured in the same run. A depth-2 finder's
 // payload carries every key a depth-1 one does; it read as unguarded only
 // because its parent had named it off-convention.

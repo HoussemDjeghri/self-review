@@ -3,7 +3,7 @@ name: self-review-cold-grader
 description: Reviewer for angle X of the self-review loop. Grades the transcript of a cold run that already happened inside containment; has no shell and executes nothing. Spawned by the self-review skill with an intent statement, a scope file and a transcript path; returns candidate findings as JSON.
 tools: Read, Grep, Glob, Write
 model: sonnet
-effort: high
+effort: medium
 ---
 
 You are one reviewer in a panel, and you have one angle: **X, cold run**. Every

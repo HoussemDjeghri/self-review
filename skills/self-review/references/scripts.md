@@ -7,16 +7,26 @@ change configuration — not mid-round.
 
 ## Config
 
-The models are skill text; the cap, the call budgets and the round caps are
-`tier.finders` (SKILL.md, top section). What the plugin reads from
+Model and effort per agent type are rows of `config/agents.json` (shipped, not
+user-overridable; see SKILL.md Models); the cap, the call budgets and the round
+caps are `tier.finders` (SKILL.md, top section). What the plugin reads from
 `${CLAUDE_PLUGIN_ROOT}/config/defaults.json` is the gate's business — the file
-kinds it exempts, `gate.maxReminders`, `pollGuard.maxChecks` — overridden per
-user in `~/.claude/self-review/config.json` (objects merge, arrays replace).
+kinds it exempts, `exempt.paths` (absolute globs, user-only: a repository's
+`.self-review.json` cannot set it), `gate.maxReminders`, `pollGuard.maxChecks` —
+overridden per user in `~/.claude/self-review/config.json` (objects merge,
+arrays replace).
 
 ## The work dir
 
 `round.sh` refuses a second round 1 in one dir and a round whose predecessor is
-missing, so two reviews cannot share a work dir by accident.
+missing, so two reviews cannot share a work dir by accident. A round 1 given
+`--force` again is a **re-plan**, not a second round 1: it re-runs only
+`tier.mjs` and `brief.mjs` over the scope round 1 captured, reuses the cold run,
+and keeps the old plan as `tier.replaced-<n>.json` and `briefs.replaced-<n>/`.
+It is refused (exit 2) once `round-2/` exists, once a finder has filed into
+`round-1/state/`, or when paths or `--base` are given — re-scoping is a new
+review. From round 2, a `STOP` or `UNRECORDED` verdict on the previous round
+refuses the round (exit 5, nothing created) and prints the `next:` call.
 
 The `>` target is checked on its own as a file write (Claude Code's redirection
 rule), which the session scratchpad passes — hence SKILL.md §0's advice when
@@ -35,9 +45,8 @@ fall back on if `round.sh` is missing; they are not the normal path. That
 fallback does **not** run `coldrun.sh`, so angle X is unavailable on it: either
 run `coldrun.sh` by hand and pass its transcript to `brief.mjs --cold`, or do
 not spawn X. A grader with no transcript can only file "not exercised". Every
-one of them carries its usage in its header comment (the two shell scripts also
-print it on `--help`; the four `.mjs` CLIs reject unknown flags instead), so
-falling back does not mean reconstructing flags from prose.
+one of them carries its usage in its header comment and prints it on `--help`,
+so falling back does not mean reconstructing flags from prose.
 
 ## Plugin root
 
@@ -128,13 +137,13 @@ changed file the next review has to review. A record missing the finder's
 
 Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin directory.
 
-- `scripts/round.sh` — **the entry point**: a whole round's setup in one call, and the tier ceiling a later round inherits (§0)
+- `scripts/round.sh` — **the entry point**: a whole round's setup in one call, the tier ceiling a later round inherits, the round-1 re-plan, and the refusal after `STOP` (§0)
 - `scripts/lib/path.sh` — `abs_path`, shared by `round.sh` and `scope.sh`
 - `scripts/scope.sh` — scope bundle (diff + untracked files; each path diffed against its own repo, plain text only for paths in none)
 - `scripts/impact.mjs` — blast radius: broken references, tests, callers, docs (§0); writes `impact.md` + `impact.json`
 - `scripts/tier.mjs` — the tier, its reasons, and the round's finder rows (§0); writes `tier.json`
 - `scripts/brief.mjs` — one brief per finder row, held to the token budget, and the `Agent` line for each (§2b); `--verify` does the same for a verifier batch (§2d)
-- `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule (§2b, §2e, §3)
+- `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record --work` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
 - `scripts/preflight.sh` — the project's own checks for the touched ecosystems (§1)
 - `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1)
 - `scripts/treecheck.sh` — says whether the working tree moved while reviewers ran (§2c)

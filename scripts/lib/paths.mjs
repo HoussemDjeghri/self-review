@@ -1,5 +1,7 @@
 /**
- * Path classification shared by impact.mjs and tier.mjs.
+ * Path classification shared by impact.mjs, tier.mjs and findings.mjs — and the
+ * one glob dialect (`globToRegExp`), which the Stop gate also uses to match
+ * `exempt.paths`.
  *
  * The gate's exempt lists (config `exempt.extensions`, `exempt.names`) answer
  * one question — "does this file need a review?" — and both phase-3 scripts
@@ -9,6 +11,9 @@
  * the gate exempts is configuration, and anything the gate would gate is code.
  * Keeping the split in one module is what keeps `tier.json`'s `kinds` and
  * `impact.md`'s sections describing the same file the same way.
+ * Changing the dialect changes what the gate exempts, so
+ * `self-review-gate.test.mjs`'s exempt.paths tests are part of this module's
+ * contract.
  */
 import { readdirSync } from "node:fs";
 import path from "node:path";

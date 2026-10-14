@@ -6,7 +6,9 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief, writeBriefs } from "./brief.mjs";
+import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief, reviewName, reviewNumber, writeBriefs } from "./brief.mjs";
+import { agentSettings } from "../hooks/lib/agent-settings.mjs";
+import { reviewFromWork } from "./findings.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "brief.mjs");
@@ -14,6 +16,9 @@ const CATALOGUE = path.join(HERE, "..", "skills", "self-review", "references", "
 // A user config file that does not exist keeps loadConfig() on the shipped
 // defaults, so these assertions do not depend on the machine running them.
 process.env.SELF_REVIEW_CONFIG = path.join(tmpdir(), "brief-test-no-such-config.json");
+// brief.mjs appends to the metrics log; the suite must not write into the
+// developer's own memory.
+process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "sr-log-"));
 
 const workdir = () => mkdtempSync(path.join(tmpdir(), "brief-"));
 const budget = { maxTokens: 2800, impactMaxLines: 80, priorMaxLines: 10 };
@@ -43,7 +48,10 @@ test("the fallback plan follows the round-1 groups, and merges by round", () => 
   const large = buildPlan("L", 1);
   assert.equal(large.finders.length, 6, "six is the cap, not a coincidence");
   assert.equal(large.verifier, "agent", "tier L gets an independent verifier");
-  assert.deepEqual(large.finders.filter((f) => f.model === "opus").map((f) => f.angles), [["G"], ["H"]]);
+  for (const finder of large.finders) {
+    const risk = ["G", "H"].includes(finder.angles[0]);
+    assert.deepEqual({ model: finder.model, effort: finder.effort }, agentSettings(risk ? "risk-finder" : "finder"), finder.angles.join("+"));
+  }
   assert.equal(buildPlan("M", 2).finders.length, 2, "round 2 merges to two finders");
   assert.deepEqual(buildPlan("L", 3).finders.map((f) => f.angles), [["compact"]], "round 3+ is one compact finder");
   assert.equal(buildPlan("M", 2).finders[0].name, "self-review-finder-r2-abdqv",
@@ -276,11 +284,49 @@ test("the CLI writes one brief per plan row, creates the state directory, and pr
   const call = JSON.parse(/^Agent (\{.*\})  # 40 calls, \d+ tok$/.exec(lines[1])[1]);
   assert.equal(call.name, "self-review-finder-r1-ab");
   assert.match(call.subagent_type, /^(self-review:)?self-review-finder$/);
-  assert.equal(call.model, "sonnet");
+  assert.deepEqual({ model: call.model, effort: call.effort }, agentSettings("finder"),
+    "the call carries effort too — before it did, a plan row's effort never reached the agent");
   assert.equal(call.prompt, `Read ${path.join(dir, "round-1", "briefs", "self-review-finder-r1-ab.md")} and follow it.`);
   assert.ok(existsSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md")));
   assert.ok(existsSync(path.join(dir, "round-1", "state")), "the state directory exists before the finder appends to it");
   assert.match(readFileSync(path.join(dir, "round-1", "briefs", "self-review-finder-r1-g.md"), "utf8"), /ship phase 2/);
+});
+
+test("a review's finder names carry its number, so no two reviews of a session print the same name", () => {
+  // The harness renames a repeated name to `-2`, `-3`, … and every lookup by the
+  // printed name then finds another review's agent or none (B7, 18 sessions).
+  const names = (k) => {
+    const dir = workdir();
+    const work = path.join(dir, `review-${k}`);
+    writeFileSync(path.join(dir, "intent.md"), "INTENT\n");
+    writeFileSync(path.join(dir, "scope.diff"), "diff\n");
+    const lines = [];
+    const results = main(["--round", "1", "--tier", "M", "--intent", path.join(dir, "intent.md"), "--scope", path.join(dir, "scope.diff"),
+      "--out", path.join(work, "round-1", "briefs"), "--live", dir], { log: (l) => lines.push(l) });
+    const printed = lines.filter((l) => l.startsWith("Agent ")).map((l) => JSON.parse(/^Agent (\{.*\})  #/.exec(l)[1]).name);
+    // The brief, the state file and the call agree, so wait.mjs's default names
+    // (the brief stems) are the names that were spawned.
+    for (const { file } of results) {
+      const stem = path.basename(file, ".md");
+      assert.ok(printed.includes(stem), `${stem} not among ${printed}`);
+      assert.ok(readFileSync(file, "utf8").includes(path.join(work, "round-1", "state", `${stem}.jsonl`)));
+    }
+    return printed;
+  };
+  const first = names(1), third = names(3);
+  assert.ok(first.includes("self-review-finder-k1-r1-abd"), first.join(" "));
+  assert.ok(third.includes("self-review-finder-k3-r1-abd"), third.join(" "));
+  assert.ok(first.every((name) => !third.includes(name)));
+});
+
+test("reviewName puts the review after the agent type, once, and leaves a name with no review alone", () => {
+  assert.equal(reviewName("self-review-finder-r1-ab", "self-review-finder", "3"), "self-review-finder-k3-r1-ab");
+  assert.equal(reviewName("self-review-cold-grader-r1-x", "self-review-cold-grader", 2), "self-review-cold-grader-k2-r1-x");
+  assert.equal(reviewName("self-review-finder-k3-r1-ab", "self-review-finder", 3), "self-review-finder-k3-r1-ab", "idempotent");
+  assert.equal(reviewName("r2-custom", "self-review-finder", 4), "r2-custom-k4", "a name that does not lead with its type still becomes unique");
+  assert.equal(reviewName("self-review-finder-r1-ab", "self-review-finder", null), "self-review-finder-r1-ab");
+  assert.equal(reviewNumber("/s/self-review/review-12"), "12");
+  assert.equal(reviewNumber("/s/self-review"), null);
 });
 
 test("a tier.json plan drives the briefs, including its own names and models", () => {
@@ -368,6 +414,17 @@ test("a plan is rejected whole: a bad row leaves no earlier brief on disk", () =
   assert.equal(badDepth.status, 3, "an unknown impact depth is refused, not silently treated as full");
   assert.match(badDepth.stderr, /impact must be one of/);
   assert.ok(!existsSync(out));
+
+  const noEffort = run(plan([row("no-effort", { effort: undefined })]));
+  assert.equal(noEffort.status, 3, "a row without an effort would spawn the finder on the frontmatter's effort");
+  assert.match(noEffort.stderr, /effort/);
+  assert.ok(!existsSync(out));
+});
+
+test("--help prints the usage and exits 0", () => {
+  const run = spawnSync(process.execPath, [SCRIPT, "--help"], { encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /usage/i);
 });
 
 test("usage errors exit 2, unreadable inputs exit 3, and neither writes a brief", () => {
@@ -400,12 +457,13 @@ test("--verify writes the verifier brief and prints its call under a guarded nam
   writeFileSync(path.join(dir, "intent.md"), "INTENT\nUser asked: \"fix it\"\n");
   writeFileSync(path.join(dir, "cands.json"), JSON.stringify([{ id: "r2-1", title: "x" }]));
   const lines = [];
-  const { file } = main(["--verify", path.join(dir, "cands.json"), "--work", dir, "--round", "2", "--batch", "3", "--live", dir],
-    { log: (l) => lines.push(l) });
+  const [{ file }] = main(["--verify", path.join(dir, "cands.json"), "--work", dir, "--round", "2", "--batch", "3", "--live", dir],
+    { log: (l) => lines.push(l), logDir: workdir() });
   assert.equal(lines.length, 1);
   const call = JSON.parse(lines[0].replace(/^Agent /, ""));
   assert.equal(call.name, "self-review-verifier-r2-b3", "the name tree-guard matches, never the registered type");
   assert.match(call.subagent_type, /^(self-review:)?self-review-verifier$/);
+  assert.deepEqual({ model: call.model, effort: call.effort }, agentSettings("verifier"));
   assert.equal(call.prompt, `Read ${file} and follow it.`);
   const brief = readFileSync(file, "utf8");
   assert.match(brief, /^Verify these 1 candidate findings from round 2/);
@@ -414,8 +472,49 @@ test("--verify writes the verifier brief and prints its call under a guarded nam
   assert.ok(brief.includes(path.join(dir, "round-2", "state", "self-review-verifier-r2-b3.jsonl")));
   assert.ok(existsSync(path.join(dir, "round-2", "state")));
 
-  writeFileSync(path.join(dir, "nine.json"), JSON.stringify(Array.from({ length: 9 }, (_, i) => ({ id: `r2-${i}` }))));
-  assert.throws(() => main(["--verify", path.join(dir, "nine.json"), "--work", dir, "--round", "2"], { log() {} }), /at most 8/);
+});
+
+test("--verify splits more than 8 candidates into even numbered batches, one Agent line each", () => {
+  const dir = workdir();
+  const work = path.join(dir, "review-2");
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  writeFileSync(path.join(work, "intent.md"), "INTENT\n");
+  writeFileSync(path.join(dir, "cands.json"), JSON.stringify(Array.from({ length: 11 }, (_, i) => ({ id: `r1-${i + 1}` }))));
+  const lines = [];
+  const logDir = workdir();
+  const batches = main(["--verify", path.join(dir, "cands.json"), "--work", work, "--round", "1", "--live", dir], { log: (l) => lines.push(l), logDir });
+  assert.match(lines[0], /^# 11 candidates, at most 8 per verifier: 2 batches — spawn every line in one message/);
+  const calls = lines.slice(1).map((l) => JSON.parse(l.replace(/^Agent /, "")));
+  assert.deepEqual(calls.map((c) => c.name), ["self-review-verifier-k2-r1-b1", "self-review-verifier-k2-r1-b2"],
+    "the review number keeps a verifier's name unique in the session too");
+  assert.deepEqual(batches.map((b) => b.name), calls.map((c) => c.name));
+  const ids = batches.map(({ file }) => [...readFileSync(file, "utf8").matchAll(/"id": "(r1-\d+)"/g)].map((m) => m[1]));
+  assert.deepEqual(ids.map((i) => i.length), [6, 5], "even, not 8 + 3");
+  assert.deepEqual(ids.flat(), Array.from({ length: 11 }, (_, i) => `r1-${i + 1}`), "every candidate once, in order");
+  assert.match(readFileSync(batches[1].file, "utf8"), /^Verify these 5 candidate findings/);
+
+  // The split, kept past the scratchpad: one numbers-only row under the review's key.
+  const rows = readFileSync(path.join(logDir, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, 1);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ["candidates", "cwd", "firstBatch", "kind", "perAgent", "review", "round", "stage", "ts"]);
+  assert.equal(rows[0].review, reviewFromWork(work));
+  assert.deepEqual({ kind: rows[0].kind, round: rows[0].round, stage: rows[0].stage, candidates: rows[0].candidates, perAgent: rows[0].perAgent, firstBatch: rows[0].firstBatch },
+    { kind: "units", round: 1, stage: "verify", candidates: 11, perAgent: [6, 5], firstBatch: 1 });
+});
+
+test("--verify with an unwritable log dir still writes every brief and prints every call", () => {
+  const dir = workdir();
+  mkdirSync(path.join(dir, "round-1"), { recursive: true });
+  writeFileSync(path.join(dir, "intent.md"), "INTENT\n");
+  writeFileSync(path.join(dir, "cands.json"), JSON.stringify([{ id: "r1-1" }]));
+  // A directory under a regular file cannot be created, whoever runs this.
+  const blocker = path.join(workdir(), "file");
+  writeFileSync(blocker, "");
+  const lines = [];
+  const [{ file }] = main(["--verify", path.join(dir, "cands.json"), "--work", dir, "--round", "1", "--live", dir],
+    { log: (l) => lines.push(l), logDir: path.join(blocker, "log") });
+  assert.equal(lines.length, 1);
+  assert.ok(existsSync(file));
 });
 
 test("the compact brief's cold-run section follows what the round planned", () => {

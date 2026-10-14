@@ -8,8 +8,9 @@
 // still going — from the same file, so the answer lives here once.
 //
 // The harness appends a subagent's transcript live to
-// <project>/<session-id>/subagents/agent-a<name>-<hash>.jsonl, one entry per
-// model message. That file is the only signal this plugin owns. The wake-ups
+// <project>/<session-id>/subagents/agent-a<name>-<hash>.jsonl (or bare
+// agent-a<hash>.jsonl with the name in a sidecar — see agentNameOf), one entry
+// per model message. That file is the only signal this plugin owns. The wake-ups
 // the harness sends are not: on 2026-09-03 three reviewers reported with
 // SendMessage `success:true` and nothing was delivered to the lead for 2h49m,
 // while their transcripts said finished within ten minutes.
@@ -89,6 +90,7 @@ export function readAgent(file) {
   const content = Array.isArray(last?.message?.content) ? last.message.content : [];
   return {
     stem: path.basename(file, ".jsonl").replace(/^agent-/, ""),
+    name: agentNameOf(file),
     file,
     // The report shape: the last entry is an ASSISTANT entry the model was
     // billed for, carrying text and no tool call. Every clause is load-bearing.
@@ -143,35 +145,51 @@ export function agentStatus(agent, now, config = {}) {
   return "active";
 }
 
+// The name an agent's transcript was filed under, or null for an unnamed agent.
+// Usually the file says it: `agent-a<name>-<hex>.jsonl`. But the harness also
+// writes a NAMED agent as bare `agent-a<hex>.jsonl`, with the name only in the
+// sibling `.meta.json` — 24 of ~1,770 named agents across 40 days of sessions,
+// surveyed 2026-09-28, interactive and print mode alike. Read from the file
+// name alone, such an agent had no transcript at all: wait.mjs reported it
+// active with "no transcript" long after it finished, and idled out three
+// ten-minute calls of a thirty-three-minute review.
+export function agentNameOf(file) {
+  const stem = path.basename(file, ".jsonl");
+  const named = /^agent-a(.+)-[0-9a-f]+$/.exec(stem);
+  if (named) return named[1];
+  if (!/^agent-a[0-9a-f]+$/.test(stem)) return null;
+  try {
+    const { name } = JSON.parse(readFileSync(path.join(path.dirname(file), `${stem}.meta.json`), "utf8"));
+    return typeof name === "string" && name ? name : null;
+  } catch {
+    return null; // no sidecar, or a torn one: an unnamed agent, which is what the file name says
+  }
+}
+
+// `name`'s own transcript, as opposed to a sibling's whose name merely starts
+// with it: the harness renames a colliding `X` to `X-2`, a different agent.
+export const isOwnTranscript = (file, name) => agentNameOf(file) === name;
+
 // Every transcript for `name`, newest first, skipping any last written before
 // `sinceMs`. A re-spawned reviewer reuses its name, so without that floor a
 // wait would settle instantly on the previous attempt's finished transcript.
 // The mtime is only a prefilter — an agent's own `startedMs` is the timestamp
-// that decides, and the caller has it once it reads the file. An exact
-// `<name>-<hash>` match outranks a longer stem that merely starts with the name,
-// which is another agent the harness renamed off a collision.
-// `agent-a<name>-<hex>.jsonl` is `name`'s own transcript; a longer stem that
-// starts the same way belongs to another agent.
-export function isOwnTranscript(file, name) {
-  const prefix = `agent-a${name}-`;
-  const stem = path.basename(file, ".jsonl");
-  return stem.startsWith(prefix) && /^[0-9a-f]+$/.test(stem.slice(prefix.length));
-}
-
+// that decides, and the caller has it once it reads the file.
+//
+// `name`'s own transcript outranks one filed as `<name>-…`, which belongs to a
+// DIFFERENT agent the harness renamed off a colliding name — but when the
+// harness renamed the agent we asked for, that is the only file there is. So
+// rank rather than exclude. The mtime floor runs first because resolving a
+// bare-hex file's name reads its sidecar.
 export function findAgentFiles(dir, name, sinceMs = 0) {
   if (!existsSync(dir) || !statSync(dir).isDirectory()) return [];
-  const prefix = `agent-a${name}-`;
-  // `<name>-<hash>` is this agent's own transcript. `<name>-2-<hash>` belongs to
-  // a DIFFERENT agent the harness renamed off a colliding name — but when the
-  // harness renamed the agent we asked for, that is the only file there is. So
-  // rank rather than exclude: an exact match wins if one exists, and the
-  // renamed transcript still answers when it does not. No regex escaping: the
-  // remainder is tested, not the name.
   return readdirSync(dir)
-    .filter((f) => f.startsWith(prefix) && f.endsWith(".jsonl"))
+    .filter((f) => f.startsWith("agent-a") && f.endsWith(".jsonl"))
     .map((f) => path.join(dir, f))
-    .map((f) => [f, statSync(f).mtimeMs, isOwnTranscript(f, name) ? 0 : 1])
+    .map((f) => [f, statSync(f).mtimeMs])
     .filter(([, mtime]) => mtime >= sinceMs)
-    .sort((a, b) => a[2] - b[2] || b[1] - a[1])
+    .map(([f, mtime]) => [f, mtime, agentNameOf(f)])
+    .filter(([, , own]) => own === name || own?.startsWith(`${name}-`))
+    .sort((a, b) => Number(a[2] !== name) - Number(b[2] !== name) || b[1] - a[1])
     .map(([f]) => f);
 }

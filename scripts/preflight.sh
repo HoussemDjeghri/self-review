@@ -68,6 +68,17 @@ fi
 # then claims the project defines no checks at all.
 root=$(cd "$root" 2>/dev/null && pwd -P) || { echo "preflight.sh: no such directory: $root" >&2; exit 2; }
 
+# The project's own virtualenv first on PATH, as `npm run` puts node_modules/.bin
+# there for a script. coldrun.sh already links `.venv` into the staged copy the
+# way it links node_modules, but nothing activated it: no review shell has, so
+# `ruff` was whatever PATH held — in the field a pyenv shim that answers 127 for
+# a Python the project pins and the machine lacks — and every check of a uv
+# project "could not start" (~55 times in 6 sessions). Detection below goes
+# through the same PATH, so a tool only the venv holds is now found at all.
+for venv in .venv venv; do
+  if [ -d "$root/$venv/bin" ]; then PATH="$root/$venv/bin:$PATH"; break; fi
+done
+
 # Which ecosystems the change touched. No paths = no information, so everything
 # detected runs; project-wide runners (Makefile, ./test.sh) always run.
 eco_node=0 eco_py=0 eco_go=0 eco_rs=0
@@ -87,7 +98,9 @@ fi
 # Checks are "kind<TAB>command" lines; the first detector to claim a kind wins,
 # so a package.json "test" script beats a Makefile target of the same name.
 checks=""
-has_kind() { printf '%s' "$checks" | grep -q "^$1	"; }
+# Here-strings, not `printf | grep -q`: an early-exiting reader under pipefail
+# turns the writer's SIGPIPE into the pipeline's status (scope.sh's exit 141).
+has_kind() { grep -q "^$1	" <<<"$checks"; }
 add_check() { has_kind "$1" || checks="$checks$1	$2
 "; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -180,7 +193,7 @@ ran=0 failed=0 skipped=0 infra=0
 
 for kind in format lint types test; do
   has_kind "$kind" || continue
-  cmd=$(printf '%s' "$checks" | awk -F'\t' -v k="$kind" '$1==k{print substr($0, length(k)+2); exit}')
+  cmd=$(awk -F'\t' -v k="$kind" '$1==k{print substr($0, length(k)+2); exit}' <<<"$checks")
   if is_skipped "$kind"; then
     printf 'SKIP  %-7s %s\n' "$kind" "(preflight.skip)" >>"$status"
     skipped=$((skipped + 1))
@@ -226,8 +239,8 @@ report="$work/report"
   else
     echo "# $ran run, $failed failed, $infra could not start, $skipped skipped"
     if [ "$ran" -gt 0 ] && [ "$infra" -eq "$ran" ]; then
-      echo "# EVERY check failed to start. This is a defect in the review, not in the project:"
-      echo "# nothing here is a verdict on the code, and the reviewers still need a real one."
+      echo "# EVERY check failed to start (exit 126/127: a tool not found or not executable where they ran)."
+      echo "# Nothing here is a verdict on the code, and the reviewers still need a real one."
     fi
   fi
   cat "$status"

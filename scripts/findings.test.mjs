@@ -1,13 +1,13 @@
 // Run: node --test plugin/scripts/findings.test.mjs   (or ./test.sh for everything)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  convergence, findingsFile, main, normaliseRemote, priorCiteOf, priorId, priorLines, rankPrior, readRecords, recordFindings, recordProblem, repoId, reviewFromWork, toRecords,
+  convergence, findingsFile, main, nextAction, normaliseRemote, priorCiteOf, priorId, priorLines, rankPrior, readRecords, recordFindings, recordProblem, repoId, reviewFromWork, toRecords,
 } from "./findings.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -15,6 +15,9 @@ const SCRIPT = path.join(HERE, "findings.mjs");
 const BRIEF = path.join(HERE, "brief.mjs");
 // A user config that does not exist keeps loadConfig() on the shipped defaults.
 process.env.SELF_REVIEW_CONFIG = path.join(tmpdir(), "findings-test-no-such-config.json");
+// Spawned findings.mjs and brief.mjs append to the log dir; the suite must not
+// write into the developer's own memory.
+process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "sr-log-"));
 
 const workdir = () => mkdtempSync(path.join(tmpdir(), "findings-"));
 
@@ -39,6 +42,20 @@ const candidate = (over = {}) => ({
 
 const stored = (dir, repoRoot) =>
   readFileSync(findingsFile(repoRoot, { logDir: dir }), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+// A review dir as round.sh leaves it: round 1's scope names the repository the
+// review keys its memory on, and a round `record` writes into has a plan.
+const planned = (work, round) => {
+  const plan = path.join(work, `round-${round}`, "tier.json");
+  mkdirSync(path.dirname(plan), { recursive: true });
+  if (!existsSync(plan)) writeFileSync(plan, "{}\n");
+};
+const scoped = (work, repo, rounds = [1]) => {
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  writeFileSync(path.join(work, "round-1", "scope.diff"), `# self-review scope\n# repo: ${repo}\n`);
+  for (const round of rounds) planned(work, round);
+  return work;
+};
 
 test("remote URLs normalise so ssh, https and .git forms are one repository", () => {
   assert.equal(normaliseRemote("https://GitHub.com/Owner/Repo.git"), "github.com/Owner/Repo");
@@ -401,8 +418,8 @@ test("the review identity comes from the work dir, and two sessions are not one 
   // records from everyone's briefs.
   const sessionA = path.join(workdir(), "scratchpad", "self-review");
   const sessionB = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(sessionA, { recursive: true });
-  mkdirSync(sessionB, { recursive: true });
+  scoped(sessionA, repo);
+  scoped(sessionB, repo);
   assert.notEqual(reviewFromWork(sessionA), reviewFromWork(sessionB), "same tail, different review");
   assert.equal(reviewFromWork(sessionA), reviewFromWork(`${sessionA}${path.sep}`), "one dir is one id, however it is spelled");
 
@@ -448,8 +465,7 @@ test("convergence: W is computed from the records, over the angles two rounds sh
 
 test("CLI: converge reads this review's own records and names the rule it did not check", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const work = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(work, { recursive: true });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [1, 2]);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   const fill = (round, entries) => run(["record", "--work", work, "--round", String(round), "--log-dir", logDir], JSON.stringify(entries));
   assert.equal(fill(1, [candidate({ severity: "blocker", angle: "A" }), candidate({ severity: "major", angle: "A" })]).status, 0);
@@ -460,8 +476,7 @@ test("CLI: converge reads this review's own records and names the rule it did no
   assert.match(out.stdout, /CONTINUE/);
   assert.match(out.stdout, /round cap|oscillation/, "it says which parts of §3 it does not decide");
   // Another review's records must not move this review's arithmetic.
-  const other = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(other, { recursive: true });
+  const other = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [2]);
   // Enough weight on the same round and angle to flip the verdict if it counted.
   run(["record", "--work", other, "--round", "2", "--log-dir", logDir],
     JSON.stringify([candidate({ severity: "blocker", angle: "A" }), candidate({ severity: "blocker", angle: "A" })]));
@@ -478,8 +493,7 @@ test("CLI: converge reads this review's own records and names the rule it did no
 // gap this closes.
 test("CLI: converge says the guard proved nothing when no engagement log was opened", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const work = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(work, { recursive: true });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
 
@@ -501,16 +515,16 @@ test("CLI: converge says the guard proved nothing when no engagement log was ope
 // at "round 7": converge compared it against another review's last round, found
 // its budget spent at every round, and said STOP from its first look. Each
 // review now gets `<base>/review-<k>/`, and the identity is that directory.
-const reviewDirs = () => {
+const reviewDirs = (repo, rounds = [1]) => {
   const base = path.join(workdir(), "scratchpad", "self-review");
   const [one, two] = ["review-1", "review-2"].map((name) => path.join(base, name));
-  for (const dir of [one, two]) mkdirSync(path.join(dir, "round-1"), { recursive: true });
+  for (const dir of [one, two]) scoped(dir, repo, rounds);
   return { one, two };
 };
 
 test("D1: a second review in the same session starts at its own round 1, with its budget unspent", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const { one, two } = reviewDirs();
+  const { one, two } = reviewDirs(repo, [1, 2, 3, 4, 5]);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   for (let round = 1; round <= 5; round += 1) {
     run(["record", "--work", one, "--round", String(round), "--log-dir", logDir], JSON.stringify([candidate({ severity: "minor" })]));
@@ -526,7 +540,7 @@ test("D1: a second review in the same session starts at its own round 1, with it
 
 test("D1: prior for review 2 carries review 1's records; each review hides only its own", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const { one, two } = reviewDirs();
+  const { one, two } = reviewDirs(repo);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   assert.notEqual(reviewFromWork(one), reviewFromWork(two), "sibling review dirs are two reviews");
   run(["record", "--work", one, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()]));
@@ -546,8 +560,7 @@ test("CLI: converge takes the round cap from tier.json, so forgetting a flag can
   // forgetting the flag silently answered on W alone and reported nothing about
   // a spent budget, which is the only bound on cost the loop has.
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const work = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(path.join(work, "round-2"), { recursive: true });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [1, 2]);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   const fill = (round, entries) => run(["record", "--work", work, "--round", String(round), "--log-dir", logDir], JSON.stringify(entries));
   fill(1, [candidate({ severity: "blocker", angle: "A" }), candidate({ severity: "major", angle: "A" })]);
@@ -570,8 +583,7 @@ test("CLI: converge logs its decision, so a granted round leaves a trace", () =>
   // only ever printed: afterwards, a review that ran round budget+1 looked
   // exactly like one that overran.
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const work = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(work, { recursive: true });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [1, 2, 3]);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   const fill = (round, entries) => run(["record", "--work", work, "--round", String(round), "--log-dir", logDir], JSON.stringify(entries));
   fill(1, [candidate({ severity: "blocker", angle: "A" }), candidate({ severity: "major", angle: "A" })]);
@@ -683,8 +695,7 @@ test("convergence: a taper that merges angles still compares like with like", ()
 
 test("CLI: converge says on stderr when the memory file holds rows it cannot use", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
-  const work = path.join(workdir(), "scratchpad", "self-review");
-  mkdirSync(work, { recursive: true });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo);
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()]));
   const file = findingsFile(repo, { logDir });
@@ -722,7 +733,7 @@ test("F3: three problems in two records are reported once, with the schema", () 
   assert.match(message, /^ {2}record 1: unknown field "title" — did you mean summary\?$/m);
   assert.match(message, /^ {2}record 1: severity — one of blocker, major, minor, got "high" — did you mean major\?$/m);
   assert.match(message, /^ {2}record 2: class — one of the class vocabulary in the schema line below, got "maintainability" — did you mean reuse\?$/m);
-  assert.match(message, /^schema: verdict fixed\|dismissed\|open · severity blocker\|major\|minor · class /m);
+  assert.match(message, /^schema: verdict fixed\|dismissed\|open\|unfixed · severity blocker\|major\|minor · class /m);
   assert.match(message, /· file · line · summary · mechanism · proof · angle · prior_id$/m);
 });
 
@@ -840,4 +851,457 @@ test("`recordProblem` does NOT apply the dismissal-proof rule to stored rows", (
   // drop them — the loop forgetting what it once found, which is the thing the
   // rule exists to prevent.
   assert.equal(recordProblem(kept({ verdict: "dismissed", proof: "" })), null);
+});
+
+// --- the interface, discoverable without failing (field report 2026-10-14 B9) --
+// `--help` answered "pass a command" 45 times in 18 sessions, and each refusal
+// was followed by three to six calls grepping this file for the schema.
+const cli = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: gitRepo() });
+
+test("--help prints the usage and the whole record vocabulary, and exits 0", () => {
+  for (const args of [["--help"], ["-h"], ["help"], ["record", "--help"], ["record", "--work", "/x", "-h"]]) {
+    const out = cli(args);
+    assert.equal(out.status, 0, `${args.join(" ")}: ${out.stderr}`);
+    assert.match(out.stdout, /findings\.mjs record \(--work <dir> \| --review <id>/, args.join(" "));
+    for (const word of ["fixed", "dismissed", "open", "blocker", "major", "minor", "correctness", "cold-run", "pre-existing"]) {
+      assert.match(out.stdout, new RegExp(`\\b${word}\\b`), `${args.join(" ")}: ${word}`);
+    }
+    assert.match(out.stdout, /^ {2}angle\b.*\bcompact\b.*\+/m, "angle is free text, so its shape is described with examples");
+  }
+  for (const command of ["prior", "converge", "engagement"]) {
+    const out = cli([command, "--help"]);
+    assert.equal(out.status, 0, out.stderr);
+    assert.match(out.stdout, new RegExp(`findings\\.mjs ${command} `));
+  }
+});
+
+test("--help never advertises --work with --repo, the pair main() refuses", () => {
+  for (const args of [["--help"], ["converge", "--help"], ["record", "--help"], ["prior", "--help"], ["engagement", "--help"]]) {
+    const out = cli(args);
+    assert.equal(out.status, 0, out.stderr);
+    assert.doesNotMatch(out.stdout, /--work <dir>[^|\n]*\[--repo/, args.join(" "));
+  }
+});
+
+test("an unknown flag names the flags the command does take", () => {
+  const out = cli(["record", "--rounds", "2"], "[]");
+  assert.equal(out.status, 2);
+  assert.match(out.stderr, /unknown argument --rounds — record takes --work, --review, --round, --in, --repo, --log-dir/);
+});
+
+test("a candidate exactly as SKILL.md §2c/§2e tells the lead to write it is accepted", () => {
+  // §2c gives every candidate an id (`r1-1`…); `record` refused the field, six
+  // times in the field. It is the lead's handle for one round's merge and
+  // verify, not part of what a later review should remember — accepted, not
+  // stored.
+  const skill = readFileSync(path.join(HERE, "..", "skills", "self-review", "SKILL.md"), "utf8");
+  const example = /findings\.mjs" record [^\n]*<<'JSON'\n([\s\S]*?)\nJSON/.exec(skill);
+  assert.ok(example, "SKILL.md's record example moved, and this test is now blind");
+  const [entry] = JSON.parse(example[1]);
+  const logDir = workdir(), repo = gitRepo();
+  recordFindings([{ id: "r1-1", ...entry }], { review: "r", round: 1, repoRoot: repo, logDir });
+  const [row] = stored(logDir, repo);
+  assert.equal(row.summary, entry.summary);
+  assert.equal(Object.hasOwn(row, "id"), false, "the id is a handle for this round, not memory");
+});
+
+test("hints cover the invented words the field actually used", () => {
+  assert.match(problems([candidate({ severity: "nit" })]), /got "nit" — did you mean minor\?/);
+  assert.match(problems([candidate({ class: "test-coverage" })]), /got "test-coverage" — did you mean verification\?/);
+});
+
+// --- converge on the rounds the W rule has nothing to say about (B11) --------
+test("convergence: a round that fixed nothing is clean, whatever the angles", () => {
+  const rec = (round, angle, severity, verdict = "fixed") => kept({ round, angle, severity, verdict, proof: "p" });
+  // Round 3 found nothing at all: it used to answer CONTINUE "nothing comparable"
+  // because an empty round shares no angle with anything.
+  const empty = convergence([rec(2, "A+B", "major")], 3);
+  assert.equal(empty.verdict, "CLEAN", empty.reason);
+  assert.match(empty.reason, /round 3 fixed nothing/);
+  // Everything dismissed or left open is clean too (SKILL §3: open and
+  // dismissed items do not count) — and it used to ESCALATE on "0 did not drop
+  // below 0".
+  const quiet = convergence([rec(1, "A", "minor", "dismissed"), rec(2, "A", "major", "dismissed"), rec(2, "A", "minor", "open")], 2);
+  assert.equal(quiet.verdict, "CLEAN", quiet.reason);
+  assert.match(quiet.reason, /1 open/, "the open item is named, because the report must carry it");
+  // A clean round on the last affordable round is still clean: nothing it did
+  // ships unreviewed.
+  assert.equal(convergence([rec(1, "A", "major"), rec(2, "A", "minor", "dismissed")], 2, { budget: 2 }).verdict, "CLEAN");
+  assert.equal(convergence([], 1).verdict, "CLEAN", "a first round that found nothing");
+});
+
+test("convergence: an unrecorded round is not a clean one", () => {
+  const unrecorded = convergence([kept({ round: 1 })], 2, { recorded: false });
+  assert.equal(unrecorded.verdict, "UNRECORDED", unrecorded.reason);
+  assert.match(unrecorded.reason, /record step/);
+  assert.equal(convergence([kept({ round: 1 }), kept({ round: 2, verdict: "open" })], 2, { recorded: false }).verdict, "CLEAN",
+    "a round that has records was recorded, receipt or not");
+});
+
+test("convergence: W with nothing on the shared angles in either round is vacuous, not a stall", () => {
+  const rec = (round, angle, severity, verdict = "fixed") => kept({ round, angle, severity, verdict, proof: "p" });
+  // Both rounds ran A; round 1 only dismissed there, round 2 fixed on S alone.
+  const vacuous = convergence([rec(1, "A", "major", "dismissed"), rec(2, "A", "minor", "dismissed"), rec(2, "S", "blocker")], 2);
+  assert.equal(vacuous.verdict, "CONTINUE", vacuous.reason);
+  assert.match(vacuous.reason, /neither a stall nor a pass/);
+  assert.match(vacuous.reason, /run round 3/);
+  assert.equal(convergence([rec(1, "A", "minor"), rec(2, "A", "minor")], 2).verdict, "ESCALATE", "a real plateau still escalates");
+  // The no-shared-angle case says what to do next, too.
+  const apart = convergence([rec(2, "A+B", "major"), rec(3, "compact", "minor"), rec(3, "S", "blocker")], 3);
+  assert.equal(apart.verdict, "CONTINUE");
+  assert.match(apart.reason, /no angle ran in both round 2 and round 3.*run round 4/);
+});
+
+test("CLI: record leaves a receipt, so converge tells a clean round from an unrecorded one", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review", "review-1"), repo, [1, 2]);
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+
+  // Round 2's record failed (or never ran): no verdict may be printed as if W
+  // had been weighed, and the line says exactly what to run.
+  assert.equal(run(["record", "--work", work, "--round", "2", "--log-dir", logDir], JSON.stringify([{ id: "r2-1", class: "docs" }])).status, 3);
+  const missing = run(["converge", "--work", work, "--round", "2", "--log-dir", logDir]);
+  assert.equal(missing.status, 0, missing.stderr);
+  assert.match(missing.stdout, /^round 2 {2}W=0 {2}angles: none$/m);
+  assert.match(missing.stdout, /^UNRECORDED — /m);
+  // The script path is shell-quoted when it holds a space; compare the call unquoted.
+  assert.ok(missing.stdout.replaceAll("'", "").includes(`findings.mjs record --work ${work} --round 2 --in <findings.json>`), missing.stdout);
+  assert.doesNotMatch(missing.stdout, /^(CONTINUE|ESCALATE|STOP|CLEAN) — /m);
+
+  // An empty batch is the record of a round that found nothing.
+  const none = run(["record", "--work", work, "--round", "2", "--log-dir", logDir], "[]");
+  assert.equal(none.status, 0, none.stderr);
+  assert.ok(existsSync(path.join(work, "round-2", "recorded.json")));
+  const clean = run(["converge", "--work", work, "--round", "2", "--log-dir", logDir]);
+  assert.match(clean.stdout, /^CLEAN — round 2 fixed nothing/m, clean.stdout);
+  // And without --round, the newest round is the one just recorded — empty or not.
+  assert.match(run(["converge", "--work", work, "--log-dir", logDir]).stdout, /^CLEAN — round 2 /m);
+});
+
+// --- R3: the verdict names the exact next call -------------------------------
+// The verdict used to reach the lead at the top of the NEXT round, so the final
+// round's was never computed: 104 converged reviews ended on CONTINUE. Each
+// branch prints the one call that acts on it, counts filled in.
+
+const COUNTS = { rounds: 2, fixed: 3, dismissed: 1, open: 2 };
+const SCRIPTS = "/plug/scripts";
+const verdictOf = (verdict, over = {}) => ({ round: 2, verdict, earned: false, tail: "minor", ...over });
+const nextFor = (verdict, over = {}) => nextAction(verdictOf(verdict, over), COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS });
+
+test("nextAction: a clean round prints the converged marker, counts and tier filled in", () => {
+  assert.equal(nextFor("CLEAN", { tail: null }),
+    "next: /plug/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
+});
+
+test("nextAction: a clean round on the last affordable round converges — it does not read as STOP", () => {
+  const records = [kept({ round: 1, severity: "major" }), kept({ round: 2, verdict: "dismissed", proof: "p" })];
+  const result = convergence(records, 2, { budget: 2 });
+  const next = nextAction(result, COUNTS, { work: "/w/review-1", tier: "S", scripts: SCRIPTS });
+  assert.match(next, /^next: (?:'[^']*converged\.sh'|\S*converged\.sh) --converged /);
+  assert.doesNotMatch(`${result.reason}\n${next}`, /unreviewed|STOP/);
+});
+
+test("nextAction: an earned extension prints the one round it buys, forced to S and audited", () => {
+  assert.equal(nextFor("CONTINUE", { earned: true, tail: "major" }),
+    'next: /plug/scripts/round.sh --work /w/review-1 --round 3 --intent /w/review-1/intent.md --force S --reason "extension round: round 2 fixed a major"');
+  assert.match(nextFor("ESCALATE", { earned: true, tail: "blocker" }), /--force S --reason "extension round: round 2 fixed a blocker"/,
+    "an earned round outranks the stall");
+});
+
+test("nextAction: STOP prints not-converged with the counts, and says that is the honest end", () => {
+  const next = nextFor("STOP").split("\n");
+  assert.equal(next[0],
+    "next: /plug/scripts/converged.sh --not-converged --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
+  assert.match(next.slice(1).join("\n"), /^ {2}round 2's fixes ship unreviewed: list them in the report\. This is the correct end of a capped review; a new review to turn it into converged is not\.$/);
+});
+
+test("nextAction: ESCALATE prints not-converged and the round to run if the user says continue", () => {
+  const next = nextFor("ESCALATE");
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged --rounds 2 /);
+  assert.match(next, /\n {2}put the stall to the user; if they say continue, run \/plug\/scripts\/round\.sh --work \/w\/review-1 --round 3 --intent \/w\/review-1\/intent\.md as usual\.$/);
+});
+
+test("nextAction: CONTINUE prints the next round", () => {
+  assert.equal(nextFor("CONTINUE"), "next: /plug/scripts/round.sh --work /w/review-1 --round 3 --intent /w/review-1/intent.md");
+});
+
+test("nextAction: UNRECORDED prints the record call, and a path with a space is quoted so it runs as printed", () => {
+  const next = nextAction(verdictOf("UNRECORDED"), COUNTS, { work: "/w/cold run/review-1", tier: null, scripts: SCRIPTS });
+  assert.match(next, /^next: \/plug\/scripts\/findings\.mjs record --work '\/w\/cold run\/review-1' --round 2 --in <findings\.json>\n/);
+  assert.match(nextFor("CLEAN"), /--tier M /);
+  assert.match(nextAction(verdictOf("CLEAN"), COUNTS, { work: null, tier: null, scripts: SCRIPTS }), /--tier <S\|M\|L> /,
+    "an unknown tier is a placeholder, never a guess");
+  assert.match(nextAction(verdictOf("CONTINUE"), COUNTS, { work: null, tier: null, scripts: SCRIPTS }), /--work <work> --round 3 --intent <work>\/intent\.md$/,
+    "a --review caller has no work dir to name");
+});
+
+/** A review dir with a round-N plan, recorded through the CLI. */
+const reviewCli = (cap) => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review", "review-1"), repo);
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  const plan = (round, tier) => {
+    mkdirSync(path.join(work, `round-${round}`), { recursive: true });
+    writeFileSync(path.join(work, `round-${round}`, "tier.json"), JSON.stringify({ tier, round, roundsCap: cap }));
+  };
+  const record = (round, entries) => run(["record", "--work", work, "--round", String(round), "--log-dir", logDir], JSON.stringify(entries));
+  return { logDir, work, run, plan, record };
+};
+
+test("CLI: record --work prints the verdict on the round it just recorded, and the next call", () => {
+  const { work, plan, record } = reviewCli(2);
+  plan(1, "M");
+  const first = record(1, [candidate({ severity: "major" }), candidate({ severity: "minor", verdict: "dismissed" })]);
+  assert.equal(first.status, 0, first.stderr);
+  const lines = first.stdout.trim().split("\n");
+  assert.match(lines[0], /^# 2 findings recorded/);
+  assert.match(lines[1], /^CONTINUE — round 1 is the first change-round/);
+  assert.ok(lines[2].replaceAll("'", "").endsWith(`round.sh --work ${work} --round 2 --intent ${work}/intent.md`), lines[2]);
+  assert.match(lines[2], /^next: /);
+
+  plan(2, "M");
+  const capped = record(2, [candidate({ severity: "minor" })]);
+  assert.match(capped.stdout, /^STOP — round budget of 2 is spent/m, capped.stdout);
+  assert.match(capped.stdout.replaceAll("'", ""), /converged\.sh --not-converged --rounds 2 --fixed 2 --dismissed 1 --open 0 --tier M /,
+    "the counts are this review's, summed across its rounds");
+  assert.equal(existsSync(path.join(work, "round-2", "recorded.json")), true);
+});
+
+test("CLI: the marker's tier is round 1's, not an extension round's forced S", () => {
+  const { plan, record, work } = reviewCli(3);
+  for (const round of [1, 2, 3]) { plan(round, "M"); assert.equal(record(round, round === 3 ? [candidate({ severity: "major" })] : []).status, 0); }
+  mkdirSync(path.join(work, "round-4"), { recursive: true });
+  writeFileSync(path.join(work, "round-4", "tier.json"), JSON.stringify({ tier: "S", forced: "S", round: 4, roundsCap: 4 }));
+  const done = record(4, []);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout.replaceAll("'", ""), /converged\.sh --converged .*--tier M /, done.stdout);
+});
+
+test("CLI: converge prints the next call just before the tree-guard line", () => {
+  const { work, run, plan, record, logDir } = reviewCli(6);
+  plan(1, "L");
+  record(1, [candidate({ severity: "major" })]);
+  planned(work, 2);
+  record(2, []);
+  const out = run(["converge", "--work", work, "--round", "2", "--log-dir", logDir]);
+  assert.equal(out.status, 0, out.stderr);
+  const lines = out.stdout.trim().split("\n");
+  const next = lines.findIndex((line) => line.startsWith("next: "));
+  assert.ok(next > 0, out.stdout);
+  assert.match(lines[next].replaceAll("'", ""), /converged\.sh --converged --rounds 2 --fixed 1 --dismissed 0 --open 0 --tier L /,
+    "the review's tier is round 1's plan, whatever round 2 holds");
+  assert.equal(next, lines.length - 2, "the tree-guard line is last");
+});
+
+test("convergence: no STOP reason calls a round that fixed nothing unreviewed", () => {
+  for (const budget of [1, 2, 3]) {
+    const result = convergence([kept({ round: 1, severity: "major" }), kept({ round: 2, verdict: "open" })], 2, { budget });
+    assert.doesNotMatch(result.reason, /unreviewed/, `budget ${budget}: ${result.reason}`);
+  }
+});
+
+// --- `unfixed`: a CONFIRMED defect left standing is not a convergence --------
+// (docs/design-notes/questions/unfixed-answer.md). A round whose applier came
+// back `blocked` fixed nothing, so it read CLEAN and printed `--converged`
+// over a known defect.
+const unfixedRow = (over = {}) => kept({ verdict: "unfixed", summary: "confirmed, not fixed", ...over });
+
+test("unfixed: record accepts it, tally prints it, and the applier's word is hinted to it", () => {
+  const logDir = workdir(), repo = gitRepo();
+  const lines = [];
+  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"],
+    { log: (l) => lines.push(l), stdin: JSON.stringify([candidate({ verdict: "unfixed" })]) });
+  assert.match(lines[0], /1 finding recorded \(1 unfixed\)/);
+  assert.match(problems([candidate({ verdict: "blocked" })]), /got "blocked" — did you mean unfixed\?/);
+  assert.equal(recordProblem(unfixedRow()), null, "a stored unfixed row is a row every reader can use");
+});
+
+test("unfixed: a round that fixed nothing and left one unfixed escalates, never CLEAN", () => {
+  const row = unfixedRow({ round: 1 });
+  const result = convergence([row], 1);
+  assert.equal(result.verdict, "ESCALATE", result.reason);
+  assert.equal(result.reason, `1 CONFIRMED finding(s) left unfixed: [${priorId(row)}]`);
+  const next = nextAction(result, COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS });
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged /);
+  assert.match(next, new RegExp(`\\n {2}round 1 leaves 1 CONFIRMED finding\\(s\\) unfixed \\[${priorId(row)}\\]: put each to the user`));
+  assert.match(next, /record --work \/w\/review-1 --round 1 with prior_id <id> on the fixed row, and run \/plug\/scripts\/round\.sh --work \/w\/review-1 --round 2 /);
+  assert.match(next, /\n {2}A defect they accept as-is is not a convergence: the marker above is the end\.$/);
+});
+
+test("unfixed: it outranks a W CONTINUE and an earned extension", () => {
+  const fixed = (round, severity) => kept({ round, angle: "A", severity });
+  const closing = [fixed(1, "blocker"), fixed(2, "minor"), unfixedRow({ round: 2, angle: "A" })];
+  assert.equal(convergence(closing.slice(0, 2), 2).verdict, "CONTINUE", "without it, W drops");
+  assert.equal(convergence(closing, 2).verdict, "ESCALATE");
+  const earning = [fixed(1, "blocker"), fixed(1, "blocker"), fixed(2, "blocker"), unfixedRow({ round: 2, angle: "A" })];
+  assert.equal(convergence(earning.slice(0, 3), 2, { budget: 2 }).earned, true, "without it, the round earns one more");
+  const result = convergence(earning, 2, { budget: 2 });
+  assert.deepEqual([result.verdict, result.earned], ["ESCALATE", false]);
+  assert.doesNotMatch(nextAction(result, COUNTS, { work: "/w/review-1", scripts: SCRIPTS }), /--force S/);
+});
+
+test("unfixed: a spent budget with one left unfixed is a STOP that names it", () => {
+  const fixed = (round) => kept({ round, angle: "A", severity: "minor" });
+  const row = unfixedRow({ round: 2 });
+  const result = convergence([fixed(1), fixed(1), fixed(2), row], 2, { budget: 2 });
+  assert.equal(result.verdict, "STOP", result.reason);
+  assert.match(result.reason, /1 CONFIRMED finding\(s\) left unfixed/);
+  const next = nextAction(result, COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS });
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged /);
+  assert.match(next, new RegExp(`\\n {2}round 2 leaves 1 CONFIRMED finding\\(s\\) unfixed \\[${priorId(row)}\\]: list them in the report\\.$`));
+});
+
+test("unfixed: it carries forward — a later round recorded empty still escalates", () => {
+  assert.equal(convergence([unfixedRow({ round: 1 })], 2).verdict, "ESCALATE",
+    "round 2's finders not refiling a defect the ledger lists is not round 2 being clean");
+});
+
+test("unfixed: a later row citing it resolves it; a citation on the wrong id does not", () => {
+  const row = unfixedRow({ round: 1 });
+  const fix = kept({ round: 1, verdict: "fixed", summary: "the fix the user ruled on", prior_id: priorId(row) });
+  assert.equal(convergence([row, fix], 1).verdict, "CONTINUE", "round 1 now fixed something, so round 2 reviews it");
+  const clean = convergence([row, fix], 2);
+  assert.equal(clean.verdict, "CLEAN", clean.reason);
+  assert.match(nextAction(clean, COUNTS, { work: "/w/review-1", scripts: SCRIPTS }), /converged\.sh --converged /);
+  const wrong = kept({ round: 1, verdict: "fixed", summary: "a fix of something else", prior_id: priorId(row) === "deadbeef" ? "cafef00d" : "deadbeef" });
+  assert.equal(convergence([row, wrong], 2).verdict, "ESCALATE");
+  assert.equal(convergence([fix, row], 2).verdict, "ESCALATE", "a citation must come after the row it cites");
+});
+
+test("unfixed: an open-only round is still CLEAN, so PLAUSIBLE/design behaves as before", () => {
+  const result = convergence([kept({ round: 1, verdict: "open" })], 1);
+  assert.equal(result.verdict, "CLEAN", result.reason);
+  assert.match(nextAction(result, COUNTS, { work: "/w/review-1", scripts: SCRIPTS }), /converged\.sh --converged /);
+});
+
+test("unfixed: UNRECORDED still outranks it", () => {
+  assert.equal(convergence([unfixedRow({ round: 1 })], 2, { recorded: false }).verdict, "UNRECORDED");
+});
+
+test("unfixed: the marker's --open excludes it, no count is NaN, and the converge row carries it", () => {
+  const logDir = workdir(), repo = gitRepo();
+  const lines = [];
+  const entries = [candidate({ verdict: "unfixed", summary: "left" }), candidate({ verdict: "open", summary: "asked" })];
+  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"], { log: () => {}, stdin: JSON.stringify(entries) });
+  main(["converge", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
+  const out = lines.join("\n");
+  assert.match(out, /^ESCALATE — 1 CONFIRMED finding\(s\) left unfixed/m, out);
+  assert.match(out, /--fixed 0 --dismissed 0 --open 1 /, out);
+  assert.doesNotMatch(out, /NaN/);
+  const [row] = readFileSync(path.join(logDir, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(row.unfixed.length, 1);
+  assert.match(row.unfixed[0], /^[0-9a-f]{8}$/);
+});
+
+// --- one repository per review (docs/design-notes/questions/record-repo-answer.md)
+// `record --work` keyed on the cwd while round.sh's converge keyed on the scope,
+// so a lead in repo A reviewing repo B wrote B's findings into A's memory and
+// converge read B's empty file as CLEAN.
+const cliIn = (cwd) => (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd });
+const rowsIn = (logDir, repo) => (existsSync(findingsFile(repo, { logDir })) ? stored(logDir, repo) : []);
+const twoRepos = () => ({ a: gitRepo({ origin: "https://github.com/o/a.git" }), b: gitRepo({ origin: "https://github.com/o/b.git" }) });
+
+test("converge --review on a round with no rows is CLEAN: a --review caller has no receipt to hold", () => {
+  const logDir = workdir(), repo = gitRepo();
+  const lines = [];
+  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"], { log: () => {}, stdin: JSON.stringify([candidate()]) });
+  main(["converge", "--review", "r", "--round", "2", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
+  assert.match(lines.join("\n"), /^CLEAN — round 2 /m, lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /^UNRECORDED/m);
+});
+
+test("converge --review on an id with nothing on record is UNRECORDED: a typo is not a clean review", () => {
+  const logDir = workdir(), repo = gitRepo();
+  const lines = [];
+  main(["converge", "--review", "typo", "--round", "1", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
+  assert.match(lines.join("\n"), /^UNRECORDED — /m, lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /^CLEAN/m);
+});
+
+test("nextAction: a tier read from tier.json is shell-quoted like every other dynamic word", () => {
+  const next = nextAction(verdictOf("CLEAN"), COUNTS, { work: "/w/review-1", tier: "L; rm -rf x", scripts: SCRIPTS });
+  assert.match(next, / --tier 'L; rm -rf x' --intent /, next);
+  assert.match(nextFor("CLEAN"), / --tier M /, "a plain tier stays bare");
+});
+
+test("record --work refuses a round round.sh never planned, and creates no round dir", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = scoped(path.join(workdir(), "review-1"), repo);
+  const run = cliIn(repo);
+  assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+  const typo = run(["record", "--work", work, "--round", "9", "--log-dir", logDir], "[]");
+  assert.equal(typo.status, 2, typo.stderr);
+  assert.ok(typo.stderr.includes(path.join(work, "round-9", "tier.json")), typo.stderr);
+  assert.equal(existsSync(path.join(work, "round-9")), false, "no round dir is invented");
+  const out = run(["converge", "--work", work, "--log-dir", logDir]);
+  assert.match(out.stdout, /^CONTINUE — round 1 /m, "converge still judges the newest real round");
+});
+
+test("record-repo: run from repo A on a scope naming repo B, the rows land in B and converge sees them", () => {
+  const logDir = workdir(), { a, b } = twoRepos();
+  const work = scoped(path.join(workdir(), "review-1"), b);
+  const run = cliIn(a);
+  assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+  assert.equal(rowsIn(logDir, b).length, 1, "the rows land in B's memory");
+  assert.equal(rowsIn(logDir, a).length, 0, "and none in A's");
+  const out = run(["converge", "--work", work, "--round", "1", "--log-dir", logDir]);
+  assert.match(out.stdout, /^CONTINUE — /m, "the fixed row is seen, not a false CLEAN");
+});
+
+test("record-repo: --work with --repo is a usage error for every command", () => {
+  const logDir = workdir(), { a, b } = twoRepos();
+  const work = scoped(path.join(workdir(), "review-1"), b);
+  for (const command of ["record", "converge", "prior", "engagement"]) {
+    const out = cliIn(a)([command, "--work", work, "--repo", b, "--log-dir", logDir], "[]");
+    assert.equal(out.status, 2, command);
+    assert.match(out.stderr, /--work or --repo, not both/, command);
+  }
+});
+
+test("record-repo: a missing round-1 scope exits 2 naming it, and writes no rows and no receipt", () => {
+  const logDir = workdir(), { a } = twoRepos();
+  const work = path.join(workdir(), "review-1");
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  const out = cliIn(a)(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()]));
+  assert.equal(out.status, 2);
+  assert.ok(out.stderr.includes(path.join(work, "round-1", "scope.diff")), out.stderr);
+  assert.equal(rowsIn(logDir, a).length, 0, "no fallback to the cwd");
+  assert.equal(existsSync(path.join(work, "round-1", "recorded.json")), false);
+});
+
+test("record-repo: a scope in no repository keys on the work dir, whichever cwd asks", () => {
+  const logDir = workdir(), { a, b } = twoRepos();
+  const work = path.join(workdir(), "review-1");
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  // A `# repo: ` line inside a plain file's content is content, not structure.
+  writeFileSync(path.join(work, "round-1", "scope.diff"), `# self-review scope (not a git repo)\n==> /x/notes.txt <==\n# repo: ${a}\n`);
+  planned(work, 1);
+  assert.equal(cliIn(a)(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+  assert.equal(rowsIn(logDir, realpathSync(work)).length, 1);
+  assert.equal(rowsIn(logDir, a).length, 0, "the plain section's `# repo: ` line did not take over");
+  assert.match(cliIn(b)(["converge", "--work", work, "--round", "1", "--log-dir", logDir]).stdout, /^CONTINUE — /m,
+    "converge from another cwd reads the same file");
+});
+
+test("record-repo: in a mixed scope the first git repository wins", () => {
+  const logDir = workdir(), { a, b } = twoRepos();
+  const work = path.join(workdir(), "review-1");
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  writeFileSync(path.join(work, "round-1", "scope.diff"),
+    `# self-review scope\n# repo: ${b}\n\n# self-review scope\n# repo: ${a}\n\n# self-review scope (not a git repo)\n==> /x/notes.txt <==\n# repo: ${a}\n`);
+  planned(work, 1);
+  assert.equal(cliIn(a)(["record", "--work", work, "--round", "1", "--log-dir", logDir], JSON.stringify([candidate()])).status, 0);
+  assert.equal(rowsIn(logDir, b).length, 1);
+  assert.equal(rowsIn(logDir, a).length, 0);
+});
+
+test("record-repo: prior --work run from repo A reads repo B's memory", () => {
+  const logDir = workdir(), { a, b } = twoRepos();
+  const work = scoped(path.join(workdir(), "review-1"), b);
+  recordFindings([candidate()], { review: "earlier", round: 1, repoRoot: b, logDir });
+  const scope = path.join(work, "scope-2.diff"), out = path.join(work, "prior.md");
+  writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n context\n+added\n");
+  assert.equal(cliIn(a)(["prior", "--scope", scope, "--out", out, "--work", work, "--log-dir", logDir]).status, 0);
+  assert.match(readFileSync(out, "utf8"), /null deref/);
 });

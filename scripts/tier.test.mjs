@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../hooks/lib/config.mjs";
+import { agentSettings } from "../hooks/lib/agent-settings.mjs";
 import { parseDiff } from "./lib/diff.mjs";
 import { buildFinders, classifyChanged, laterRound, measure, mergeToFit, pickTier, plan, riskMarkers, wireEvidence } from "./tier.mjs";
 import { parseScope } from "./impact.mjs";
@@ -16,6 +17,9 @@ import { parseScope } from "./impact.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "tier.mjs");
 process.env.SELF_REVIEW_CONFIG = path.join(tmpdir(), "tier-test-no-such-config.json");
+// tier.mjs appends to the metrics log; the suite must not write into the
+// developer's own memory.
+process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "sr-log-"));
 
 const CONFIG = loadConfig();
 const TIER = { ...CONFIG.tier, impactDepths: CONFIG.impact };
@@ -269,6 +273,44 @@ test("markers: a config file gets no exemption, not even this tool's own word li
   ], "every code- and config-kind file is scanned, including the tool's own config");
 });
 
+test("markers: teardown in a test file is not a destructive change, the same line in code is", () => {
+  // Test teardown — `rm -rf` of a temp dir, `shutil.rmtree` in a fixture — was
+  // the evidenced cause of tier-L reviews over changes that deleted nothing.
+  const files = [{ path: "src/foo.test.mjs", status: "M" }, { path: "src/foo.mjs", status: "M" }];
+  const diff = parseDiff([
+    ...hunk("src/foo.test.mjs", ['  execSync("rm -rf " + tmp);', "  const out = child_process.exec(cmd);"]).split("\n"),
+    ...hunk("src/foo.mjs", ['  execSync("rm -rf " + tmp);']).split("\n"),
+  ]);
+  const markers = riskMarkers({ files, diff, kinds: classifyChanged(files, TIER, EXEMPT), config: TIER, broken: 0 });
+  assert.deepEqual(markers.destructive, ["src/foo.mjs:1 rm -rf"]);
+  assert.match(markers.security.join(" "), /src\/foo\.test\.mjs:2 child_process/, "only the destructive marker skips tests");
+});
+
+test("markers: TRUNCATE is a word, so an identifier that contains it does not fire", () => {
+  const files = [{ path: "src/scope.mjs", status: "M" }];
+  const diff = parseDiff(hunk("src/scope.mjs", [
+    "  const scopeTruncated = scope.truncated;",
+    "  if (wasTruncated) return;",
+    '  db.execute("truncate table x");',
+    "  fs.truncateSync(file, 0);",
+    "  ftruncate(fd, 0);",
+  ]).split("\n"));
+  const markers = riskMarkers({ files, diff, kinds: classifyChanged(files, TIER, EXEMPT), config: TIER, broken: 0 });
+  assert.deepEqual(markers.destructive.map((m) => m.split(" ")[0]), ["src/scope.mjs:3", "src/scope.mjs:4", "src/scope.mjs:5"],
+    "the fs calls are the destructive form of the word");
+});
+
+test("a destructive line that first appears in round 2's code still lifts an S ceiling", () => {
+  const files = ["M  src/clean.mjs", "M  src/clean.test.mjs"];
+  const diff = [hunk("src/clean.test.mjs", ['  rmSync(tmp, { recursive: true });']), hunk("src/clean.mjs", ['  rmSync(dir, { recursive: true });'])].join("\n");
+  const lifted = planFor(files, diff, IMPACT(), { round: 2, cap: "S", capMarkers: [] });
+  assert.equal(lifted.tier, "L");
+  assert.deepEqual(lifted.capLifted, ["destructive"]);
+  const testOnly = planFor(["M  src/clean.test.mjs"], hunk("src/clean.test.mjs", ['  rmSync(tmp, { recursive: true });']),
+    IMPACT(), { round: 2, cap: "S", capMarkers: [] });
+  assert.equal(testOnly.tier, "S", "test teardown alone does not");
+});
+
 test("markers: a removed line that matched is not a marker — only added lines are", () => {
   const files = [{ path: "src/run.ts", status: "M" }];
   const diff = parseDiff(hunk("src/run.ts", ["  safe();"], ["  eval(input);"]).split("\n"));
@@ -437,14 +479,20 @@ test("merging never crosses kinds and stops as soon as the round fits", () => {
   assert.deepEqual(docsOnly.merged, [], "there is no same-kind target, so nothing merges");
 });
 
-test("tier L round 1: split groups, opus on the security and concurrency finders", () => {
+test("tier L round 1: split groups, the risk finder's settings on the security and concurrency finders", () => {
   const diff = [hunk("src/a.ts", ["const r = fetch(url);", "await r.json();"]), hunk("src/b.ts", Array.from({ length: 320 }, (_, i) => `const x${i} = ${i};`))].join("\n");
   const result = planFor(["M  src/a.ts", "M  src/b.ts"], diff, IMPACT());
   assert.equal(result.tier, "L");
   assert.equal(result.verifier, "agent");
   assert.equal(result.roundsCap, 6);
   assert.deepEqual(result.finders.map((f) => f.angles), [["A", "B"], ["C", "D"], ["E", "F"], ["Q", "V"], ["G"], ["H"]]);
-  assert.deepEqual(result.finders.filter((f) => f.model === "opus").map((f) => f.angles), [["G"], ["H"]]);
+  // Against the table rather than a literal, so changing a model is still an
+  // edit to config/agents.json alone.
+  const settings = ({ model, effort }) => ({ model, effort });
+  for (const finder of result.finders) {
+    const risk = ["G", "H"].includes(finder.angles[0]);
+    assert.deepEqual(settings(finder), agentSettings(risk ? "risk-finder" : "finder"), finder.angles.join("+"));
+  }
 });
 
 test("round 2 is at most two finders, plus the cold grader; round 3 adds the finder that may say no", () => {
@@ -609,6 +657,12 @@ test("CLI: --cap holds a later round at round 1's tier, and is not a --force", (
   // unusable by its only caller the first time it was passed for real.
   assert.equal(run(["--cap", "S", "--cap-markers", "security,concurrency"]).status, 0, "a non-escalating marker is still a marker");
   assert.equal(run(["--cap-markers", "auth"]).status, 2, "--cap-markers belongs to --cap");
+});
+
+test("CLI: --help prints the usage and exits 0", () => {
+  const run = spawnSync(process.execPath, [SCRIPT, "--help"], { encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /usage/i);
 });
 
 test("CLI: a missing scope is exit 3, a missing flag is exit 2", () => {

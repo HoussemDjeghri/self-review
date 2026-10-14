@@ -4,6 +4,7 @@
 #
 # Usage: round.sh --new-review --work <base> --intent <file> [options] [path ...]
 #        round.sh --work <review dir> --round <n> --intent <file> [options] [path ...]
+#        round.sh --work <review dir> --round 1 --intent <file> --force S|M|L --reason "…"
 #   options: [--base <ref>] [--force S|M|L --reason "…"] [--no-preflight]
 #
 # `--new-review` starts a review: it allocates `<base>/review-<k>/` (the first
@@ -41,10 +42,20 @@
 # must not cost more than finding it. `--force` still overrides.
 # From round 2 on it also runs `findings.mjs converge` for the round just
 # finished and prints its verdict above the plan: the stopping rule ran in 7 of
-# 46 measured reviews while it was a step the lead had to remember.
+# 46 measured reviews while it was a step the lead had to remember. A STOP, or
+# a round whose record step never ran, refuses the round instead (exit 5).
+#
+# The third form re-plans round 1 in place: `--force` given to a round 1 that
+# already has briefs re-runs only tier.mjs and brief.mjs over the scope round 1
+# captured, and keeps the plan it replaces as `tier.replaced-<n>.json` and
+# `briefs.replaced-<n>/`. It is refused once round 2 exists or a finder has
+# filed against the old plan.
 #
 # Exit: 0; 2 usage (a bad flag, a missing intent file, a work dir inside the
 # repo, a round number the work dir does not support); 4 nothing to review (an empty scope, or a change that is all assets);
+# 5 the review is over or unrecorded — round N-1 said STOP, was never
+# recorded, or its verdict could not be computed; the verdict (or the failing
+# converge call) is printed, nothing created;
 # 3 propagated from tier.mjs or brief.mjs when an input of theirs is unreadable,
 # because those two are unguarded on purpose — without a plan or a brief there
 # is no round, so the failure must reach the caller rather than degrade.
@@ -55,6 +66,18 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib/path.sh"
 
 die() { echo "round.sh: $*" >&2; exit 2; }
+
+# No failure is silent. Under `set -e` a step that dies ends the round with its
+# own exit code and nothing on stderr: 30 field failures were a bare exit 141
+# (scope.sh's SIGPIPE), each costing three to five turns of `bash -x` to find
+# which step it was. The code is kept; the step and line are added.
+on_err() {
+  local rc=$? line=$1 step=${BASH_COMMAND%%$'\n'*}
+  local why=""; [ "$rc" -le 128 ] || why=", killed by signal $((rc - 128))"
+  echo "round.sh: stopped at line $line (exit $rc$why): ${step:0:200}" >&2
+  exit "$rc"
+}
+trap 'on_err $LINENO' ERR
 
 work=""; round=""; intent=""; base=""; force=""; reason=""; preflight=1; new_review=0
 # `paths` is expanded as ${paths[@]+"${paths[@]}"} everywhere below: under
@@ -93,6 +116,9 @@ case "$round" in ''|*[!0-9]*) die "--round needs a positive integer, got: $round
 # after scope.sh and impact.mjs had already run and written files, and with a
 # message naming a script the caller did not invoke.
 [ -z "$force" ] || [ -n "$reason" ] || die "--force needs --reason \"…\": a tier set by hand has to be auditable"
+# Before anything moves: a re-plan moves round 1's plan aside first, so a bad
+# tier caught by tier.mjs would leave the round with no plan at all.
+case "$force" in ''|S|M|L) ;; *) die "--force needs S, M or L, got: $force" ;; esac
 
 # Checked here as well as inside scope.sh (lib/path.sh) so the round dies before
 # it creates anything, and with round.sh's name on the message. This is the
@@ -106,12 +132,58 @@ fi
 # the reuse this layout exists to end. A round 1 that died before its briefs
 # (a paperwork refusal, an empty scope) never reached a reviewer, so running it
 # again is a retry, not a second review — and those refusals name a retry.
+#
+# With `--force` it is a re-plan, which is how a tier is raised or lowered
+# before anyone is launched: 36% of reviews forced their tier, and doing it
+# with a second `--new-review` cost an orphaned review dir, a second scope and
+# a second pre-flight. A re-plan gives the lead no power `--force` on any round
+# does not already give, because the gate never reads tier.json; what round.sh
+# can see is a finder that has already FILED against the old plan, and that is
+# where it stops. Paths and `--base` re-scope the change, which is a new review.
+replan=0
 if [ "$new_review" -eq 0 ]; then
   if [ "$round" -eq 1 ] && [ -d "$work/round-1/briefs" ]; then
-    die "$work already holds a review's round 1 — start the next review with round.sh --new-review --work <base> --intent <file>, never a reused round-1"
+    [ -n "$force" ] || die "$work already holds a review's round 1 — to change its tier before anyone is launched, re-plan it: round.sh --work $work --round 1 --intent $work/intent.md --force S|M|L --reason \"…\"; to review another change, round.sh --new-review --work <base> --intent <file>. Never a reused round-1"
+    [ ! -d "$work/round-2" ] || die "round-2/ exists, so round 1's tier is already the ceiling — re-planning round 1 changes nothing; use --force on the current round instead"
+    [ ! -e "$work/round-1/recorded.json" ] || die "round 1 is already recorded ($work/round-1/recorded.json) — a re-plan is for before anyone is launched; use --force on round 2, or --new-review for another change"
+    if [ -n "$(find "$work/round-1/state" -name '*.jsonl' -size +0 -print 2>/dev/null || true)" ]; then
+      die "a finder has filed against round 1's plan ($work/round-1/state/) — a re-plan would brief the rest against a plan the filed findings were not made under"
+    fi
+    [ -z "$base" ] && [ -z "${paths[0]+set}" ] || die "a re-plan reuses round 1's scope; paths and --base re-scope the change, which is a new review: round.sh --new-review --work <base> --intent <file>"
+    replan=1
   fi
   if [ "$round" -ge 2 ] && [ ! -f "$work/round-$((round - 1))/tier.json" ]; then
     die "round $round needs round $((round - 1)) first: there is no $work/round-$((round - 1))/tier.json — --work is the review dir --new-review printed (work: …)"
+  fi
+fi
+
+# The stopping rule's verdict on the round just finished, before this round
+# creates anything. It used to be printed at the top of the next round, after
+# that round had started, so a spent budget read as advice and 20 reviews
+# marked `converged` after a STOP. A STOP ends the review: the cap is a cost
+# bound, so there is no flag past it — more review after a STOP is a new review
+# (`--new-review --force S --reason …`), which re-scopes and leaves a trail. An
+# unrecorded round is refused too, because W cannot be weighed on findings
+# nobody wrote down. ESCALATE only prints: W has known false positives, and a
+# user's "run round 3" must work without a flag.
+#
+# The repository is the review's, which findings.mjs reads from round 1's scope.
+converged=""; prev_verdict=""
+if [ "$round" -ge 2 ]; then
+  prev=$((round - 1))
+  if converged="$("$here/findings.mjs" converge --work "$work" --round "$prev" 2>"$work/round-$prev/converge.err")"; then
+    prev_verdict="$(grep -E '^(CLEAN|CONTINUE|ESCALATE|STOP|UNRECORDED) — ' <<<"$converged" || true)"
+    case "$prev_verdict" in
+      "STOP — "*|"UNRECORDED — "*)
+        printf '%s\n' "$prev_verdict"
+        # `next:` and the lines indented under it — the call, and what to read before running it.
+        awk '/^next: /{p=1; print; next} p && /^  /{print; next} {p=0}' <<<"$converged"
+        exit 5 ;;
+    esac
+  else
+    # Fail closed: an unknown verdict could be the STOP this block exists to honour.
+    echo "round.sh: findings.mjs converge failed ($work/round-$prev/converge.err) — round $prev's verdict is unknown, so round $round is not planned past it. Run: $here/findings.mjs converge --work $work --round $prev" >&2
+    exit 5
   fi
 fi
 
@@ -141,7 +213,12 @@ mkdir -p "$dir/state"   # reviewers append their lifeboat lines here
 # Scope first: impact, tier and every finder read this same bundle, so none of
 # them can be looking at a different change from the others.
 scope="$dir/scope.diff"
-"$here/scope.sh" --work "$work" ${base:+--base "$base"} ${paths[@]+"${paths[@]}"} > "$scope"
+# A re-plan reviews the change round 1 captured, so nothing upstream of the plan
+# runs again: not scope, paperwork, pre-flight, impact, the cold run or the
+# tree record. None of their inputs changed, and forcing a tier is not one.
+if [ "$replan" -eq 0 ]; then
+  "$here/scope.sh" --work "$work" ${base:+--base "$base"} ${paths[@]+"${paths[@]}"} > "$scope"
+fi
 
 # The repository under review is the scope's, never the cwd's: given paths are
 # resolved to the repo each lives in, so a round run from anywhere else used to
@@ -151,7 +228,9 @@ scope="$dir/scope.diff"
 # there is no project to pre-flight and no tree to stage, and the round says so.
 # The plain section is printed last and holds raw file text, so reading stops at
 # its header — a scoped file containing a `# repo: ` line must not name the repository.
-repo_root="$(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; s/^# repo: //p' "$scope" | head -1)"
+# sed quits on the first match itself: `| head -1` closed the pipe on a scope
+# with a second repo below, and pipefail made sed's SIGPIPE the round's exit.
+repo_root="$(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; /^# repo: /{s/^# repo: //p;q;}' "$scope")"
 if [ -n "$repo_root" ]; then
   ( cd "$repo_root" && refuse_if_inside_repo "$work" "round.sh" ) || exit 2
 fi
@@ -163,7 +242,9 @@ fi
 # and the signature (lib/paths.mjs isReviewPaperwork, matched on contents
 # because users rename the directory) is specific enough that a false refusal
 # costs the one line the message names.
-if ! paperwork="$(node --input-type=module -e '
+if [ "$replan" -eq 1 ]; then
+  :   # round 1 already passed it, over this same scope
+elif ! paperwork="$(node --input-type=module -e '
   const [here, file] = process.argv.slice(1);
   const { pathToFileURL } = await import("node:url");
   const { readFileSync } = await import("node:fs");
@@ -202,6 +283,7 @@ fi
 # Pre-flight belongs to round 1: a reviewer that reports a failing test is a
 # wasted agent, and by round 2 the suite has already been run on the fix.
 pf=""; pf_from=""
+[ "$replan" -eq 0 ] || preflight=0
 if [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ] && [ -z "$repo_root" ]; then
   pf_from="no repository"
   pf="# no checks run — every path in the scope is outside a repository, so there is no project to pre-flight"
@@ -314,8 +396,9 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # relative one lands pointing back into the stage, where a write is the copy's
   # own business. A link to a file is never one coldrun made. `find` does not follow
   # links, so the enumeration never walks into a dependency tree; the trailing
-  # slash below is what makes the second `find` descend into one.
-  tripped=""
+  # slash below is what makes the second `find` descend into one. Sorted, so
+  # "first:" names the same tree on every filesystem (APFS and ext4 list differently).
+  tripped=""; trips=""; trip_count=0
   if [ "$pf_from" != "$repo_root" ]; then
     checkout="$(cd -P "$repo_root" && pwd)"
     while IFS= read -r link; do
@@ -326,12 +409,28 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
       # `if`, not `[ … ] && …`: under `set -e` a false `&&` list is a failing
       # command and would end the round on the ordinary case where nothing wrote.
       if [ -n "$hit" ]; then
-        tripped="$tripped
-TRIP  ${link#"$pf_from"/}    pre-flight wrote into the checkout through the staged link: $hit"
+        trips="${trips}TRIP  ${link#"$pf_from"/}    pre-flight wrote into the checkout through the staged link: $hit
+"
+        trip_count=$((trip_count + 1))
       fi
     done <<EOF
-$(find "$pf_from" -type l 2>/dev/null || true)
+$({ find "$pf_from" -type l 2>/dev/null || true; } | LC_ALL=C sort)
 EOF
+  fi
+  # One line however many links tripped, and every one of them in a file. A
+  # monorepo's suite writes the same cache into each package's node_modules
+  # (vite's `.vite-temp`, measured: ~85 TRIP lines over nine sessions), and a
+  # line per package taught the lead to `grep -v TRIP` the whole block. The
+  # writes are real, so they are still reported — not filtered by tool or by
+  # path, since a per-tool ignore list is the blind spot this wire exists for.
+  if [ "$trip_count" -eq 1 ]; then
+    tripped="
+${trips%$'\n'}"
+  elif [ "$trip_count" -gt 1 ]; then
+    printf '%s' "$trips" >"$dir/tripwire.txt"
+    first="${trips%%$'\n'*}"; first="${first#TRIP  }"
+    tripped="
+TRIP  $trip_count linked trees    pre-flight wrote into the checkout through the staged links — first: ${first%%    *}: ${first##*staged link: }; all $trip_count in $dir/tripwire.txt"
   fi
   rm -f "$sentinel"
   # The verdict lines only — preflight.txt keeps the failure tail, and --out
@@ -342,18 +441,27 @@ EOF
   # Every check failing to START is the staging failure above, discovered one
   # step later: the reviewers still need a real verdict on the code, and the
   # checkout is where the checks are known to run. So it falls back exactly as a
-  # failed stage does — and says which of the two happened, because "the stage is
-  # broken for this project" is a defect in the plugin and "your suite is red" is
-  # not, and the report must not let the lead confuse them.
+  # failed stage does — and says which of the two happened, because "your suite
+  # is red" and "a tool could not be run" call for different reactions.
+  #
+  # It does not call the stage a plugin defect, because 127 does not say that:
+  # it says a tool was not found. Worded that way, it was printed ~55 times over
+  # venv projects whose tools were not on PATH in the checkout either. Which of
+  # the two trees lacks the tool is measured by the re-run, and said below.
   if [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
-    echo "round.sh: no check could start in the install copy — a defect in this plugin's staging, not in the project. Re-running pre-flight from the checkout; report both." >&2
+    echo "round.sh: no check could start in the install copy — a tool not found or not executable there (exit 127/126). Re-running pre-flight from the checkout." >&2
     mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
     # The same pnpm switch as the first run, for the same reason.
     if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$repo_root" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
       echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
     fi
-    tripped="$tripped
-INFRA staging  no check could start in the install copy (${dir}/preflight-stage.txt); the verdicts below are from the checkout"
+    if grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
+      tripped="$tripped
+INFRA staging  no check could start in the install copy or in the checkout — the project's tools are not runnable from this shell (see ${dir}/preflight.txt); not a staging defect"
+    else
+      tripped="$tripped
+INFRA staging  no check could start in the install copy, and they do from the checkout — a tool the staged copy does not have (${dir}/preflight-stage.txt); the verdicts below are from the checkout"
+    fi
     # The header at the end of this script names where pre-flight ran, and the
     # comment above it says why that is load-bearing. Rewriting preflight.txt
     # without moving `pf_from` printed the stage's path over the checkout's
@@ -443,7 +551,7 @@ fi
 # checked), so an impact failure costs accuracy, not the round. Under
 # `set -e` a bare call aborted with only scope.diff written — no plan, no
 # briefs — while SKILL.md promised the loop keeps going without these scripts.
-if ! "$here/impact.mjs" --scope "$scope" --out "$dir/" >/dev/null 2>"$dir/impact.err"; then
+if [ "$replan" -eq 0 ] && ! "$here/impact.mjs" --scope "$scope" --out "$dir/" >/dev/null 2>"$dir/impact.err"; then
   echo "round.sh: impact.mjs failed (${dir}/impact.err) — continuing without the blast radius; the tier will say so" >&2
   rm -f "$dir/impact.json"
 fi
@@ -460,6 +568,23 @@ if [ "$round" -ge 2 ] && [ -f "$work/round-1/tier.json" ]; then
   # touches auth/ or first adds a DROP TABLE — and drop the reviewer that
   # marker exists to force.
   cap_markers="$(node -e 'try{const m=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).markers??{};process.stdout.write(Object.keys(m).filter((k)=>m[k].length).join(","))}catch{}' "$work/round-1/tier.json")"
+fi
+
+# Moved, not deleted: the computed-vs-forced history is what "forcing down is
+# the one the numbers watch" audits.
+if [ "$replan" -eq 1 ]; then
+  n=1
+  while [ -e "$dir/tier.replaced-$n.json" ] || [ -e "$dir/briefs.replaced-$n" ]; do n=$((n + 1)); done
+  mv "$dir/tier.json" "$dir/tier.replaced-$n.json"
+  mv "$dir/briefs" "$dir/briefs.replaced-$n"
+  # Put back if the re-plan dies before its briefs exist, so a retry still
+  # finds the round planned. Cleared once brief.mjs has written the new ones.
+  restore_plan() {
+    rm -rf "$dir/briefs"
+    mv -f "$dir/tier.replaced-$n.json" "$dir/tier.json"
+    mv "$dir/briefs.replaced-$n" "$dir/briefs"
+  }
+  trap restore_plan EXIT
 fi
 
 # Held, not printed: an empty scope must not put a tier line for a review that
@@ -494,28 +619,18 @@ if [ "$reviewable" != "yes" ]; then
   esac
   exit 4
 fi
-# The stopping rule's verdict on the round just finished, where the next round
-# starts — above the plan, because it is what decides whether to spend it.
-# Printed, never enforced: the exit code is the round's, not the rule's. A
-# round with no records is a clean round or an unrecorded one; either way W
-# has nothing to weigh, and no verdict is printed as if it had.
-if [ "$round" -ge 2 ]; then
-  prev=$((round - 1))
-  if converged="$("$here/findings.mjs" converge --work "$work" --round "$prev" ${repo_root:+--repo "$repo_root"} 2>"$dir/converge.err")"; then
-    if printf '%s\n' "$converged" | grep -q "^round $prev  W=0  angles: none\$"; then
-      echo "converge: no records for round $prev — W cannot be computed"
-    else
-      verdict="$(printf '%s\n' "$converged" | grep -E '^(CONTINUE|ESCALATE|STOP) — ' || true)"
-      echo "converge (round $prev): ${verdict:-no verdict line — run findings.mjs converge --work $work --round $prev}"
-    fi
-  else
-    echo "round.sh: findings.mjs converge failed (${dir}/converge.err) — round $prev's verdict is unknown" >&2
-  fi
+# The verdict this round was allowed on, above the plan: CLEAN and ESCALATE
+# are the lead's to weigh, and the plan is what they would spend.
+if [ -n "$converged" ]; then
+  echo "converge (round $prev): ${prev_verdict:-no verdict line — run findings.mjs converge --work $work --round $prev}"
 fi
 printf '%s\n' "$plan_out"
 
 # Written even when empty, so the chain does not break on a repo with no memory.
-"$here/findings.mjs" prior --scope "$scope" --out "$dir/prior.md" --work "$work" >/dev/null
+# A re-plan keeps round 1's: the scope is the same, and so is the memory.
+if [ "$replan" -eq 0 ]; then
+  "$here/findings.mjs" prior --scope "$scope" --out "$dir/prior.md" --work "$work" >/dev/null
+fi
 
 # Ruling 1, item 2. tree-guard's allow path and its inert path are the same
 # silence, which is how it went unnoticed that a named agent's `agent_type` is
@@ -523,7 +638,7 @@ printf '%s\n' "$plan_out"
 # Opening the log here is what scopes the guard's writes to a repository with a
 # review in progress; `findings.mjs converge` reads it back at the end of the
 # round and says whether the guard watched anything.
-"$here/findings.mjs" engagement --work "$work" --round "$round" ${repo_root:+--repo "$repo_root"} >/dev/null || true
+[ "$replan" -eq 1 ] || "$here/findings.mjs" engagement --work "$work" --round "$round" >/dev/null || true
 
 ledger="$work/ledger.md"
 [ -f "$ledger" ] || echo "_No dismissals yet._" > "$ledger"
@@ -540,12 +655,18 @@ ledger="$work/ledger.md"
 # tests, and it sits under the work dir, which is already required to be
 # outside the repository.
 cold=""; cold_skipped=""
+# A re-plan grades round 1's cold run, never a second one: the run is keyed on
+# `kinds.executable`, which forcing a tier does not change. So the X row is
+# dropped again for the reason round 1 recorded, or kept for its transcript.
+if [ "$replan" -eq 1 ]; then
+  cold_skipped="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).coldSkipped??""))}catch{}' "$dir/tier.replaced-$n.json")"
+  if [ -z "$cold_skipped" ] && [ -f "$dir/cold run/transcript.md" ]; then cold="$dir/cold run/transcript.md"; fi
 # Keyed on the executable SURFACE, not on an X row: tier S and every compact
 # round plan a single `["compact"]` finder, so a check for angle X skipped the
 # cold run exactly there — and the compact brief went on telling a reviewer WITH
 # a shell to run the changed script itself, uncontained. The surface is the
 # question; who grades it is a separate one.
-if node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).kinds.executable?.length?0:1)}catch{process.exit(1)}' "$dir/tier.json"; then
+elif node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).kinds.executable?.length?0:1)}catch{process.exit(1)}' "$dir/tier.json"; then
   # Reported, not swallowed, and never fatal: the skip is recorded in tier.json
   # and printed below, which is a true statement about the review. Losing the
   # round over it would not be.
@@ -599,11 +720,12 @@ fi
 # the reports. Detection, not prevention: the prose in the agent files asks
 # reviewers not to write, and one of them ran the writer under review against
 # the real repository and then `git checkout` to undo it.
-"$here/treecheck.sh" --work "$work" --round "$round" ${repo_root:+--root "$repo_root"} --record
+[ "$replan" -eq 1 ] || "$here/treecheck.sh" --work "$work" --round "$round" ${repo_root:+--root "$repo_root"} --record
 
 "$here/brief.mjs" --round "$round" --plan "$dir/tier.json" --intent "$intent" \
   --scope "$scope" ${impact_md:+--impact "$dir/impact.md"} --prior "$dir/prior.md" --ledger "$ledger" \
   ${cold:+--cold "$cold"} --out "$dir/briefs/"
+[ "$replan" -eq 0 ] || trap - EXIT
 
 # The base intent becomes this review's only once the round it briefs exists;
 # moved earlier, a refused round 1 would strand it in a review that never ran.

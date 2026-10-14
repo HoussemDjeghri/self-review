@@ -102,7 +102,8 @@ export function parseSummary(summary = "") {
 }
 
 // Usage per API call, deduped by message id: a streamed reply spans several lines.
-function usageOf(entries) {
+// Exported for evals/run.mjs, which prices a whole session with the same count.
+export function usageOf(entries) {
   const calls = new Map();
   for (const entry of entries) {
     if (entry.type !== "assistant" || !entry.message?.usage) continue;

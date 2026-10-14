@@ -30,8 +30,12 @@
  *     applier section further down says why arming on the launch alone is the
  *     point rather than a compromise. The orchestrator is additionally review
  *     evidence, under a clause of its own — see `reviewerState`.
+ *   A call that never ran — refused by the user, a permission rule or a
+ *   PreToolUse hook — is no change, whatever its input names.
  *   Paths under tmp, the session scratchpad, and Claude's own runtime state
  *   (~/.claude/projects, plans, todos, …) are ignored: scratch is not work.
+ *   So is any path matched by an absolute glob in the user config's
+ *   `exempt.paths`.
  *   Prose, config and data files (.md, .json, .yaml, .txt, images, …) are
  *   ignored too: the gate arms for code only. Measured 2026-08-22 over 17
  *   reviews — the loop earned its cost on code with tests (real blockers)
@@ -116,10 +120,12 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, stat
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
-import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, skillName } from "./lib/config.mjs";
+import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, pluginVersion, skillName } from "./lib/config.mjs";
+import { appendMonthly } from "./lib/monthly-log.mjs";
+import { globToRegExp } from "../scripts/lib/paths.mjs";
 import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
-import { findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
+import { agentStatus, findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
@@ -262,6 +268,17 @@ const SCRATCH_PREFIXES = [
 // counts: failing toward a review costs a round, failing open costs a bug.
 const EXEMPT_EXTENSIONS = new Set(CONFIG.exempt.extensions.map((e) => e.toLowerCase()));
 const EXEMPT_NAMES = new Set(CONFIG.exempt.names.map((n) => n.toLowerCase()));
+// The user's absolute path globs (`exempt.paths`, absolute by the time config.mjs
+// hands them over), each in two spellings: as written, and with the directory
+// before its first wildcard through `realish` — so a glob written through a
+// symlink matches a file reached by its realpath. The file side's `realish`
+// covers the reverse. One glob dialect in the plugin, tier's and impact's.
+const EXEMPT_PATH_RES = CONFIG.exempt.paths.flatMap((glob) => {
+  const wild = glob.search(/[*?]/);
+  const dir = path.dirname(wild === -1 ? glob : glob.slice(0, wild + 1));
+  const real = realish(dir);
+  return [...new Set([glob, real + glob.slice(dir.length)])].map(globToRegExp);
+});
 
 function toolResultText(entry) {
   const parts = [];
@@ -290,17 +307,35 @@ function isScratchPath(p) {
   return SCRATCH_PREFIXES.some((prefix) => resolved === prefix.replace(/\/$/, "") || resolved.startsWith(prefix));
 }
 
-// A write the gate does not arm for: scratch, or a file that is not code. A
-// dotfile has no extension to Node (`extname(".env") === ""`), so an
-// extensionless file is keyed by its whole name; a directory operand (trailing
-// slash kept by analyzeShell) is never exempt by name — `cp -r src site.json/`
-// writes code under it.
+// A write the gate does not arm for: scratch, a path the user exempted, or a
+// file that is not code. A dotfile has no extension to Node (`extname(".env")
+// === ""`), so an extensionless file is keyed by its whole name; a directory
+// operand (trailing slash kept by analyzeShell) is never exempt by name — `cp
+// -r src site.json/` writes code under it.
 function isExempt(p) {
   if (isScratchPath(p)) return true;
+  if (exemptByPath(p)) return true;
   if (p.endsWith("/")) return false;
   const file = stripAtomicSuffix(p);
   const ext = path.extname(file).toLowerCase();
   return ext ? EXEMPT_EXTENSIONS.has(ext) : EXEMPT_NAMES.has(path.basename(file).toLowerCase());
+}
+
+// Under one of the user's `exempt.paths`, judged by the path's real location
+// only — through the realpath of its nearest existing ancestor — never by the
+// spelling it was written with: a symlink inside an exempt tree that points out
+// of it writes outside it. A relative path is never exempt here: the gate
+// cannot tell where it is, so it counts. A directory operand is exempt only
+// when anything written under it would be: its real location is matched as a
+// name no glob can spell (NUL), at two depths, so `proto/**` covers `cp -r x
+// proto/` and `proto/*.md` does not.
+function exemptByPath(p) {
+  if (!EXEMPT_PATH_RES.length) return false;
+  const expanded = expandHome(p);
+  if (!expanded.startsWith("/")) return false;
+  const at = realish(path.resolve(expanded));
+  const matches = (file) => EXEMPT_PATH_RES.some((re) => re.test(file));
+  return p.endsWith("/") ? matches(`${at}/\0`) && matches(`${at}/\0/\0`) : matches(at);
 }
 
 // `notes.md.new` is written and then renamed over `notes.md`: the file is what
@@ -338,6 +373,11 @@ const SCRIPT_WRITE_PATTERNS = [
   /\b(?:fs\.|fsp\.|fs\.promises\.)?(writeFileSync|writeFile|appendFileSync|appendFile|rmSync|unlinkSync|renameSync|copyFileSync)\(/,
   /\bSet-Content\b|\bOut-File\b/,
 ];
+// Writers that keep the source's mtime: a move, or a copy that preserves
+// times. The stat witness dates a file by its mtime, so for these it cannot
+// look, and only a witness that looked may clear an unresolved write.
+const MTIME_KEEPING = /\bos\.(rename|replace)\(|\bshutil\.(move|copy2|copytree)\(|\b(renameSync|copyFileSync|cpSync|rename|copyFile|cp)\(|\btar\s+(-?[a-zA-Z]*x|--extract)|\brsync\s+(-[a-zA-Z]*[at]|--archive|--times)|\bcp\s+(-[a-zA-Z]*[pa]|--preserve|--archive)|\bmv\s|\binstall\s+(-[a-zA-Z]*p|--preserve-timestamps)/;
+const MTIME_BLIND = "could not look: the command moves or copies files keeping their mtime, which the gate dates writes by";
 
 // `S=/tmp/x; … > "$S/out"` is the common shape of scratch writes (long paths
 // get a variable). Substituting the command's own assignments lets the scratch
@@ -385,9 +425,12 @@ function expandLocalAssignments(cmd) {
   return cmd.replace(REFERENCE, (whole, name, at) => valueAt(name, at) ?? whole);
 }
 
-// A target still holding a `$NAME` after expansion is not a path: the value
-// comes from somewhere this command does not say, so the write is unknown.
-const UNEXPANDED = /\$\{?[A-Za-z_]/;
+// A target still holding a `$NAME`, `${…}`, `$(…)`, a backtick or a positional or
+// special parameter after expansion is not a path: the value comes from
+// somewhere this command does not say, so the write is unknown. Missing `$(` and
+// the backtick let `cd "$(echo /x)"` resolve to a directory inside the cwd that
+// does not exist (review round 4).
+const UNEXPANDED = /\$[{(A-Za-z_0-9@#?*!]|`/;
 
 // The session's own tree: the cwd's repository, or the cwd itself outside git.
 function sessionRoot(cwd) {
@@ -407,11 +450,21 @@ function realish(p) {
   try { return path.join(realpathSync(dir), path.relative(dir, p)); } catch { return p; }
 }
 
+// The repository a path is in, as the nearest ancestor of its realish spelling
+// holding a `.git` entry (a directory, or the file a worktree or submodule
+// has), or null. No subprocess: a repository's config can make git execute
+// code, so the gate runs git in the session's own repository only.
+function gitTopOf(dir) {
+  for (let d = realish(dir); ; d = path.dirname(d)) {
+    if (existsSync(path.join(d, ".git"))) return d;
+    if (path.dirname(d) === d) return null;
+  }
+}
+
 function inWorkTree(p) {
   let dir = realish(p);
   while (!existsSync(dir) || !statSync(dir).isDirectory()) dir = path.dirname(dir);
-  const inside = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
-  return inside.status === 0 && inside.stdout.trim() === "true";
+  return gitTopOf(dir) !== null;
 }
 
 // A removed path outside the session's tree and outside every repository has
@@ -426,7 +479,7 @@ function deletedOutside(target, acc) {
   return !withinRoot && !inWorkTree(target);
 }
 
-const expandHome = (p) => (p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p.replace(/^\$HOME\//, HOME + "/").replace(/^\$\{?TMPDIR\}?/, tmpdir()));
+const expandHome = (p) => (p === "~" ? HOME : p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p.replace(/^\$HOME\//, HOME + "/").replace(/^\$\{?TMPDIR\}?/, tmpdir()));
 
 
 // The word that starts at `at` in the raw segment — the target after a redirect
@@ -475,29 +528,63 @@ function segmentWriteTargets(segment, ws) {
   return null;
 }
 
+// Quoted strings inside a word or a script body: where an inline `-c` snippet
+// or an interpreter heredoc names the file it opens.
+const QUOTED_RE = /(['"])([^'"\n]+)\1/g;
+
+// A path the command's own text names, resolved against the directory current
+// where it appears: one of the witnesses an unresolved write is judged against.
+// Read-only mentions are collected too — telling them apart is the parser layer
+// this file keeps out of, and a stat costs nothing.
+function addLiteral(acc, text, dir) {
+  if (pathLike(text) && !UNEXPANDED.test(expandHome(text)) && !text.includes("\n")) acc.literals.push(path.resolve(dir, expandHome(text)));
+}
+
 // Walks shell text segment by segment, tracking `cd` so relative targets resolve
 // against the directory the command was actually in.
 function analyzeShell(text, dir, acc) {
+  const groups = []; // `( … )` runs in a subshell: a cd inside it ends with the group
   for (const segment of splitSegments(expandLocalAssignments(text))) {
     const ws = words(segment);
+    for (const w of ws) if (w === "(") groups.push({ dir, known: acc.dirKnown });
+    const closes = ws.filter((w) => w === ")").length;
+    const after = () => { for (let i = 0; i < closes && groups.length; i++) ({ dir, known: acc.dirKnown } = groups.pop()); };
     const inline = inlineShell(ws);
-    if (inline !== null) { analyzeShell(inline, dir, acc); continue; } // its own shell: a cd inside stays inside
+    if (inline !== null) { const known = acc.dirKnown; analyzeShell(inline, dir, acc); acc.dirKnown = known; after(); continue; } // its own shell: a cd inside stays inside
+    for (const w of ws) {
+      addLiteral(acc, w, dir);
+      for (const m of w.matchAll(QUOTED_RE)) addLiteral(acc, m[2], dir);
+    }
     const at = afterPrefixes(ws);
+    if (ws[at] === "popd") { acc.blind ??= `could not look: \`${ws.slice(at).join(" ")}\` moves to a directory the gate cannot resolve`; acc.dirKnown = false; after(); continue; }
     if (ws[at] === "cd" || ws[at] === "pushd") {
-      const target = ws.slice(at + 1).find((w) => !w.startsWith("-")); // `cd -` is unknowable
-      if (target) dir = path.resolve(dir, expandHome(target));
+      // `cd -`, a bare `pushd` (it swaps with the stack) and an unexpanded target
+      // move somewhere the gate cannot name; a bare `cd` goes home.
+      const target = ws.slice(at + 1).find((w) => w === "-" || !w.startsWith("-"));
+      // `~user`, `~+` and `~-` name directories only the shell knows.
+      const unknowable = target === "-" || (target === undefined ? ws[at] === "pushd" : /^~[^/]/.test(target) || UNEXPANDED.test(expandHome(target)));
+      if (target === undefined && !unknowable) dir = homedir();
+      else if (target !== undefined && target !== "-") dir = path.resolve(dir, expandHome(target));
+      if (unknowable) acc.blind ??= `could not look: \`${ws.slice(at).join(" ")}\` moves to a directory the gate cannot resolve`;
+      else acc.dirs.push(dir);
+      // Once the directory is unknown, only an absolute or `~` cd names it again.
+      if (unknowable) acc.dirKnown = false;
+      else if (target !== undefined && (target.startsWith("~") || path.isAbsolute(expandHome(target)))) acc.dirKnown = true;
     }
     const found = segmentWriteTargets(segment, ws);
-    if (found === null) continue;
-    const opaque = found.filter((t) => UNEXPANDED.test(expandHome(t)));
+    if (found === null) { after(); continue; }
+    // A relative target in an unknown directory is as unnameable as an unexpanded one.
+    const opaque = found.filter((t) => UNEXPANDED.test(expandHome(t)) || (!acc.dirKnown && !path.isAbsolute(expandHome(t))));
     let named = found.filter((t) => !opaque.includes(t)).map((t) => ({ t, at: path.resolve(dir, expandHome(t)) }));
     if (DELETERS.has(commandOf(ws)) && opaque.length === 0 && named.length) {
       named = named.filter(({ at }) => !deletedOutside(at, acc));
-      if (named.length === 0) continue; // every removal was outside: nothing written to review
+      if (named.length === 0) { after(); continue; } // every removal was outside: nothing written to review
     }
     acc.writes = true;
     if (found.length === 0 || opaque.length) acc.unknown = true;
+    if (acc.unknown && MTIME_KEEPING.test(segment)) acc.blind ??= MTIME_BLIND;
     acc.targets.push(...named.map(({ t, at }) => at + (t.endsWith("/") ? "/" : "")));
+    after();
   }
   return dir;
 }
@@ -514,18 +601,23 @@ function analyzeShell(text, dir, acc) {
 // the change. When nothing non-exempt is left to name, an empty list is the
 // honest answer and collectChanges falls through to the git evidence, which
 // decides on what the turn actually wrote rather than on what was parseable.
+//
+// `dirs` and `literals` are the other two witnesses for a write whose targets
+// did not resolve: every directory the command cd'd into, and every path its
+// own text names — interpreter heredoc bodies included, by their quoted strings.
 function bashWrites(command, cwd) {
   if (typeof command !== "string") return null;
-  const acc = { writes: false, unknown: false, targets: [], cwd, root: undefined };
+  const acc = { writes: false, unknown: false, targets: [], dirs: [], literals: [], cwd, root: undefined, blind: null, dirKnown: true };
   const { shell, scripts } = separateHeredocs(command);
   const dir = analyzeShell(shell, cwd, acc);
   for (const { interpreter, body } of scripts) {
-    if (SHELL_INTERPRETERS.has(interpreter)) analyzeShell(body, dir, acc);
-    else if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; }
+    if (SHELL_INTERPRETERS.has(interpreter)) { analyzeShell(body, dir, acc); continue; }
+    for (const m of body.matchAll(QUOTED_RE)) addLiteral(acc, m[2], dir);
+    if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; if (MTIME_KEEPING.test(body)) acc.blind ??= MTIME_BLIND; }
   }
   if (!acc.writes) return null;
   const named = [...new Set(acc.targets)];
-  return { named, gated: named.filter((p) => !isExempt(p)), unknown: acc.unknown };
+  return { named, gated: named.filter((p) => !isExempt(p)), unknown: acc.unknown, dirs: [...new Set(acc.dirs)], literals: [...new Set(acc.literals)], blind: acc.blind };
 }
 
 /**
@@ -578,10 +670,18 @@ function changedFiles(cwd) {
   // `--show-cdup` is the way up in the cwd's own spelling, which is the one
   // every parsed target is resolved in — `--show-toplevel` returns a realpath,
   // and on macOS `/private/var/…` never matches a target written as `/var/…`.
-  const cdup = spawnSync("git", ["-C", cwd, "rev-parse", "--show-cdup"], { encoding: "utf8" });
+  // Both calls are bounded, and each result is read three ways: a call that did
+  // not finish is "could not look", which blocks; only a non-zero exit is "no
+  // git repository".
+  const cdup = spawnSync("git", ["-C", cwd, "rev-parse", "--show-cdup"], { encoding: "utf8", timeout: 3_000, killSignal: "SIGKILL" });
+  if (cdup.error?.code === "ENOENT") return "git is not installed";
+  if (cdup.error || cdup.signal) return "git rev-parse did not finish within 3 s";
   if (cdup.status !== 0 || typeof cdup.stdout !== "string") return "no git repository";
   const top = path.resolve(cwd, cdup.stdout.trim());
-  const status = spawnSync("git", ["-C", cwd, "status", "--porcelain=v1", "--untracked-files=all", "-z"], { encoding: "utf8" });
+  const status = spawnSync("git", ["--no-optional-locks", "-C", cwd, "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+    { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 64 << 20 });
+  if (status.error?.code === "ENOBUFS") return "git status output exceeded 64 MB";
+  if (status.error || status.signal) return "git status did not finish within 10 s";
   if (status.status !== 0 || typeof status.stdout !== "string") return "no git repository";
   const files = [];
   for (const rel of statusPaths(status.stdout)) {
@@ -667,11 +767,16 @@ function agentEdited(entry) {
  * not credit to an unresolved write. The explained paths come from here rather
  * than from a second walk for the reason the paragraph above gives.
  */
+//
+// A call that never executed is not a write, so it is dropped HERE rather than
+// by either caller — the reason the paragraphs above give for one enumerator.
 function* writeEvents(entries, from, to, cwd) {
+  const skipped = neverRan(entries);
   for (let index = from + 1; index < to; index += 1) {
     const entry = entries[index];
     if (!entry) continue;
     for (const use of toolUses(entry)) {
+      if (skipped(use)) continue;
       if (EDIT_TOOLS.has(use.name)) {
         const file = use.input?.file_path ?? use.input?.notebook_path;
         if (!file) continue;
@@ -687,7 +792,7 @@ function* writeEvents(entries, from, to, cwd) {
         const blind = writes.unknown || writes.named.length === 0;
         const background = use.input?.run_in_background === true;
         yield blind || writes.gated.length
-          ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named, background }
+          ? { index, kind: "bash", id: use.id, targets: writes.gated, unresolved: writes.gated.length === 0, explains: writes.named, background, dirs: writes.dirs, literals: writes.literals, blind: writes.blind }
           : { index, kind: "exempt", id: use.id, explains: writes.named, shell: true, background };
       }
     }
@@ -695,6 +800,33 @@ function* writeEvents(entries, from, to, cwd) {
       yield { index, kind: "agent", agentType: entry.toolUseResult.agentType ?? "subagent" };
     }
   }
+}
+
+// The harness's own words, at the very start of an error result, for a call it
+// never ran: a permission denial, the user declining it, a PreToolUse hook
+// blocking it — measured across local transcripts (unresolved-write ruling).
+// Anchored at the start because that is what a command cannot forge: a Bash
+// that ran and failed always starts `Exit code N`, so nothing it printed can
+// pose as a denial. If the harness rewords these, a denied call counts as a
+// write again, which is the closed direction to fail in.
+const NEVER_RAN_PREFIXES = ["Permission to use ", "The user doesn't want to proceed with this tool use", "PreToolUse:"];
+
+// Whether a tool call never executed, as a predicate over one tool_use. An edit
+// tool's error qualifies only when it is the tool's own pre-execution refusal
+// (`<tool_use_error>`, kept verbatim by textOf) or a never-ran prefix: those
+// tools do not write partially, but a PostToolUse hook's block comes back as an
+// error after the edit landed.
+function neverRan(entries) {
+  const errors = new Map();
+  for (const entry of entries) {
+    if (entry.type !== "user" || !hasToolResult(entry)) continue;
+    for (const block of entry.message.content) {
+      if (block?.type === "tool_result" && block.is_error === true) errors.set(block.tool_use_id, textOf(block.content));
+    }
+  }
+  return (use) => errors.has(use.id)
+    && ((EDIT_TOOLS.has(use.name) && errors.get(use.id).startsWith("<tool_use_error>"))
+      || NEVER_RAN_PREFIXES.some((prefix) => errors.get(use.id).startsWith(prefix)));
 }
 
 // The first write of `(from, to)`, as the event rather than its index: the
@@ -731,6 +863,46 @@ function collectChanges(turn, cwd, since) {
     if (evidence === undefined) evidence = changedFiles(cwd);
     if (!Array.isArray(evidence)) return evidence;
     return evidence.filter(({ mtimeMs }) => inWindow(window, mtimeMs)).map(({ file }) => file);
+  };
+  // An unresolved write is cleared only when the places it could have written
+  // are bounded: every directory the command entered or names is inside the
+  // session's repository (no nested `.git` between), scratch, or exempt. Then the
+  // repository's git status (above) and a stat of each file the command names,
+  // held to the call's own window, are complete for every place it named. A `cd`
+  // or a directory literal anywhere else blocks, as does anything the gate could
+  // not resolve (r1-shape ruling, 2026-10-14). It replaced a walk of foreign `cd`
+  // targets, which was a witness widened one replayed miss at a time and still
+  // missed writes that keep their mtime (`tar x`, `cp -p`, `rsync -a`). git runs
+  // only in the session's own repository, because a repository's config can make
+  // git execute code. `blind` is the first reason the gate could not bound or
+  // see the write, and it is never dropped.
+  const sessionTop = cwd ? gitTopOf(cwd) : null;
+  const bounded = (dir) => {
+    if (isExempt(dir.endsWith("/") ? dir : `${dir}/`)) return true; // scratch or an exempt.paths directory
+    if (sessionTop === null) return false;
+    const rel = path.relative(sessionTop, realish(dir));
+    return !rel.startsWith("..") && !path.isAbsolute(rel) && gitTopOf(dir) === sessionTop;
+  };
+  const seen = (event) => {
+    const tree = witnessed(event);
+    const window = callWindow(event, turn, since, finishedAt);
+    if (!window) return { written: [], blind: tree }; // witnessed() has already said why
+    const written = new Set(Array.isArray(tree) ? tree : []);
+    let blind = Array.isArray(tree) ? null : tree;
+    blind ??= event.blind ?? null;
+    for (const dir of event.dirs ?? []) {
+      if (!bounded(dir)) blind ??= `could not look: the command entered ${dir}, outside this repository`;
+    }
+    for (const file of event.literals ?? []) {
+      let stat;
+      try { stat = statSync(file); } catch { continue; } // names nothing that exists
+      if (stat.isDirectory()) {
+        if (!bounded(file)) blind ??= `could not look: the command names ${file}, a directory outside this repository`;
+      } else if (stat.isFile() && !isExempt(file) && inWindow(window, stat.mtimeMs)) {
+        written.add(file);
+      }
+    }
+    return { written: [...written], blind };
   };
   // The explaining calls are counted turn-wide but the verdict is per event, so
   // a file some other successful call already accounts for — exempt ones
@@ -773,19 +945,17 @@ function collectChanges(turn, cwd, since) {
     // A resolvable target decides on its own: it may be outside the repo,
     // where git has nothing to say about it.
     if (!event.unresolved) { changes.push({ index: event.index, kind: "bash", files: event.targets }); continue; }
-    const written = witnessed(event);
-    if (!Array.isArray(written)) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: written }); continue; }
+    const { written, blind } = seen(event);
     const unexplained = written.filter((file) => !explained.has(file));
     const gated = unexplainedCode(written);
     if (gated.length) { changes.push({ index: event.index, kind: "bash", files: gated }); continue; }
-    // Every unexplained file is exempt: prose, config, scratch. That is a real
-    // answer — the artifact was looked at — so no change is recorded. An empty
-    // remainder is not: the command wrote something the evidence cannot account
-    // for, and the gate falls back to blocking. The two empty cases get two
-    // texts, because "nothing changed" is the one leads have learned to answer
-    // with `not-applicable`, and here something did change — just not visibly.
-    if (!written.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "nothing in the working tree changed while this command ran" });
-    else if (!unexplained.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "every file changed in the working tree while this command ran is accounted for by another tool call, so this one wrote somewhere git cannot see from here — outside this repository, or into a file another call also wrote" });
+    if (blind) { changes.push({ index: event.index, kind: "bash", files: [], unresolved: blind }); continue; }
+    // Every unexplained file is exempt — prose, config, scratch — or no witness
+    // saw a write at all. Both are real answers, because every place the command
+    // could be seen writing was looked at, so no change is recorded. A remainder
+    // that other calls wholly explain is not: the command wrote something the
+    // evidence cannot account for, and the gate falls back to blocking.
+    if (written.length && !unexplained.length) changes.push({ index: event.index, kind: "bash", files: [], unresolved: "every file changed in the working tree while this command ran is accounted for by another tool call, so this one wrote somewhere git cannot see from here — outside this repository, or into a file another call also wrote" });
   }
   return changes;
 }
@@ -1077,17 +1247,30 @@ function scanAgents(entries, results) {
 //
 // KNOWN LIMIT: the transcript proves the report existed before the marker, not
 // that the lead read it — which is also all a delivered notice ever proved.
+//
+// EDITORS settle too, and on either side of the marker. An editor's completion
+// is not evidence for the claim but the change the claim must follow, so a
+// notice-less applier left "pending" read "applying" at every Stop and released
+// a converged marker unchecked — 161 field releases, 158 with the applier's
+// transcript ended 10–16 minutes before. Finished before the marker, it is
+// judged like any finished applier; finished after it, the marker is behind the
+// change, which is what the notice would have said had it come.
+//
+// Only a report written after the agent's latest dispatch counts: a resumed
+// agent's earlier report is the work it was sent back from.
 function settleFromTranscripts(agents, entries, markerAt, transcriptPath) {
   const msOf = (entry) => Date.parse(entry?.timestamp ?? "");
   const markerMs = msOf(entries[markerAt]);
   const dir = resolveSubagentsDir(transcriptPath);
   return agents.map((a) => {
+    const editor = isEditor(a.type);
     const unsettled = a.doneAt === -1 || a.doneAt > markerAt;
-    if (!unsettled || !(REVIEWER_TYPES.test(a.type) || isVerifier(a))) return a;
+    if (!unsettled || !(editor || REVIEWER_TYPES.test(a.type) || isVerifier(a))) return a;
+    const dispatchedAt = Math.max(a.launchedAt, a.resumedAt ?? -1);
     const finishedMs = reportFinishedMs(a, dir, msOf(entries[a.launchedAt]));
-    if (!(finishedMs < markerMs)) return a;
-    const doneAt = entries.findIndex((e, i) => i > a.launchedAt && msOf(e) >= finishedMs);
-    return doneAt !== -1 && doneAt < markerAt ? { ...a, doneAt, pending: false } : a;
+    if (!(finishedMs > msOf(entries[dispatchedAt])) || !(editor || finishedMs < markerMs)) return a;
+    const doneAt = entries.findIndex((e, i) => i > dispatchedAt && msOf(e) >= finishedMs);
+    return doneAt !== -1 && (editor || doneAt < markerAt) ? { ...a, doneAt, pending: false } : a;
   });
 }
 
@@ -1095,9 +1278,13 @@ function settleFromTranscripts(agents, entries, markerAt, transcriptPath) {
 // does not say so: no transcript, only an earlier launch's under the same name,
 // or a last entry that is not a report. A named agent's file carries the name
 // the harness GAVE it — the launch's `name` gains a `-2` on a collision, and the
-// id (`<name>@session-…`) is what carries the result — and only its exact
-// `<name>-<hex>` file counts: a longer stem is another agent. An unnamed agent's
-// file carries its id, which is checked for shape before it becomes a path.
+// id (`<name>@session-…`) is what carries the result — and only its own-name
+// transcript counts — the name in the file (`<name>-<hex>`) or, for a bare
+// `agent-a<hex>.jsonl`, in its `.meta.json` sidecar (agentNameOf in
+// lib/agents.mjs); a longer `<name>-…` stem is another agent. The harness files
+// a named agent as bare hex when it launched it with a hex agentId, so in
+// practice that agent reaches the id branch below. An unnamed agent's file
+// carries its id, which is checked for shape before it becomes a path.
 function reportFinishedMs(agent, dir, launchMs) {
   const [given, session] = agent.id.split("@");
   const files = session !== undefined
@@ -1108,7 +1295,9 @@ function reportFinishedMs(agent, dir, launchMs) {
     // Unreadable is no evidence, and no evidence leaves the refusal standing;
     // letting it throw would fail the hook open, which releases the turn.
     try { read = readAgent(file); } catch { continue; }
-    if (read.startedMs >= launchMs) return read.endsWithReport ? read.lastMs : NaN;
+    // wait.mjs's rule, not the report shape alone: a text entry is followed by
+    // its tool_use within seconds, so a report is final at end_turn or once settled.
+    if (read.startedMs >= launchMs) return agentStatus(read, Date.now(), CONFIG.wait) === "finished" ? read.lastMs : NaN;
   }
   return NaN;
 }
@@ -1372,6 +1561,33 @@ const countUnvalidated = reminderCounter(UNVALIDATED_TAG);
 const UNVERIFIED_TAG = "these counts need a verifier behind them";
 const countUnverified = reminderCounter(UNVERIFIED_TAG);
 
+// The previous marker is the one that CLOSED a window — the last one before
+// `before` that this gate did not refuse. A refused marker closed nothing: its
+// loop goes on, and the re-mark is a claim about the same span. Counting it
+// opened the verifier window after it, so a verifier that had already ruled
+// went unseen and the correct re-mark was refused "no verifier since the
+// previous marker" (field: 5 refusals in 2 sessions, the first after a refusal
+// for a missing finder). Refused is read from the gate's own refusals — the
+// three that judge a well-formed marker, delivered as feedback before the next
+// marker — so the answer is the gate's decision at that Stop, not a re-run of it.
+// Refused only while the gate was still refusing: once a tag's refusals reach
+// MAX_REMINDERS, counted per tag as the deciding branches count them, the gate
+// released that marker, the task ended on it, and it is a boundary like an
+// accepted one.
+const MARKER_REFUSAL_TAGS = [UNREVIEWED_TAG, UNVALIDATED_TAG, UNVERIFIED_TAG];
+function previousAcceptedMarker(entries, results, cwd, before) {
+  for (let next = before; next >= 0;) {
+    const at = lastMarker(entries.slice(0, next), results, cwd).at;
+    const counts = at >= 0
+      ? MARKER_REFUSAL_TAGS.map((tag) => entries.slice(at + 1, next).filter((e) => isReminderFor(e, tag)).length)
+      : [];
+    const refused = counts.some((n) => n > 0) && counts.every((n) => n < MAX_REMINDERS);
+    if (!refused) return at;
+    next = at;
+  }
+  return -1;
+}
+
 // The refusal. It names WHICH trigger fired, because the two want different
 // batches: `dismissed` wants the dismissed candidates specifically, and
 // `candidates` wants the round's whole set.
@@ -1478,6 +1694,11 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
     // original finding survive this: the session whose only reviewer was an
     // orchestrator still sees it named, because it has one.
     `${GATE_TAG} The converged marker was refused: ${UNREVIEWED_TAG}, but no plugin reviewer (self-review-finder, self-review-cold-grader${hasOrchestrator ? " or self-review-orchestrator" : ""}) completed between the last change — your own edit, or an editing subagent finishing — and the marker.`,
+    // Ahead of the spawn advice: a lead that marked `converged` after STOP was
+    // otherwise told to launch a finder before it read the honest end, and a
+    // review run to turn a capped one into `converged` is the cost the cap
+    // exists to bound (after-STOP ruling).
+    "If converge said STOP, the budget is spent and the honest marker is `--not-converged` with your counts — not another finder.",
     middle,
     `${action} ${MARKER_BODY}`,
     `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts. If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
@@ -1488,7 +1709,8 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
 
 function evaluate(entries, cwd, transcriptPath) {
   const lastMessage = [...entries].reverse().find((e) => e.type === "user" || e.type === "assistant");
-  if (!lastMessage || isInterrupt(lastMessage)) return null;
+  if (!lastMessage) return { rule: "pass:empty" };
+  if (isInterrupt(lastMessage)) return { rule: "pass:interrupted" };
 
   // Every human prompt, not just the last: the task window reaches back across
   // the ones an agent was working through. `boundary` stays the last of them.
@@ -1517,7 +1739,7 @@ function evaluate(entries, cwd, transcriptPath) {
   const appliers = appliersIn(agents);
   const orchestrators = orchestratorsIn(agents);
   const editors = editorsIn(agents);
-  if (changes.length === 0 && editors.length === 0) return null;
+  if (changes.length === 0 && editors.length === 0) return { rule: "pass:no-change" };
 
   // BOTH FRAMES, together, because getting them apart is what went wrong here,
   // and the frame each field takes is decided by WHAT GATES IT.
@@ -1546,6 +1768,10 @@ function evaluate(entries, cwd, transcriptPath) {
   // dedupes on the marker id anywhere in the log.
   const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
   const { at: markerAtW, fileMarker, outcome, intent, counts } = lastMarker(entries, results, cwd);
+  // What the decision log records beside the rule: the outcome of a marker in
+  // THIS turn when there is one — an earlier turn's is not this Stop's — and
+  // whichever count the deciding branch read.
+  const facts = (counted = {}) => ({ marker: markerAt >= 0 ? outcome ?? undefined : undefined, ...counted });
   const lastChangeAt = changes.length ? Math.max(...changes.map((c) => c.index)) : -1;
   // ONE INDEX FRAME, declared before it is used twice below. markerAt and
   // lastChangeAt are turn-relative; agent records carry whole-window indices.
@@ -1555,25 +1781,33 @@ function evaluate(entries, cwd, transcriptPath) {
   // Everything the orchestrator did NOT do: the lead's own writes, and any
   // applier launched on the main chain beside it. This is the lower bound of the
   // orchestrator's evidence clause in `reviewerState`.
-  const externalChangeAt = Math.max(
-    changes.length ? toWindow(lastChangeAt) : -1,
-    ...appliers.map(editorAnchor),
-  );
-  // The latest thing needing a marker behind it. The orchestrator's anchor joins
-  // it here — as a change source it is indistinguishable from an applier, and
-  // leaving it out is what lets a `not-converged` marker written mid-flight sit
-  // ahead of `changeAtW` while the orchestrator's applier is still editing.
-  const changeAtW = Math.max(externalChangeAt, ...orchestrators.map(editorAnchor));
-  // One frame for everything that becomes prose, so a message cannot describe
-  // the wrong entry: file changes converted up, appliers already there.
-  const inFrame = [
-    ...changes.map((c) => ({ ...c, index: toWindow(c.index) })),
-    // No agent type on the record: nothing reads one, and round 1 removed the
-    // only thing that did. Carrying it anyway is a field a later edit could
-    // innocently print, reopening the leak with no test to catch it.
-    ...appliers.map((a) => ({ index: editorAnchor(a), kind: "applier" })),
-    ...orchestrators.map((a) => ({ index: editorAnchor(a), kind: "orchestrator" })),
-  ];
+  //
+  // A function of the agent records, because the converged check re-derives all
+  // three from transcript-settled records — an editor settled there moves its
+  // anchor, and judging it against the notices' anchor would undo the settling.
+  const frameOf = (list) => {
+    const externalChangeAt = Math.max(
+      changes.length ? toWindow(lastChangeAt) : -1,
+      ...appliersIn(list).map(editorAnchor),
+    );
+    // The latest thing needing a marker behind it. The orchestrator's anchor joins
+    // it here — as a change source it is indistinguishable from an applier, and
+    // leaving it out is what lets a `not-converged` marker written mid-flight sit
+    // ahead of `changeAtW` while the orchestrator's applier is still editing.
+    const changeAtW = Math.max(externalChangeAt, ...orchestratorsIn(list).map(editorAnchor));
+    // One frame for everything that becomes prose, so a message cannot describe
+    // the wrong entry: file changes converted up, appliers already there.
+    const inFrame = [
+      ...changes.map((c) => ({ ...c, index: toWindow(c.index) })),
+      // No agent type on the record: nothing reads one, and round 1 removed the
+      // only thing that did. Carrying it anyway is a field a later edit could
+      // innocently print, reopening the leak with no test to catch it.
+      ...appliersIn(list).map((a) => ({ index: editorAnchor(a), kind: "applier" })),
+      ...orchestratorsIn(list).map((a) => ({ index: editorAnchor(a), kind: "orchestrator" })),
+    ];
+    return { externalChangeAt, changeAtW, inFrame };
+  };
+  const { externalChangeAt, changeAtW, inFrame } = frameOf(agents);
   // What still has no marker behind it — what the generic block is about, where
   // naming an applier that was already reviewed and marked would be wrong.
   // The REFUSAL message must not use this list. It runs only when the marker is
@@ -1592,10 +1826,11 @@ function evaluate(entries, cwd, transcriptPath) {
   // launch so no validator could beat it, and one validator anywhere in a
   // session permanently unlocked `validated` for every later unrelated turn.
   //
-  // `lastMarker` sets `at` only for an accepted marker: a rejected file write
+  // `lastMarker` sets `at` only for a well-formed marker: a rejected file write
   // sets `rejectedAt`, and a script call whose output lacks the token sets
-  // nothing. So this is unambiguous without reading any outcome.
-  const prevMarkerAt = markerAtW >= 0 ? lastMarker(entries.slice(0, markerAtW), results, cwd).at : -1;
+  // nothing. So this is unambiguous without reading any outcome. A well-formed
+  // marker this gate then REFUSED is skipped too — see previousAcceptedMarker.
+  const prevMarkerAt = previousAcceptedMarker(entries, results, cwd, markerAtW);
   // A human prompt is an INTERJECTION when some agent launched before it was
   // still running across it; it is a TASK BOUNDARY when none was. Turn-scoping
   // on `boundary` alone reintroduces the 2026-08-22 false block, because an
@@ -1637,18 +1872,23 @@ function evaluate(entries, cwd, transcriptPath) {
     // a finder that completed after the APPLIER finished, not merely after the
     // lead's own last edit.
     // Read only when the notices alone would not pass — see settleFromTranscripts.
+    // "applying" is read too: it is a notice-based verdict like the rest, and
+    // releasing on it unread is how a finished applier held the gate open.
     let settled;
     const settledAgents = () => (settled ??= settleFromTranscripts(agents, entries, markerAtW, transcriptPath));
+    let judged = { agents, externalChangeAt, changeAtW, inFrame };
     let state = outcome === "converged"
       ? reviewerState(agents, externalChangeAt, changeAtW, markerAtW, prevMarkerAt)
       : "ok";
-    if (state !== "ok" && state !== "applying") {
-      state = reviewerState(settledAgents(), externalChangeAt, changeAtW, markerAtW, prevMarkerAt);
+    if (state !== "ok") {
+      judged = { agents: settledAgents(), ...frameOf(settledAgents()) };
+      state = reviewerState(judged.agents, judged.externalChangeAt, judged.changeAtW, markerAtW, prevMarkerAt);
     }
     // A reviewer still working is not a missing one, and this loop waits by
     // ending turns: release, exactly as the pending branch below does.
     if (state === "running") {
       return {
+        rule: "release:reviewer-running", log: facts(),
         systemMessage: `self-review gate: a converged marker landed while a reviewer is still running — turn released so its report can arrive; re-mark after it lands and the gate re-checks at the next stop`,
       };
     }
@@ -1658,6 +1898,7 @@ function evaluate(entries, cwd, transcriptPath) {
     // next Stop sees a finished applier and asks for the re-mark.
     if (state === "applying") {
       return {
+        rule: "release:editor-running", log: facts(),
         systemMessage: `self-review gate: a converged marker landed while an editing subagent is still running — turn released so its edits can finish; review them and re-mark after it reports`,
       };
     }
@@ -1665,15 +1906,17 @@ function evaluate(entries, cwd, transcriptPath) {
       const refusals = countUnreviewed(turn);
       if (refusals >= MAX_REMINDERS) {
         return {
+          rule: "release:unreviewed-exhausted", log: facts({ refusals }),
           systemMessage: `self-review gate: released after ${refusals} refusals of a converged marker with no reviewer completion behind it — the review may not have run. (SELF_REVIEW_GATE=off disables the gate.)`,
         };
       }
       return {
+        rule: "block:no-reviewer", log: facts({ refusals }),
         decision: "block",
-        reason: unreviewedReason(state, inFrame, changeAtW, cwd, {
+        // The records and frame the state was judged on: settled ones when the transcripts were read.
+        reason: unreviewedReason(state, judged.inFrame, judged.changeAtW, cwd, {
           hasOrchestrator: orchestrators.length > 0,
-          // The agents the state was judged on: settled ones when the transcripts were read.
-          midFlight: (settled ?? agents).some((a) => REVIEWER_TYPES.test(a.type) && a.launchedAt <= changeAtW && a.doneAt > changeAtW),
+          midFlight: judged.agents.some((a) => REVIEWER_TYPES.test(a.type) && a.launchedAt <= judged.changeAtW && a.doneAt > judged.changeAtW),
         }),
         systemMessage: `self-review gate: converged marker refused — no reviewer completion after the last change (an independent reader of the final state is required)`,
       };
@@ -1692,6 +1935,7 @@ function evaluate(entries, cwd, transcriptPath) {
       // ending turns, and a verifier still working is not a missing one.
       if (verified === "running") {
         return {
+          rule: "release:verifier-running", log: facts(),
           systemMessage: `self-review gate: a converged marker landed while a verifier is still running — turn released so its verdicts can arrive; re-mark after they land and the gate re-checks at the next stop`,
         };
       }
@@ -1699,10 +1943,12 @@ function evaluate(entries, cwd, transcriptPath) {
         const refusals = countUnverified(turn);
         if (refusals >= MAX_REMINDERS) {
           return {
+            rule: "release:unverified-exhausted", log: facts({ refusals }),
             systemMessage: `self-review gate: released after ${refusals} refusals of a converged marker whose ${need === "dismissed" ? "dismissals" : "candidate count"} needed a verifier — the verdicts may be the author's alone. (SELF_REVIEW_GATE=off disables the gate.)`,
           };
         }
         return {
+          rule: "block:no-verifier", log: facts({ refusals }),
           decision: "block",
           reason: unverifiedReason(need, counts),
           systemMessage: `self-review gate: converged marker refused — ${need === "dismissed" ? `${counts.dismissed} dismissal${counts.dismissed === 1 ? "" : "s"}` : `${counts.fixed + counts.dismissed + counts.open} candidates`} with no verifier completion behind them`,
@@ -1737,22 +1983,25 @@ function evaluate(entries, cwd, transcriptPath) {
       const refusals = countUnvalidated(turn);
       if (refusals >= MAX_REMINDERS) {
         return {
+          rule: "release:unvalidated-exhausted", log: facts({ refusals }),
           systemMessage: `self-review gate: released after ${refusals} refusals of intent=validated with no ticket-validator completion before the first change — the intent may never have been read. (SELF_REVIEW_GATE=off disables the gate.)`,
         };
       }
       return {
+        rule: "block:unvalidated", log: facts({ refusals }),
         decision: "block",
         reason: unvalidatedReason(unnamed ? written.index : null),
         systemMessage: `self-review gate: intent=validated refused — no ticket-validator completed before this task's first code change`,
       };
     }
     if (fileMarker) logFileMarker(fileMarker, cwd);
-    return null;
+    return { rule: "pass:marker", log: facts() };
   }
 
   const pending = agents.filter((a) => a.pending).length;
   if (pending > 0) {
     return {
+      rule: "release:pending", log: facts(),
       systemMessage: `self-review gate: ${pending} subagent(s) still running — turn released so their results can arrive; the gate re-checks at the next stop`,
     };
   }
@@ -1760,6 +2009,7 @@ function evaluate(entries, cwd, transcriptPath) {
   const reminders = countReminders(turn, markerAt);
   if (reminders >= MAX_REMINDERS) {
     return {
+      rule: "release:reminders-exhausted", log: facts({ reminders }),
       systemMessage: `self-review gate: released without a convergence marker after ${reminders} reminders — the review may be incomplete. (SELF_REVIEW_GATE=off disables the gate.)`,
     };
   }
@@ -1772,6 +2022,7 @@ function evaluate(entries, cwd, transcriptPath) {
   // every defect and the exact body to write, in one message.
   if (rejected) {
     return {
+      rule: "block:rejected", log: facts({ reminders }),
       decision: "block",
       reason: rejectionReason(rejected),
       systemMessage: `self-review gate: the convergence marker was refused — ${rejected.length} problem(s) with the record`,
@@ -1779,12 +2030,14 @@ function evaluate(entries, cwd, transcriptPath) {
   }
   if (remarkOnly(outcome, markerAtW, inFrame, editors)) {
     return {
+      rule: "block:remark", log: facts({ reminders }),
       decision: "block",
       reason: remarkReason(outcome),
       systemMessage: `self-review gate: an editing subagent finished after the ${outcome} marker — re-mark with the same outcome`,
     };
   }
   return {
+    rule: "block:unmarked", log: facts({ reminders }),
     decision: "block",
     reason: blockReason(described, reminders, cwd) + beside,
     systemMessage: `self-review gate: ${describeChanges(described, cwd)} — ${lastChange(described)?.kind === "orchestrator" ? "read its report and re-mark before the turn ends" : "running the review loop before the turn ends"}`,
@@ -1905,7 +2158,38 @@ function rejectionReason(problems) {
   ].join("\n");
 }
 
+// The decision log (state-location ruling, section 2): one row per Stop,
+// passes included, in LOG_DIR/gate/YYYY-MM.jsonl. WRITE-ONLY — nothing in this
+// gate reads it back, because the log dir can be redirected by a repo's
+// settings `env` and a log that fed a decision would be state that repo
+// controls. Best effort, so a failure here never changes what is printed. The
+// row holds the project root, codes and counts only: the messages name files
+// inside the project, so no message text goes in.
+function logDecision(payload, rule, { reminders = null, refusals = null, marker } = {}) {
+  try {
+    appendMonthly(path.join(LOG_DIR, "gate"), {
+      ts: new Date().toISOString(), session: payload.session_id ?? null, cwd: gitTopOf(payload.cwd ?? process.cwd()) ?? (payload.cwd ?? process.cwd()),
+      decision: rule.slice(0, rule.indexOf(":")), rule, reminders, refusals, marker, version: pluginVersion(),
+    });
+  } catch (err) {
+    process.stderr.write(`self-review-gate: could not log the decision: ${err.message}\n`);
+  }
+}
+
 runHook("SELF_REVIEW_GATE", "self-review-gate", (payload) => {
-  if (typeof payload.transcript_path !== "string") return null;
-  return evaluate(readMainChain(payload.transcript_path), payload.cwd ?? process.cwd(), payload.transcript_path);
+  // Every return site names its rule; the code and its counts are the log's,
+  // and are taken off before anything is printed. A throw still leaves its row,
+  // then goes on to runHook, which reports it and fails open.
+  let decided;
+  try {
+    decided = typeof payload.transcript_path === "string"
+      ? evaluate(readMainChain(payload.transcript_path), payload.cwd ?? process.cwd(), payload.transcript_path)
+      : { rule: "pass:no-transcript" };
+  } catch (err) {
+    logDecision(payload, "error:crash");
+    throw err;
+  }
+  const { rule, log, ...output } = decided;
+  logDecision(payload, rule, log);
+  return Object.keys(output).length ? output : null;
 });

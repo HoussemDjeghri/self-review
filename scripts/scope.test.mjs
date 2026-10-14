@@ -192,3 +192,19 @@ test("F1: the mixed case — commit + unstaged edit + rename + untracked — is 
     "a rename stays one line, both halves intact");
   assert.equal(files.filter((f) => f.path === "untracked.mjs").length, 1, "one line per path");
 });
+
+test("B4: a scope over MAX_LINES is truncated and announced, never fatal", () => {
+  // `printf … | head` under pipefail: once the bundle outgrew the pipe buffer,
+  // head closed early, printf took SIGPIPE and the script exited 141 before the
+  // TRUNCATED line — and round.sh died on it with no message (30 failures in 9
+  // sessions). The scratch file is what made the field scopes that large.
+  const { repo } = layout();
+  writeFileSync(path.join(repo, "scratch.txt"), "line\n".repeat(100000));
+  const done = spawnSync("bash", [SCOPE], {
+    cwd: repo, encoding: "utf8", env: { ...process.env, SELF_REVIEW_SCOPE_MAX_LINES: "50" },
+  });
+  assert.equal(done.status, 0, `exit ${done.status}: ${done.stderr}`);
+  assert.match(done.stdout, /^# TRUNCATED: \d+ lines total, showing 50\./m);
+  assert.equal(done.stdout.split("\n").findIndex((l) => l.startsWith("# TRUNCATED")), 51,
+    "50 lines of scope, a blank line, then the notice");
+});

@@ -221,6 +221,12 @@ const contextSymbol = (context, ext) => definitionsIn(context, ext).map((d) => d
  * which state, and how many changed lines their hunk carried (the ranking).
  */
 const GONE = new Set(["removed", "renamed"]);
+// Names many classes define — `__init__`, `__eq__`, `constructor`, `toString`.
+// A name match cannot attribute one to the class that lost it, so every other
+// class's `__init__` read as a remaining reference to the removed one and the
+// change was tier L for a broken contract that was not there. Recorded as
+// changed: the finders still see the symbol, and nothing claims it is broken.
+const isProtocolName = (name) => /^__\w+__$/.test(name) || name === "constructor" || name === "toString";
 
 export function changedSymbols(diffLines) {
   const symbols = new Map();
@@ -251,7 +257,7 @@ export function changedSymbols(diffLines) {
       // reference, but worth saying differently in the report.
       for (const [name, kind] of removed) {
         if (added.has(name)) continue;
-        record(name, kind, file, addedOnly.length ? "renamed" : "removed", weight);
+        record(name, kind, file, isProtocolName(name) ? "changed" : addedOnly.length ? "renamed" : "removed", weight);
       }
       for (const name of contextSymbol(hunk.context, ext)) if (!symbols.has(name)) record(name, "enclosing", file, "changed", weight);
     }
@@ -783,7 +789,16 @@ export function parseArgs(argv) {
   return options;
 }
 
+const USAGE = [
+  "usage: impact.mjs --scope round-N/scope.diff --out round-N/ [--base <ref>]",
+  "                  [--adapter auto|grep|crg|none] [--symbol NAME]… [--timeout SEC] [--max-lines N]",
+].join("\n");
+
 export function main(argv, { log = console.log } = {}) {
+  if (argv.some((a) => a === "--help" || a === "-h")) {
+    log(USAGE);
+    return { help: true };
+  }
   const options = parseArgs(argv);
   const usage = (message) => Object.assign(new Error(message), { exitCode: 2 });
   for (const required of ["scope", "out"]) if (!options[required]) throw usage(`--${required} is required`);

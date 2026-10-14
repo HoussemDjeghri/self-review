@@ -18,7 +18,9 @@ exactly that way. So when a reviewer dies, goes idle without a report,
 ```
 
 The session id is the UUID in your scratchpad path; the briefs in
-`round-<r>/briefs/` say who was launched. Then:
+`round-<r>/briefs/` say who was launched. A name launched more than once prints
+its newest launch, and stderr lists the older transcripts' stems — pass one in
+place of the name to print that launch instead. Then:
 
 - **finished** — its last message is the report. Use it as delivered; never
   re-spawn an agent whose report already exists. A reviewer `wait.mjs` listed

@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.8.5" src="https://img.shields.io/badge/version-0.8.5-191919">
+  <img alt="version 0.8.6" src="https://img.shields.io/badge/version-0.8.6-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -81,7 +81,8 @@ enforcing:
   `skipped`. All three are honest; only `validated` is checked.
 - **Prose is not code.** Markdown, JSON/YAML, data and images are exempt from
   the gate by default and reviewed on demand (`/self-review <path>`) — a review
-  loop that churns on a README costs tokens and changes nothing.
+  loop that churns on a README costs tokens and changes nothing. So is any path
+  you exempt by absolute glob in your own config (`exempt.paths`, below).
 - **Waiting is one call, and it is bounded.** After spawning reviewers the
   session blocks in a single call on `scripts/wait.mjs`, which reads the
   reviewers' own transcripts and returns when each has reported or gone silent
@@ -97,7 +98,8 @@ enforcing:
 /plugin install self-review@houssem-plugins
 ```
 
-Restart your sessions so the hooks register. Requires Node ≥ 18 (CI runs 20 on
+Restart your sessions so the hooks register. Requires Claude Code 2.1.292 or
+later (the printed agent calls pass a per-call `effort`), Node ≥ 18 (CI runs 20 on
 Linux and macOS) and bash; no daemon, no service of its own — the hooks and
 scripts read your transcript, your files and `git`, and that is the whole of it
 (`hooks/no-network.test.mjs` fails the build if a shipped hook or script ever
@@ -107,9 +109,10 @@ session does: their tool grants include `WebFetch` and `WebSearch`, for the
 angles that check a cited URL or a documented API.
 
 To remove it: `/plugin uninstall self-review@houssem-plugins`. That takes the
-hooks with it; your review log (`~/.claude/self-review/log.jsonl`) and any
-config you wrote (`~/.claude/self-review/config.json`) stay until you delete
-them. `SELF_REVIEW_GATE=off` turns the gate off for a session without
+hooks with it; your review log (`~/.claude/self-review/log.jsonl`), the gate's
+decision log (`~/.claude/self-review/gate/`, one file a month, pruned after six)
+and any config you wrote (`~/.claude/self-review/config.json`) stay until you
+delete them. `SELF_REVIEW_GATE=off` turns the gate off for a session without
 uninstalling.
 
 ## How a turn goes
@@ -208,7 +211,7 @@ arrays replace — so you can shorten an exemption list, not only extend it.
 
 ```json
 {
-  "exempt": { "extensions": [".md", ".json", ".yaml", ".png"], "names": ["license", ".gitignore"] },
+  "exempt": { "extensions": [".md", ".json", ".yaml", ".png"], "names": ["license", ".gitignore"], "paths": ["~/code/app/prototypes/**"] },
   "gate": { "maxReminders": 2 },
   "pollGuard": { "maxChecks": 2 },
   "tier": { "l": { "minLines": 300 }, "riskPaths": { "payments": ["billing", "subscriptions"] } },
@@ -217,6 +220,14 @@ arrays replace — so you can shorten an exemption list, not only extend it.
   "preflight": { "skip": [] }
 }
 ```
+
+`exempt.paths` takes absolute globs only — `/…` or `~/…`; any other entry is
+dropped with a warning on the hook's stderr (visible with `claude --debug`),
+because a relative glob in a global file would exempt that path in every
+repository you open. `*` and `?` stay inside one path segment, and `**` crosses
+segments, so `~/code/app/prototypes/**` covers everything below `prototypes/` and
+`~/code/app/prototypes/*` only its direct children. It stops the gate arming on those files
+and nothing else: a review whose scope includes them still reads them.
 
 A repository can carry its own `.self-review.json` at its root, merged on top of
 your config for anyone reviewing changes in it. It is **default closed and

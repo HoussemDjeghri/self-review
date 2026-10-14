@@ -32,7 +32,9 @@ const DEFAULTS_PATH = path.join(PLUGIN_ROOT, "config", "defaults.json");
 // Exported so a script can ask what a setting is *supposed* to be when a
 // config layer hands it something unusable.
 export const FALLBACK = {
-  exempt: { extensions: [], names: [] },
+  // `paths`: absolute globs whose writes do not arm the gate. User-only and
+  // gate-only — see absolutePaths() below.
+  exempt: { extensions: [], names: [], paths: [] },
   gate: { maxReminders: 2 },
   pollGuard: { maxChecks: 2 },
   brief: { maxTokens: 2800, impactMaxLines: 80, priorMaxLines: 10 },
@@ -248,12 +250,39 @@ function mergeRepo(config, repoRoot) {
 }
 
 
+// `exempt.paths` releases the gate for whatever it matches, so every entry must
+// be absolute — a leading `/`, or `~/` for the home directory. A slash-less
+// glob matches the basename (`matchesGlob`), so a stray `*.tsx` would exempt
+// every TSX file in every repository, and a relative one would exempt
+// `app/proto/**` in every checkout the user ever opens, untrusted ones
+// included. An absolute glob is what scopes a rule to one checkout. Anything
+// else is dropped per entry, with a warning (exempt-paths ruling). It is not in
+// REPO_ADDITIVE, so a repository never reaches it. Each dropped entry is warned
+// about once per process, however often the config is loaded.
+const warnedPaths = new Set();
+function absolutePaths(config) {
+  const paths = [];
+  for (const entry of config.exempt.paths) {
+    if (entry.startsWith("/")) paths.push(entry);
+    else if (entry.startsWith("~/")) paths.push(homedir() + entry.slice(1));
+    else if (!warnedPaths.has(entry)) {
+      warnedPaths.add(entry);
+      warn(`config: ignoring exempt.paths entry ${JSON.stringify(entry)} — it must be absolute (start with / or ~/)`);
+    }
+  }
+  return { ...config, exempt: { ...config.exempt, paths } };
+}
+
 /**
  * The merged configuration. Pass the repo root to add the `.self-review.json`
  * layer (scripts do; the hooks do not, so hook behaviour never depends on the
  * repository being reviewed).
  */
 export function loadConfig(repoRoot) {
+  return absolutePaths(mergedConfig(repoRoot));
+}
+
+function mergedConfig(repoRoot) {
   let defaults;
   try {
     defaults = merge(FALLBACK, readJson(DEFAULTS_PATH), "defaults.json: ");
@@ -278,6 +307,16 @@ export function loadConfig(repoRoot) {
 export function pluginName(root = PLUGIN_ROOT) {
   try {
     return readJson(path.join(root, ".claude-plugin", "plugin.json")).name || "";
+  } catch {
+    return "";
+  }
+}
+
+// The plugin's version, or "" when there is no manifest — stamped on the gate's
+// decision log so a row can be read against the release that made it.
+export function pluginVersion(root = PLUGIN_ROOT) {
+  try {
+    return readJson(path.join(root, ".claude-plugin", "plugin.json")).version || "";
   } catch {
     return "";
   }

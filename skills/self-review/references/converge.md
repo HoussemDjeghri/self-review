@@ -7,8 +7,24 @@ argue with the verdict, or to understand a tree-guard line you have to quote.
 
 It prints each round's `W = 3·blockers + 2·majors + 1·minors` over what that
 round **fixed**, compares the two rounds over the angles they share, and says
-`CONTINUE`, `ESCALATE` or `STOP` — `STOP` being the round backstop rather than a
-reading of `W`, which is why it can arrive on a round whose `W` fell. The restriction is what "compare like with like"
+`CONTINUE`, `ESCALATE` or `STOP` (plus `CLEAN` and `UNRECORDED`, below) — `STOP` being the round backstop rather than a
+reading of `W`, which is why it can arrive on a round whose `W` fell. Two
+verdicts come before `W` is asked at all: `CLEAN`, a round that fixed nothing
+(open and dismissed do not count), which outranks a spent budget because
+nothing it did ships unreviewed; and `UNRECORDED`, a round with no records and
+no `recorded.json` receipt, because a `record` that failed leaves exactly the
+records a clean round does. After `UNRECORDED` and before `CLEAN` comes a known defect: a row
+recorded `unfixed` anywhere in this review (CONFIRMED/design with no ruling from
+the user, or a `blocked` that survived the retry; PLAUSIBLE/design is `open`)
+stays outstanding until a later row cites it by `prior_id`, and while it does
+the verdict is `ESCALATE`, or `STOP` on a spent budget — never `CLEAN`, never an
+earned round, whatever `W` says. Every verdict is followed by a `next:` line, the
+call that acts on it. In order: `record` for `UNRECORDED`; the marker for
+`CLEAN`; for `unfixed` ESCALATE, `--not-converged` plus the user rulings; the
+one extension round (`round.sh … --force S --reason "extension round…"`) when
+the round closed a blocker or major on the last budgeted round; the marker
+(`--not-converged`) for `STOP` and for a plain `ESCALATE`; the next round
+otherwise. The restriction is what "compare like with like"
 means: angle S arrives by rule at round 3 (§2a) and files every non-`sound`
 verdict as a `blocker` by construction, so an unrestricted `W` reads as an
 increase and stops a loop that is converging — it did exactly that to this
@@ -18,8 +34,9 @@ is compared against. A finder that merged angles (`A+B+D`) counts as having
 run every one of them, and its weight joins the comparison only when all of
 them are shared — without that, the taper in §2a would make consecutive rounds
 permanently incomparable and leave the round cap as the only thing that can
-stop the loop. `converge` decides the `W` rule and nothing else — the round
-cap and the oscillation check below are yours. If it writes `N records did not
+stop the loop. `converge` decides the `W` rule and the round cap, and
+`round.sh` enforces the cap: after a `STOP` it refuses the next round (exit 5).
+The oscillation check is yours. If it writes `N records did not
 match the record schema` on stderr, the findings file holds corrupted rows:
 they are dropped where the file is read, so nothing in them reaches `W`, the
 angle sets or the verdict — but a dropped row is a finding this loop has
@@ -36,7 +53,7 @@ the agent as a reviewer; `converge` reports what the round proved. It exists
 because the guard was inert for roughly ninety named finders while every
 review round read the file and correctly found it correct — a mechanism whose
 working and inert behaviours are identical. Nothing reads it to decide
-anything, so it never changes `CONTINUE`/`ESCALATE`. What it can say, and what
+anything, so it never changes the verdict. What it can say, and what
 each one asks of you:
 
 **`tree-guard engaged: N/M` is the only wording that is a pass.** Any other —

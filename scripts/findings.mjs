@@ -3,12 +3,14 @@
  * findings.mjs — what past reviews of this repository already found.
  *
  * Usage:
- *   findings.mjs record --work <dir> [--round N] [--in <file|->] [--repo <dir>] [--log-dir <dir>]
- *   findings.mjs prior  --scope <scope.diff> --work <dir> [--out prior.md] [--max N]
- *   findings.mjs converge --work <dir> [--round N] [--repo <dir>] [--log-dir <dir>]
+ *   findings.mjs record   (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--in <file|->] [--log-dir <dir>]
+ *   findings.mjs prior    --scope <scope.diff> (--work <dir> | --review <id> [--repo <dir>]) [--out prior.md] [--max N] [--log-dir <dir>]
+ *   findings.mjs converge (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--budget N] [--log-dir <dir>]
  *
- * `--work` is the round's work dir; the review's identity is derived from it
- * (`--review <id>` instead when a caller has no work dir, e.g. the evals).
+ * `--work` is the round's work dir; the review's identity and its repository
+ * (the round-1 scope's) are derived from it, so `--work` with `--repo` is
+ * refused. `--review <id> [--repo <dir>]` instead when a caller has no work
+ * dir, e.g. the evals.
  *
  * A review that cannot remember starts every round cold: the same near-miss in
  * the same file gets re-discovered by a fresh agent every time, at the price of
@@ -30,21 +32,26 @@
  *
  * Exit 0; 2 usage; 3 an input file is missing, unreadable, or not the schema.
  */
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { LOG_DIR, isMain, loadConfig, realpathOr } from "../hooks/lib/config.mjs";
 import { auditEngagement, engagementFile, engagementLine, openEngagement } from "../hooks/lib/engagement.mjs";
 import { parseDiff } from "./lib/diff.mjs";
+import { editDistance } from "./lib/edit-distance.mjs";
 import { classifyPath } from "./lib/paths.mjs";
-import { gitRoot } from "./lib/repo.mjs";
+import { gitRoot, workRepo } from "./lib/repo.mjs";
 
 const fail = (message, exitCode = 3) => Object.assign(new Error(message), { exitCode });
 const usage = (message) => fail(message, 2);
 
 // --- the record schema (DESIGN §4.4) ---------------------------------------
-export const VERDICTS = new Set(["fixed", "dismissed", "open"]);
+// `unfixed` is CONFIRMED and not fixed: the applier's `blocked` survived the
+// lead's retry, or a design-risk fix the user did not rule on. `open` stays a
+// question for the user. Only `unfixed` keeps a review from converging.
+export const VERDICTS = new Set(["fixed", "dismissed", "open", "unfixed"]);
 const SEVERITIES = new Set(["blocker", "major", "minor"]);
 // The finder's `category` vocabulary (agents/self-review-finder.md), mapped to
 // the kind of file it is about. Fixed on purpose: matching a past finding
@@ -66,6 +73,12 @@ const CLASS_KIND = new Map([
   ["cold-run", "code"],
 ]);
 const FIELDS = new Set(["verdict", "file", "line", "severity", "class", "angle", "summary", "mechanism", "proof", "prior_id"]);
+// Accepted and not stored. SKILL.md §2c gives every candidate an `id` (`r1-1`…)
+// as the lead's handle while merging and verifying one round; it names nothing
+// a later review could look up, and `priorId` is what identifies a finding
+// across reviews. Refusing it refused candidates written exactly as the skill
+// says to write them.
+const ROUND_ONLY = new Set(["id"]);
 // Optional on purpose: most findings have no prior line to cite, and a required
 // field is an invitation to fill it in with something. Eight hex, as `priorId`
 // makes them — a value in any other shape is a typo, and a typo that scored as
@@ -152,26 +165,20 @@ export function reviewFromWork(dir) {
  * memory file is keyed on: an alias accepted once is a second spelling in that
  * memory forever.
  */
-const HINTS = new Map([["title", "summary"], ["high", "major"], ["maintainability", "reuse"], ["category", "class"]]);
-
-function distance(a, b) {
-  if (Math.abs(a.length - b.length) > 2) return 3;
-  let previous = [...Array(b.length + 1).keys()];
-  for (let i = 1; i <= a.length; i += 1) {
-    const row = [i];
-    for (let j = 1; j <= b.length; j += 1) {
-      row[j] = Math.min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    previous = row;
-  }
-  return previous[b.length];
-}
+const HINTS = new Map([
+  ["title", "summary"], ["high", "major"], ["maintainability", "reuse"], ["category", "class"],
+  // The two most frequent refusals of 2026-09-28 → 10-14.
+  ["nit", "minor"], ["test-coverage", "verification"],
+  // The applier's status and the verifier's verdict, recorded as if they were
+  // the ledger's: what they mean in the ledger is `unfixed`.
+  ["blocked", "unfixed"], ["confirmed", "unfixed"], ["wontfix", "unfixed"],
+]);
 
 export function hintFor(value, vocabulary) {
   if (typeof value !== "string" || !value) return "";
   const fixed = HINTS.get(value.toLowerCase());
   if (fixed && vocabulary.includes(fixed)) return ` — did you mean ${fixed}?`;
-  const near = vocabulary.filter((word) => distance(value.toLowerCase(), word) <= 2);
+  const near = vocabulary.filter((word) => editDistance(value.toLowerCase(), word) <= 2);
   return near.length === 1 ? ` — did you mean ${near[0]}?` : "";
 }
 
@@ -198,7 +205,7 @@ export function toRecord(entry, position, { review, round, ts }) {
   }
   const fields = [...FIELDS];
   for (const key of Object.keys(entry)) {
-    if (!FIELDS.has(key)) report(`unknown field ${JSON.stringify(key)}${hintFor(key, fields) || ` — the schema is ${fields.join(", ")}`}`);
+    if (!FIELDS.has(key) && !ROUND_ONLY.has(key)) report(`unknown field ${JSON.stringify(key)}${hintFor(key, fields) || ` — the schema is ${fields.join(", ")}`}`);
   }
   const need = (key, vocabulary, value = entry[key]) => {
     if (vocabulary.includes(value)) return value;
@@ -522,9 +529,16 @@ const angleTokens = (angle) => angle.split("+").map((token) => token.trim()).fil
  * must not leave unread; a round that closed only minors, or only dismissed
  * things, earns nothing. A stall (`ESCALATE`) outranks a spent budget.
  *
+ * A round that fixed nothing is `CLEAN` before any of that is asked: W compares
+ * fixes, and with none there is nothing unreviewed to compare or cap. An empty
+ * round is clean only if its record step ran — `recorded` is the caller saying
+ * so (the CLI reads the receipt `record` leaves); without it the round is
+ * `UNRECORDED`, because a failed `record` leaves exactly the records a clean
+ * round does.
+ *
  * The oscillation check and the ledger's open items stay with the reader.
  */
-export function convergence(records, round, { budget = null } = {}) {
+export function convergence(records, round, { budget = null, recorded = true } = {}) {
   const rounds = new Map();
   for (const record of records) {
     // Records arrive vetted (`readRecords`). A caller that skipped it would
@@ -568,14 +582,51 @@ export function convergence(records, round, { budget = null } = {}) {
     (severity) => current.fixed.some((entry) => entry.severity === severity)) ?? null;
   const earned = budget !== null && round === budget && (tail === "blocker" || tail === "major");
   const spent = budget !== null && round >= budget && !earned;
-  const base = { round, w: current.w, angles: [...current.angles].sort(), shared, currentShared, previousShared, budget, tail, earned };
+  // A CONFIRMED defect left standing, anywhere in this review, until a later row
+  // cites it by `prior_id` — whatever that row's verdict. The citation is exact
+  // where file and summary are not: a fix moves the line `priorId` hashes.
+  // Review-wide, because the next round's finders read the ledger and are
+  // unlikely to refile it, and their silence would read as CLEAN.
+  const unfixed = records
+    .filter((record, index) => record.verdict === "unfixed"
+      && !records.slice(index + 1).some((later) => later.prior_id === priorId(record)))
+    .map(priorId);
+  const base = { round, w: current.w, angles: [...current.angles].sort(), shared, currentShared, previousShared, budget, tail, earned, unfixed };
   // A budget is a bound on cost, not a finding of health: when it runs out the
   // loop says so and names what it is leaving unread. `STOP` never means clean.
   const stop = (previousRound) => ({ ...base, previousRound, verdict: "STOP",
     reason: `round budget of ${budget} is spent${tail ? ` — round ${round}'s ${tail} fix ships unreviewed` : ""}` });
+  // W silent is not W satisfied: the round fixed something, so §3's "another
+  // round is mandatory" holds, and the reason has to say so — leads read the
+  // bare "nothing comparable" as a pass, or asked the user what to do.
+  const vacuous = (why) => (spent ? stop(previousRound ?? null) : { ...base, previousRound: previousRound ?? null, verdict: "CONTINUE",
+    reason: `${why} — neither a stall nor a pass: round ${round}'s fixes are unreviewed, so run round ${round + 1}` });
 
-  if (!previous) return spent ? stop(null) : { ...base, previousRound: null, verdict: "CONTINUE", reason: `round ${round} is the first change-round — nothing to compare` };
-  if (!shared.length) return spent ? stop(previousRound) : { ...base, previousRound, verdict: "CONTINUE", reason: `no angle ran in both round ${previousRound} and round ${round} — nothing comparable` };
+  // No record and no receipt is a record step that failed or never ran, which
+  // reads exactly like a clean round from the records alone. Calling it clean
+  // ends a loop on findings that were never written down.
+  if (!rounds.has(round) && !recorded) {
+    return { ...base, previousRound: previousRound ?? null, verdict: "UNRECORDED", reason: `round ${round} has no records and its record step never succeeded` };
+  }
+  // A known defect is not a convergence: it outranks CLEAN, an earned extension
+  // and W, and only ever ends the review — the retry belongs before `record`.
+  if (unfixed.length) {
+    return { ...base, earned: false, previousRound: previousRound ?? null, verdict: spent ? "STOP" : "ESCALATE",
+      reason: `${unfixed.length} CONFIRMED finding(s) left unfixed: [${unfixed.join(", ")}]` };
+  }
+  // SKILL §3's clean round: zero findings to fix, open and dismissed items not
+  // counted. It needs no comparison — and asking W anyway made an empty round
+  // "nothing comparable" (it ran no angle) and a dismissals-only round a stall
+  // ("0 did not drop below 0"). It outranks a spent budget: nothing it did
+  // ships unreviewed.
+  if (!current.fixed.length) {
+    const open = records.filter((record) => record.round === round && record.verdict === "open").length;
+    return { ...base, previousRound: previousRound ?? null, verdict: "CLEAN",
+      reason: `round ${round} fixed nothing — a clean round: converged (SKILL §4)${open ? `; report its ${open} open item${open === 1 ? "" : "s"}` : ""}` };
+  }
+  if (!previous) return vacuous(`round ${round} is the first change-round, so there is nothing to compare`);
+  if (!shared.length) return vacuous(`no angle ran in both round ${previousRound} and round ${round}, so W has nothing to compare`);
+  if (!currentShared && !previousShared) return vacuous(`neither round fixed anything on ${shared.join(", ")}, the angles both ran, so W has nothing to compare`);
   const dropped = currentShared < previousShared;
   // A stall outranks a spent budget: "the fixes stopped shrinking the problem"
   // is the thing the reader has to decide about, and it does not become less
@@ -588,6 +639,58 @@ export function convergence(records, round, { budget = null } = {}) {
       ? `W over ${shared.join(", ")}: ${currentShared} < ${previousShared}`
       : `W over ${shared.join(", ")}: ${currentShared} did not drop below ${previousShared}`,
   };
+}
+
+// The commands below are printed with this file's own path, so they run as
+// printed wherever the plugin is installed.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// Quoted only when the shell would split or expand the word. A leading
+// `<placeholder>` is left bare: it is there to be replaced, not run.
+const shellWord = (word) => (/^(?:<[\w|]+>)?[\w@%+=:,./-]*$/.test(word) ? word : `'${word.replace(/'/g, "'\\''")}'`);
+
+/**
+ * The exact call that acts on a verdict, as `next: …` plus any line the lead
+ * needs to read before running it. The verdict used to reach the lead at the
+ * top of the NEXT round, so the final round's was never computed — 104
+ * converged reviews ended on CONTINUE — and a STOP was answered by spawning a
+ * finder, because nothing said what the honest end of a capped review is.
+ *
+ * First match wins: a clean round converges whatever else is true (its finders
+ * read the final state); an earned extension outranks STOP and ESCALATE; STOP
+ * and ESCALATE both end `--not-converged`, ESCALATE with the user asked.
+ * `counts` are this review's records across all its rounds. `--intent` is left
+ * for the lead: whether the ticket was validated is stored nowhere this reads.
+ */
+export function nextAction(result, counts, { work = null, review = null, tier = null, scripts = HERE } = {}) {
+  const { round, verdict } = result;
+  const dir = work ?? "<work>";
+  const identity = !work && review ? `--review ${shellWord(review)}` : `--work ${shellWord(dir)}`;
+  const script = (name) => shellWord(path.join(scripts, name));
+  const nextRound = [script("round.sh"), "--work", shellWord(dir), "--round", round + 1, "--intent", shellWord(path.join(dir, "intent.md"))].join(" ");
+  const marker = (outcome) => [script("converged.sh"), outcome, "--rounds", counts.rounds, "--fixed", counts.fixed,
+    "--dismissed", counts.dismissed, "--open", counts.open, "--tier", tier === null || tier === undefined ? "<S|M|L>" : shellWord(tier), "--intent", "<validated|author|skipped>"].join(" ");
+  if (verdict === "UNRECORDED") {
+    return `next: ${script("findings.mjs")} record ${identity} --round ${round} --in <findings.json>\n`
+      + "  `[]` if it had nothing to record; record then prints the round's verdict and the call after it";
+  }
+  if (verdict === "CLEAN") return `next: ${marker("--converged")}`;
+  const unfixed = result.unfixed ?? [];
+  const leaves = `round ${round} leaves ${unfixed.length} CONFIRMED finding(s) unfixed [${unfixed.join(", ")}]`;
+  if (verdict === "ESCALATE" && unfixed.length) {
+    return `next: ${marker("--not-converged")}\n  ${leaves}: put each to the user with your recommendation.\n`
+      + `  If they rule on a fix, apply it, then: ${script("findings.mjs")} record ${identity} --round ${round} with prior_id <id> on the fixed row, and run ${nextRound}.\n`
+      + "  A defect they accept as-is is not a convergence: the marker above is the end.";
+  }
+  if (result.earned) return `next: ${nextRound} --force S --reason "extension round: round ${round} fixed a ${result.tail}"`;
+  if (verdict === "STOP") {
+    return `next: ${marker("--not-converged")}\n  round ${round}'s fixes ship unreviewed: list them in the report. `
+      + "This is the correct end of a capped review; a new review to turn it into converged is not."
+      + (unfixed.length ? `\n  ${leaves}: list them in the report.` : "");
+  }
+  if (verdict === "ESCALATE") {
+    return `next: ${marker("--not-converged")}\n  put the stall to the user; if they say continue, run ${nextRound} as usual.`;
+  }
+  return `next: ${nextRound}`;
 }
 
 /**
@@ -611,6 +714,8 @@ export function logConvergence(result, { review, cwd = process.cwd(), logDir = L
     ts: now(), kind: "converge", cwd, review,
     round: result.round, budget: result.budget, verdict: result.verdict,
     earned: result.earned, tail: result.tail, w: result.w,
+    // What tells a known-defect ESCALATE from a stalled-W one in the audit.
+    unfixed: result.unfixed ?? [],
   };
   try {
     mkdirSync(logDir, { recursive: true });
@@ -633,6 +738,92 @@ const FLAGS = {
   engagement: ["work", "review", "round", "repo", "log-dir"],
 };
 
+// The interface used to be learned by failing: `--help` was refused as "pass a
+// command", 45 times in 18 sessions, and every refusal sent the caller grepping
+// this file for the schema it could have printed.
+const USAGE = {
+  record: "findings.mjs record (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--in <file|->] [--log-dir <dir>]\n"
+    + "  this round's verdicts, a JSON array or one object per line, on stdin or --in; `[]` records a round with nothing to record;\n"
+    + "  with --work it then prints the round's verdict and `next:`, the call that acts on it",
+  prior: "findings.mjs prior --scope <scope.diff> (--work <dir> | --review <id> [--repo <dir>]) [--out prior.md] [--max N] [--log-dir <dir>]\n"
+    + "  the past findings that touch this change, one line each, for brief.mjs --prior",
+  converge: "findings.mjs converge (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--budget N] [--log-dir <dir>]\n"
+    + "  each round's W, one verdict — CLEAN, CONTINUE, ESCALATE, STOP or UNRECORDED (SKILL §3) — and `next:`, the call that acts on it",
+  engagement: "findings.mjs engagement (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--log-dir <dir>]\n"
+    + "  opens the round's tree-guard engagement log (round.sh runs it)",
+};
+const RECORD_HELP = [
+  `schema: ${SCHEMA_LINE}`,
+  "  required: verdict, severity, class, file, summary; a dismissal also needs proof",
+  "  angle     free text: the finder's angle as the round's plan names it — one (A, S, X, compact) or a merged group joined by + (A+B+D)",
+  "  line      a positive integer, or null",
+  "  file, summary, mechanism, proof — one line each",
+  "  prior_id  the eight hex characters of the prior.md line it re-raises, brackets optional",
+  "  id        the candidate's id in this round (r1-1); accepted, not stored",
+].join("\n");
+const helpFor = (command) => (command
+  ? [`usage: ${USAGE[command]}`, ...(command === "record" ? [RECORD_HELP] : [])]
+  : ["usage:", ...Object.values(USAGE).map((line) => `  ${line.replace(/\n/g, "\n  ")}`),
+    "  --review <id> stands in for --work when a caller has no work dir", RECORD_HELP]).join("\n");
+const asksForHelp = (arg) => arg === "--help" || arg === "-h";
+
+// Where `record` says it ran for a round. An empty round leaves no row in the
+// memory file, and neither does a `record` that failed or never ran; only this
+// lets `converge` tell a clean round from a forgotten one.
+const receiptFile = (work, round) => path.join(work, `round-${round}`, "recorded.json");
+function receiptRounds(work) {
+  let names;
+  try {
+    names = readdirSync(work);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw fail(`cannot list the work dir ${work} (${error.message})`);
+  }
+  return names.map((name) => /^round-(\d+)$/.exec(name)?.[1]).filter(Boolean).map(Number)
+    .filter((round) => existsSync(receiptFile(work, round)));
+}
+
+/**
+ * One round's verdict, as `converge` and `record --work` both state it.
+ *
+ * The round cap already exists: `tier.mjs` computed it and wrote it into this
+ * round's `tier.json` as `roundsCap`. Requiring it to be retyped as a flag
+ * meant that forgetting the flag silently turned the cap off — the verdict then
+ * answered on `W` alone and reported nothing about a spent budget, which is the
+ * one bound on cost the loop has. Read it instead; an explicit `--budget` still
+ * wins, so forcing a cap stays possible. The same plan names the tier the
+ * marker in `next:` carries.
+ */
+function judge(mine, round, { work, review, budget }) {
+  let plan = {};
+  if (work) {
+    try { plan = JSON.parse(readFileSync(path.join(work, `round-${round}`, "tier.json"), "utf8")) ?? {}; } catch { /* no plan for this round: the cap is genuinely unknown, and converge says so */ }
+  }
+  let budgetFrom = budget === null ? "" : " (given)";
+  if (budget === null && Number.isInteger(plan.roundsCap) && plan.roundsCap >= 1) {
+    budget = plan.roundsCap;
+    budgetFrom = ` (round ${round}'s tier.json)`;
+  }
+  // `--review` callers have no work dir to hold a receipt, so for them a round
+  // is recorded when the review has a row in it or an earlier round. Nothing in
+  // the plugin calls `converge --review`, so this fails closed: a review with
+  // nothing on record cannot be told apart from a typo, and a typo is not CLEAN.
+  const recorded = work ? existsSync(receiptFile(work, round)) : mine.some((record) => record.round <= round);
+  const result = convergence(mine, round, { budget, recorded });
+  // `--open` in the marker stays the count of questions; `unfixed` is counted
+  // so it cannot turn its own slot into a NaN.
+  const counts = { rounds: round, fixed: 0, dismissed: 0, open: 0, unfixed: 0 };
+  for (const record of mine) counts[record.verdict] += 1;
+  // The marker's tier is the review's, which round 1 planned; a later round
+  // forced to S for an extension does not relabel the review.
+  let first = plan;
+  if (work && round !== 1) {
+    try { first = JSON.parse(readFileSync(path.join(work, "round-1", "tier.json"), "utf8")) ?? {}; } catch { first = {}; }
+  }
+  const tier = typeof first.tier === "string" && first.tier ? first.tier : null;
+  return { result, budget, budgetFrom, next: nextAction(result, counts, { work, review, tier }) };
+}
+
 // Rows the memory file holds but no reader can use. Said on stderr, never
 // fatal, and always with the count: "remembered 4 findings" reads the same
 // whether the file held 4 or 40, and only this line tells them apart.
@@ -644,12 +835,13 @@ function warnUnusable(skipped, malformed, where = "") {
 
 const camel = (flag) => flag.replace(/-(.)/g, (_, char) => char.toUpperCase());
 
-function parseArgs(argv, allowed) {
+function parseArgs(argv, command) {
+  const allowed = FLAGS[command];
   const options = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const [name, inline] = arg.startsWith("--") ? arg.slice(2).split(/=(.*)/s) : [null, null];
-    if (!name || !allowed.includes(name)) throw usage(`unknown argument ${arg}`);
+    if (!name || !allowed.includes(name)) throw usage(`unknown argument ${arg} — ${command} takes ${allowed.map((flag) => `--${flag}`).join(", ")}`);
     const value = inline ?? argv[++i];
     if (value === undefined) throw usage(`--${name} needs a value`);
     options[camel(name)] = value;
@@ -671,15 +863,26 @@ const tally = (records) =>
 
 export function main(argv, { log = console.log, stdin } = {}) {
   const [command, ...rest] = argv;
-  if (!command || !Object.hasOwn(FLAGS, command)) {
-    throw usage(`pass a command: record, prior, converge or engagement${command ? ` (not ${command})` : ""}`);
+  if (command === "help" || asksForHelp(command)) {
+    log(helpFor(null));
+    return { help: true };
   }
-  const options = parseArgs(rest, FLAGS[command]);
+  if (!command || !Object.hasOwn(FLAGS, command)) {
+    throw usage(`pass a command: record, prior, converge or engagement${command ? ` (not ${command})` : ""}; --help for the usage`);
+  }
+  if (rest.some(asksForHelp)) {
+    log(helpFor(command));
+    return { help: true };
+  }
+  const options = parseArgs(rest, command);
   // One way to say it per call: two spellings of one identity is what this
   // flag's own history is made of.
   if (options.work && options.review) throw usage("pass --work or --review, not both");
+  // A review has one repository, read from its own scope: an override that
+  // still parses would become the new way to key it on the wrong one.
+  if (options.work && options.repo) throw usage("pass --work or --repo, not both: a review dir's repository is its round-1 scope's");
   const review = options.work ? reviewFromWork(options.work) : reviewId(options.review);
-  const repoRoot = options.repo ? path.resolve(options.repo) : gitRoot();
+  const repoRoot = options.work ? workRepo(options.work) : options.repo ? path.resolve(options.repo) : gitRoot();
   const logDir = options.logDir ? path.resolve(options.logDir) : LOG_DIR;
 
   if (command === "record") {
@@ -692,9 +895,30 @@ export function main(argv, { log = console.log, stdin } = {}) {
       throw fail(`cannot parse the findings (${error.message})`);
     }
     const round = Number(options.round ?? 1);
+    // A round round.sh never planned is a typo, not a round: recording it
+    // would invent a round dir and a receipt converge then believes.
+    if (options.work && Number.isInteger(round) && round >= 1) {
+      const plan = path.join(options.work, `round-${round}`, "tier.json");
+      if (!existsSync(plan)) throw usage(`no plan at ${plan} — round ${round} was never planned; round.sh writes it`);
+    }
     const result = recordFindings(entries, { review, round, rawRound: options.round, repoRoot, logDir });
+    // After the records, never before: a receipt for a write that failed is
+    // the forgotten round dressed as a clean one.
+    if (options.work) {
+      const receipt = receiptFile(options.work, round);
+      writeFileSync(receipt, `${JSON.stringify({ review, round, count: result.count, ts: new Date().toISOString() })}\n`);
+    }
     const counts = tally(result.records);
     log(`# ${result.count} finding${result.count === 1 ? "" : "s"} recorded${counts ? ` (${counts})` : ""} → ${result.file}`);
+    // Recording is the last act of a round, so the verdict on it is due now —
+    // not at the top of a round the verdict may say not to run.
+    if (options.work) {
+      const { records, skipped, malformed } = readRecords(result.file);
+      warnUnusable(skipped, malformed);
+      const verdict = judge(records.filter((record) => record.review === review), round, { work: options.work, budget: null });
+      log(`${verdict.result.verdict} — ${verdict.result.reason}`);
+      log(verdict.next);
+    }
     return result;
   }
 
@@ -710,25 +934,13 @@ export function main(argv, { log = console.log, stdin } = {}) {
     const { records, skipped, malformed } = readRecords(findingsFile(repoRoot, { logDir }));
     warnUnusable(skipped, malformed);
     const mine = records.filter((record) => record.review === review);
-    const rounds = mine.map((record) => record.round);
+    // A clean round has a receipt and no rows, and it is the newest round.
+    const rounds = [...mine.map((record) => record.round), ...(options.work ? receiptRounds(options.work) : [])];
     const round = Number(options.round ?? (rounds.length ? Math.max(...rounds) : 1));
     if (!Number.isInteger(round) || round < 1) throw usage(`--round needs a positive integer, not ${JSON.stringify(options.round)}`);
-    let budget = options.budget === undefined ? null : Number(options.budget);
-    if (budget !== null && (!Number.isInteger(budget) || budget < 1)) throw usage(`--budget needs a positive integer, not ${JSON.stringify(options.budget)}`);
-    // The round cap already exists: `tier.mjs` computed it and wrote it into
-    // this round's `tier.json` as `roundsCap`. Requiring it to be retyped as a
-    // flag meant that forgetting the flag silently turned the cap off — the
-    // verdict then answered on `W` alone and reported nothing about a spent
-    // budget, which is the one bound on cost the loop has. Read it instead;
-    // an explicit `--budget` still wins, so forcing a cap stays possible.
-    let budgetFrom = budget === null ? "" : " (given)";
-    if (budget === null && options.work) {
-      try {
-        const cap = JSON.parse(readFileSync(path.join(options.work, `round-${round}`, "tier.json"), "utf8")).roundsCap;
-        if (Number.isInteger(cap) && cap >= 1) { budget = cap; budgetFrom = ` (round ${round}'s tier.json)`; }
-      } catch { /* no plan for this round: the cap is genuinely unknown, and the line below says so */ }
-    }
-    const result = convergence(mine, round, { budget });
+    const given = options.budget === undefined ? null : Number(options.budget);
+    if (given !== null && (!Number.isInteger(given) || given < 1)) throw usage(`--budget needs a positive integer, not ${JSON.stringify(options.budget)}`);
+    const { result, budget, budgetFrom, next } = judge(mine, round, { work: options.work, review: options.review, budget: given });
     logConvergence(result, { review, logDir });
     for (const n of [result.previousRound, round].filter((n) => n !== null)) {
       const at = convergence(mine, n);
@@ -737,6 +949,7 @@ export function main(argv, { log = console.log, stdin } = {}) {
     if (result.earned) log(`# round ${round} closed a ${result.tail}: one more round, then the budget is spent whatever it finds`);
     log(`${result.verdict} — ${result.reason}`);
     log(`# the W rule and the round budget${budget === null ? " (none found: W only)" : budgetFrom}; the oscillation check and the ledger's open items stay with you (SKILL §3)`);
+    log(next);
     // Did the guard that protects the author's tree actually watch this round?
     // Silence here used to be indistinguishable from "watching nothing".
     let engagement = "";

@@ -27,20 +27,41 @@
 //
 // Exit 0 every reviewer settled (collect now) · 1 call ceiling reached with
 // budget left (call it again, immediately) · 3 the round's wait budget is spent
-// (treat the still-active ones as dead) · 2 usage, a budget already spent, or no
-// transcripts to watch, which is the one case where ending the turn is still the
-// way to wait.
+// (treat the still-active ones as dead) · 2 usage, a budget already spent, a
+// name with no transcript while every other reviewer settled (a wrong name: the
+// table says which transcripts are close), or no transcripts to watch, which is
+// the one case where ending the turn is still the way to wait.
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { isMain, loadConfig } from "../hooks/lib/config.mjs";
-import { agentStatus, findAgentFiles, readAgent, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
+import { LOG_DIR, isMain, loadConfig } from "../hooks/lib/config.mjs";
+import { agentNameOf, agentStatus, findAgentFiles, readAgent, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
+import { reviewName, reviewNumber } from "./brief.mjs";
+import { editDistance } from "./lib/edit-distance.mjs";
 import { gitRoot } from "./lib/repo.mjs";
+import { ROLE, logReviewRow, roleOf, tally } from "./lib/review-log.mjs";
 
 const POLL_MS = 5000;
+// Polls are POLL_MS apart while this process runs, so a gap far wider than that
+// is time the process did not run at all: the host was asleep. A suspended
+// laptop stops the reviewers in the same window, and counting that window as
+// their silence declared a whole round dead with "0m of budget left" — and the
+// lead then salvaged and re-spawned finders that went on to finish (a 4h23m
+// review). Slept time therefore counts toward neither the stale limit nor the
+// budget.
+const SLEEP_GAP_MS = 60_000;
+// A name with no transcript, while every other reviewer has settled, is a
+// wrong name rather than a slow start: a spawned agent writes its first line
+// within seconds. This is that "seconds", with room; past it the wait stops
+// instead of sitting out the stale limit (660s, longer than one call) on a
+// name nothing will ever write under.
+const NO_TRANSCRIPT_GRACE_MS = 60_000;
 // A wait that can return in seconds is a wait the lead will call in a loop, and
 // a loop of calls is the turn-per-check cost this script exists to remove. So
 // while anything is still working, no call returns sooner than this.
 const MIN_CALL_MS = 120_000;
+// How a wait ended, as the durable log spells it. Exit 1 is absent: the wait
+// has not ended, the caller is told to call again.
+const ENDED = { 0: "settled", 2: "unknown-name", 3: "budget-spent" };
 
 const usage = (message) => Object.assign(new Error(message), { exitCode: 2 });
 
@@ -112,8 +133,14 @@ export function makeReader() {
   };
 }
 
+// The host's sleep that lies after `fromMs`: a reviewer's silence is measured
+// on the wall clock, less only the time the host slept since it last wrote.
+const sleptAfter = (sleeps, fromMs) =>
+  sleeps.reduce((sum, { from, to }) => sum + Math.max(0, to - Math.max(from, fromMs)), 0);
+
 // One row per reviewer: what the transcripts say right now.
-export function poll({ names, dir, since, roundDir, now, config, waitStartMs, read }) {
+export function poll({ names, dir, since, roundDir, now, config, waitStartMs, read, sleeps = [] }) {
+  const quietNow = (fromMs) => now - sleptAfter(sleeps, fromMs);
   return names.map((name) => {
     const agent = findAgentFiles(dir, name, since)
       .map(read)
@@ -128,7 +155,7 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
       // Never started. Silence before the first message is silence all the
       // same, timed from when this wait began rather than from a file that
       // does not exist.
-      const quiet = now - waitStartMs;
+      const quiet = quietNow(waitStartMs) - waitStartMs;
       return {
         name, stateLines, calls: 0, lastAt: "—",
         status: quiet > config.staleSeconds * 1000 ? "dead" : "active",
@@ -136,8 +163,8 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
       };
     }
     return {
-      name, stateLines, calls: agent.calls, lastAt: agent.lastAt,
-      status: agentStatus(agent, now, config),
+      name, stateLines, calls: agent.calls, lastAt: agent.lastAt, matched: agent.name,
+      status: agentStatus(agent, quietNow(agent.mtimeMs), config),
       // The row carries the error itself, because which KIND it is decides the
       // remedy and only the transcript knows: a nudge resumes a dropped
       // connection and merely spends another refusal against a quota limit.
@@ -172,10 +199,25 @@ export function render(rows, verdict, extra = [], sessionId = undefined) {
 // A file named after a row of this round's plan is not an earlier attempt: it
 // is a finder that writes under its row's name while it was spawned under
 // another, so the lead is waiting on a name the state file does not carry.
+//
+// Only the stage being waited on is looked at. The finders' state files stay
+// in round-N/state/ while the lead waits on the verifier and then the applier,
+// and reading them there named every finder as "spawned under another name" or
+// "an earlier attempt" on one wait call in six (145 of 910).
+const stageOf = (name) => {
+  const role = ROLE.exec(name)?.[1] ?? null;
+  return role === "cold-grader" ? "finder" : role;
+};
+
 export function orphanAdvice(rows, stateDir, files, planned = []) {
   const waited = new Set(rows.map((r) => r.name));
+  const stages = new Set(rows.map((r) => stageOf(r.name)));
   const unwaited = files
-    .filter((f) => f.endsWith(".jsonl") && !waited.has(f.slice(0, -".jsonl".length)))
+    .filter((f) => {
+      if (!f.endsWith(".jsonl")) return false;
+      const name = f.slice(0, -".jsonl".length);
+      return !waited.has(name) && stages.has(stageOf(name));
+    })
     .sort();
   const rowNames = new Set(planned);
   const misnamed = unwaited.filter((f) => rowNames.has(f.slice(0, -".jsonl".length)));
@@ -206,12 +248,43 @@ function earlierAttempts(stateDir, orphans) {
   ];
 }
 
-const plannedNames = (roundDir) => {
+// The plan's names as brief.mjs printed them: tier.json holds them without the
+// review number, the briefs and state files with it.
+const plannedNames = (roundDir, review) => {
   try {
-    return JSON.parse(readFileSync(path.join(roundDir, "tier.json"), "utf8")).finders.map((row) => row.name);
+    return JSON.parse(readFileSync(path.join(roundDir, "tier.json"), "utf8")).finders
+      .map((row) => reviewName(row.name, row.agent, review));
   } catch {
     return [];
   }
+};
+
+// The names of this round's transcripts that no waited row was matched to —
+// where the agent a wrong name meant to find is, if it ran at all.
+function unclaimedNames(dir, since, rows) {
+  const claimed = new Set(rows.map((r) => r.matched).filter(Boolean));
+  let files = [];
+  try { files = readdirSync(dir); } catch { return []; }
+  return [...new Set(files
+    .filter((f) => f.startsWith("agent-a") && f.endsWith(".jsonl") && mtimeOr(path.join(dir, f), 0) >= since)
+    .map((f) => agentNameOf(path.join(dir, f)))
+    .filter((name) => name && !claimed.has(name)))].sort();
+}
+
+// The two wrong names measured in the field: the base name where the harness
+// had suffixed it (`X` for `X-3`), and several names joined into one shell
+// word. Both are a substring relation; a typo is the edit distance.
+export function nearMatches(name, candidates) {
+  const base = (n) => n.replace(/-\d+$/, "");
+  return candidates
+    .filter((c) => c.includes(name) || name.includes(c) || base(c) === base(name) || editDistance(c, name) <= 2)
+    .slice(0, 3);
+}
+
+// Rows with no transcript at all while every row that has one has settled.
+const missingWhileSettled = (rows) => {
+  const missing = rows.filter((r) => r.status === "active" && r.note === "no transcript");
+  return missing.length && rows.every((r) => missing.includes(r) || r.status !== "active") ? missing : [];
 };
 
 // A dead reviewer's remedy is a command, and SKILL.md §2f tells the lead the
@@ -252,11 +325,18 @@ export function stallAdvice(rows) {
 
 const count = (rows, status) => rows.filter((r) => r.status === status).length;
 
+const USAGE = "usage: wait.mjs --work <dir> --round N [--session <id>] [name…]";
+
 export async function main(argv, {
   log = (line) => process.stdout.write(`${line}\n`),
   now = Date.now,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  logDir = LOG_DIR,
 } = {}) {
+  if (argv.some((a) => a === "--help" || a === "-h")) {
+    log(USAGE);
+    return 0;
+  }
   const options = parseArgs(argv);
   if (!options.work) throw usage("--work is required");
   const round = Number(options.round);
@@ -311,55 +391,101 @@ export async function main(argv, {
   }
   const waitStartMs = Date.parse(state.startedAt);
   const budgetEndsMs = waitStartMs + config.budgetMinutes * 60_000;
+  // The budget reads `awake()`, wall time minus the time the host slept during
+  // this wait. Staleness reads the wall clock less only the sleep after each
+  // agent's last write, because transcript mtimes are wall-clock: subtracting
+  // all of it understated the quiet of an agent silent since the wake. The call
+  // ceiling, which guards the Bash tool's own timeout, reads the wall clock.
+  let slept = Number(state.sleptMs) || 0;
+  const sleeps = Array.isArray(state.sleeps) ? state.sleeps : [];
+  const awake = () => now() - slept;
+  const budgetLeft = () => `${Math.max(0, Math.round((budgetEndsMs - awake()) / 60_000))}m of budget left`;
 
   const callStartMs = now();
   const callEndsMs = callStartMs + config.callSeconds * 1000;
-  log(`# wait round ${round} · ${names.length} agent${names.length === 1 ? "" : "s"} · call ${state.calls} · ` +
-    `${Math.max(0, Math.round((budgetEndsMs - callStartMs) / 60_000))}m of budget left`);
+  log(`# wait round ${round} · ${names.length} agent${names.length === 1 ? "" : "s"} · call ${state.calls} · ${budgetLeft()}`);
 
   const read = makeReader();
-  const snapshot = () => poll({ names, dir, since, roundDir, now: now(), config, waitStartMs, read });
+  const snapshot = () => poll({ names, dir, since, roundDir, now: now(), config, waitStartMs, read, sleeps });
   // A missing state directory is the normal case in a round where nobody has
   // filed yet, so it reads as "no orphans" rather than as an error.
   const stateDir = path.join(roundDir, "state");
   const orphans = () => {
     let files = [];
     try { files = readdirSync(stateDir); } catch { return []; }
-    return orphanAdvice(rows, stateDir, files, plannedNames(roundDir));
+    return orphanAdvice(rows, stateDir, files, plannedNames(roundDir, reviewNumber(workDir)));
   };
+  const sleptNote = () => slept > 0
+    ? [`# the host was asleep for ${Math.max(1, Math.round(slept / 60_000))}m of this wait — not counted toward the stale limit or the budget`]
+    : [];
   let rows = snapshot();
   // The table is worth printing even when the tool timeout, not this script,
   // ends the call — otherwise a wait that ran too long tells the lead nothing.
   const onSignal = () => {
-    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`, orphans(), sessionId));
+    log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`, [...sleptNote(), ...orphans()], sessionId));
     process.exit(1);
   };
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
 
   let exitCode = 0;
+  let lastPollMs = callStartMs;
+  let missingSinceMs = null;
   try {
     for (;;) {
-      rows = snapshot();
       const at = now();
+      if (at - lastPollMs > SLEEP_GAP_MS) {
+        // Recorded at once: a call the Bash timeout kills on wake must not
+        // hand the next call a clock with the sleep back in it.
+        slept += at - lastPollMs - POLL_MS;
+        sleeps.push({ from: lastPollMs, to: at - POLL_MS });
+        state.sleptMs = slept;
+        state.sleeps = sleeps;
+        writeFileSync(waitFile, `${JSON.stringify(state, null, 2)}\n`);
+      }
+      lastPollMs = at;
+      rows = snapshot();
+      const missing = missingWhileSettled(rows);
+      missingSinceMs = missing.length ? (missingSinceMs ?? awake()) : null;
+      if (missing.length && awake() - missingSinceMs >= NO_TRANSCRIPT_GRACE_MS) {
+        const others = unclaimedNames(dir, since, rows);
+        rows = rows.map((r) => {
+          if (!missing.includes(r)) return r;
+          const near = nearMatches(r.name, others);
+          return { ...r, status: "unknown", note: near.length ? `no transcript — did you mean ${near.join(" or ")}?` : "no transcript under this or any similar name this round" };
+        });
+        exitCode = 2;
+        break;
+      }
       if (count(rows, "active") === 0) { exitCode = 0; break; }
-      if (at >= budgetEndsMs) { exitCode = 3; break; }
+      if (awake() >= budgetEndsMs) { exitCode = 3; break; }
       if (at >= callEndsMs && at - callStartMs >= MIN_CALL_MS) { exitCode = 1; break; }
       await sleep(POLL_MS);
     }
 
-    if (exitCode === 3) {
-      state.spent = true;
+    // The wait's final state, and one numbers-only row of it in the durable
+    // log: wait.json goes with the scratchpad, and how long a round's
+    // reviewers took is a fact the metrics need after it has gone.
+    if (exitCode !== 1) {
+      if (exitCode === 3) state.spent = true;
+      state.ended = ENDED[exitCode];
+      state.waitedMs = Math.max(0, Math.round(awake() - waitStartMs));
       writeFileSync(waitFile, `${JSON.stringify(state, null, 2)}\n`);
+      logReviewRow("wait", {
+        round, ended: state.ended, calls: state.calls, waitedMs: state.waitedMs, sleptMs: slept,
+        roles: tally(names.map(roleOf)), statuses: tally(rows.map((r) => r.status)),
+      }, { work: workDir, script: "wait.mjs", logDir });
     }
 
     const active = count(rows, "active");
     const verdict = {
       0: `# settled — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead. Collect the finished reports (§2c); a dead one goes to §2f.`,
-      1: `# ${active} still active, ${Math.max(0, Math.round((budgetEndsMs - now()) / 60_000))}m of budget left — call wait.mjs again as the very next tool call.`,
+      1: `# ${active} still active, ${budgetLeft()} — call wait.mjs again as the very next tool call.`,
+      2: `# ${count(rows, "unknown")} name${count(rows, "unknown") === 1 ? " has" : "s have"} no transcript while every other reviewer settled — a wrong name, not a slow agent. ` +
+        "Call wait.mjs again with the name the Agent launch result shows.",
       3: `# budget spent after ${config.budgetMinutes}m — treat the ${active} still active as dead (§2f).`,
     }[exitCode];
-    log(render(rows, verdict, orphans(), sessionId));
+    log(render(rows, verdict, [...sleptNote(), ...orphans()], sessionId));
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);

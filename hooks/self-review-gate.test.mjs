@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir, userInfo } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -116,7 +116,7 @@ function run(entries, { env = {}, payload = {}, gate = GATE, subagents = {} } = 
     env: childEnv, encoding: "utf8",
   });
   assert.equal(res.status, 0, `gate must exit 0, stderr: ${res.stderr}`);
-  return { stdout: res.stdout.trim(), json: res.stdout.trim() ? JSON.parse(res.stdout) : null, stderr: res.stderr };
+  return { stdout: res.stdout.trim(), json: res.stdout.trim() ? JSON.parse(res.stdout) : null, stderr: res.stderr, log: childEnv.SELF_REVIEW_LOG_DIR };
 }
 
 const turn = (...body) => [human("do the thing"), ...body, said("done")];
@@ -822,6 +822,27 @@ test("a finder completing between the last change and the marker releases the tu
   assert.equal(r.stdout, "");
 });
 
+// A lead that wrote `converged` after `converge` said STOP was told to spawn a
+// finder before it was told the honest end — so the honest end goes first
+// (after-STOP ruling). The gate's behaviour does not change, only the order.
+test("the none and stale refusals name --not-converged after STOP before they say to launch a finder", () => {
+  const none = run(turn(...write(`${PROJECT}/src/a.ts`), ...marker()));
+  const stale = run([human("go"), ...reviewed(), ...write(`${PROJECT}/src/a.ts`), ...marker(), said("done")]);
+  for (const [label, r] of [["none", none], ["stale", stale]]) {
+    assert.ok(blocks(r), label);
+    const stop = r.json.reason.indexOf("If converge said STOP, the budget is spent and the honest marker is `--not-converged` with your counts — not another finder.");
+    assert.ok(stop !== -1, `${label}: ${r.json.reason}`);
+    assert.ok(stop < r.json.reason.indexOf("launch one self-review-finder"), `${label}: STOP comes first`);
+  }
+});
+
+test("a converged marker with open items and a finder after the last change is still accepted", () => {
+  // `open` counts questions put to the user; gating on a number the model types
+  // would teach it to type 0.
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker({ ...CONVERGED_RECORD, rounds: 2, open: 2 })));
+  assert.equal(r.stdout, "", r.json?.reason);
+});
+
 test("the cold-run grader counts as a reviewer too", () => {
   const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`),
     ...launch("x1", "self-review:self-review-cold-grader"), notification("x1"), ...marker(), said("done")]);
@@ -914,6 +935,16 @@ test("a reviewer whose transcript finished before the marker is not late because
   const tail = [...bash("wait.mjs --work w --round 1", "rvRead  finished"), ...marker(), notification("rvRead"), said("done")];
   const r = run([...head, ...tail], { subagents: { "agent-rvRead.jsonl": [finished] } });
   assert.equal(r.json, null, JSON.stringify(r.json));
+});
+
+test("a report with no stop_reason and a fresh transcript is not final yet; with end_turn it is", () => {
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("rvSettle"), said("reading its report")];
+  const report = subagentReport();
+  const unsettled = { ...report, message: { ...report.message, stop_reason: null } };
+  const tail = [...bash("wait.mjs --work w --round 1", "rvSettle  finished"), ...marker(), notification("rvSettle"), said("done")];
+  const early = run([...head, ...tail], { subagents: { "agent-rvSettle.jsonl": [unsettled] } });
+  assert.match(early.json?.reason ?? "", /only AFTER the marker was written/, "its tool_use may still follow the text");
+  assert.equal(run([...head, ...tail], { subagents: { "agent-rvSettle.jsonl": [report] } }).json, null);
 });
 
 test("a reviewer whose transcript finished only after the marker is still late", () => {
@@ -1080,6 +1111,36 @@ test("a converged marker written while the applier is still running releases rat
   const r = run(turn(...write(`${PROJECT}/a.ts`), ...reviewed(), ...applier("ap1"), ...marker()));
   assert.ok(!blocks(r));
   assert.match(r.json.systemMessage, /editing subagent is still running/);
+});
+
+// The applier's completion notice is as late-prone as a reviewer's, and its
+// absence used to be final: a notice-less applier read "applying" at every Stop,
+// and that branch released without consulting the transcript — 161 field
+// releases, 158 of them with the applier's own transcript ended 10–16 minutes
+// before. Its transcript is the evidence, as it already is for reviewers.
+test("an applier whose transcript finished before the marker is judged finished, not still running", () => {
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...applier("apT"), said("applying")];
+  const finished = subagentReport();
+  const subagents = { "agent-apT.jsonl": [finished] };
+  const reviewedAfter = run([...head, said("applier reported"), ...reviewed(), ...marker(), said("done")], { subagents });
+  assert.equal(reviewedAfter.json, null, JSON.stringify(reviewedAfter.json));
+  const unreviewed = [...head, said("applier reported"), ...marker(), said("done")];
+  const r = run(unreviewed, { subagents });
+  assert.ok(blocks(r), "the only finder completed before the applier's edits were a fixed set");
+  assert.match(r.json.reason, /claims a review ran/);
+  // Without the transcript the notices are all there is, and they say running.
+  assert.match(run(unreviewed).json.systemMessage, /editing subagent is still running/);
+});
+
+test("an applier whose transcript finished only after the marker asks for a review, not another release", () => {
+  // The follow-up the release promises — "the next Stop sees a finished
+  // applier" — needs a notice when only the notices are read. Without one, every
+  // later Stop released again and the marker stood unchecked.
+  const head = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...applier("apL"), ...marker(), said("waiting")];
+  const finished = subagentReport();
+  const r = run([...head, human("is it done?"), said("checking")], { subagents: { "agent-apL.jsonl": [finished] } });
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /claims a review ran/);
 });
 
 test("the applier's arm survives a human interjection — the turn is the wrong frame for it", () => {
@@ -1410,6 +1471,9 @@ test("a wrong-shaped user config (null or mistyped keys) is ignored per key with
 test("a missing or corrupt config/defaults.json does not crash the hook: everything is gated and stderr says why", () => {
   const root = mkdtempSync(path.join(tmpdir(), "srplug-"));
   cpSync(path.join(PLUGIN_ROOT, "hooks"), path.join(root, "hooks"), { recursive: true });
+  // The gate takes its glob dialect from scripts/lib, so the copy carries that
+  // too: what this test removes is config/, not the rest of the install.
+  cpSync(path.join(PLUGIN_ROOT, "scripts/lib"), path.join(root, "scripts/lib"), { recursive: true });
   const r = run(turn(...write(`${PROJECT}/README.md`)), { gate: path.join(root, "hooks/self-review-gate.mjs") });
   assert.ok(blocks(r), "with no exemption list known, a prose file is gated rather than the hook dying");
   assert.match(r.stderr, /defaults\.json/);
@@ -1659,7 +1723,21 @@ test("F7: a resolvable prose target does not hide a code artifact beside it", ()
 // tools, and the all-exempt rule read that as "the artifact was prose". The
 // evidence is turn-wide but the verdict is per event, so a file another event
 // already explains cannot clear an unresolved write (unresolved-write ruling §1).
-const HEREDOC_OUTSIDE = `cd ${REAL_HOME}/.claude/hooks; python3 - <<'PY'\np='guard.mjs'\nopen(p,'w').write('x')\nPY`;
+//
+// The field command cd'd into `~/.claude/hooks`. The fixture cds into an empty
+// directory outside any repository instead: the gate now looks inside every
+// directory a command entered, and the developer's real hooks directory holds
+// files whose mtimes no fixture controls.
+const plainDir = (tag = "plain") => {
+  const dir = mkdtempSync(path.join(REAL_HOME, `${HOME_FIXTURE}${process.pid}-${tag}-`));
+  fixtures.add(dir);
+  return dir;
+};
+const OUTSIDE = plainDir("hooks");
+const HEREDOC_OUTSIDE = `cd ${OUTSIDE}; python3 - <<'PY'\np='guard.mjs'\nopen(p,'w').write('x')\nPY`;
+// The same unresolved write with no `cd`: the only place it could land is the
+// session's repository, so git decides (r1-shape ruling).
+const HEREDOC_COMPUTED = "python3 - <<'PY'\np='gu'+'ard.mjs'\nopen(p,'w').write('x')\nPY";
 test("an interpreter heredoc behind `cd x;` or `&&` on the same line is code, not data", () => {
   // The field commands all began `cd ~/.claude/hooks;`, and the heredoc's
   // feeder was read as the line's FIRST command word — `cd` — so the body was
@@ -1676,9 +1754,9 @@ test("a `;` inside a quoted argument is not the heredoc feeder's boundary", () =
   assert.ok(blocks(run(turn(bash(cmd)))));
 });
 
-function failed(name, input) {
+function failed(name, input, text = "<tool_use_error>File has not been read yet.</tool_use_error>") {
   const id = `${name}${++seq}`;
-  const result = toolResult(id, "<tool_use_error>File has not been read yet.</tool_use_error>");
+  const result = toolResult(id, text);
   result.message.content[0].is_error = true;
   return [toolUse(name, input, id), result];
 }
@@ -1688,7 +1766,7 @@ test("an unresolved write whose only evidence other tools already explain blocks
   // Both files are stamped inside the heredoc's own window: evidence is per call
   // now, and this case is the one where all of it is explained by other calls.
   const r = run(turn(...write(`${repo}/docs/a.md`), bash(`cat > ${repo}/docs/b.md <<'EOF'\n# b\nEOF`),
-    during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"), path.join(repo, "docs/b.md"))), { payload: { cwd: repo } });
+    during(bash(HEREDOC_COMPUTED), path.join(repo, "docs/a.md"), path.join(repo, "docs/b.md"))), { payload: { cwd: repo } });
   assert.ok(blocks(r), "the field case: the .md files were written by the Write and the redirect, not by the heredoc");
   assert.match(r.json.reason, /could not determine which files — every file changed in the working tree while this command ran is accounted for by another tool call/);
   assert.doesNotMatch(r.json.reason, /nothing in the working tree changed/, "leads have learned to answer that one with not-applicable");
@@ -1696,26 +1774,26 @@ test("an unresolved write whose only evidence other tools already explain blocks
 
 test("an unresolved write whose evidence is an unexplained exempt file still records no change", () => {
   const { repo } = repoFixture({ "config/settings.json": "{}\n" });
-  assert.equal(run(turn(during(bash(HEREDOC_OUTSIDE), path.join(repo, "config/settings.json"))), { payload: { cwd: repo } }).stdout, "");
+  assert.equal(run(turn(during(bash(HEREDOC_COMPUTED), path.join(repo, "config/settings.json"))), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("a failed Write explains nothing: its file stays evidence for the heredoc after it", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n" });
-  const r = run(turn(...failed("Write", { file_path: `${repo}/docs/a.md`, content: "x" }), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"))),
+  const r = run(turn(...failed("Write", { file_path: `${repo}/docs/a.md`, content: "x" }), during(bash(HEREDOC_COMPUTED), path.join(repo, "docs/a.md"))),
     { payload: { cwd: repo } });
   assert.equal(r.stdout, "", r.json?.reason);
 });
 
 test("a successful Edit and a heredoc on the same exempt file block — the accepted false arm", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n" });
-  const r = run(turn(...edit(`${repo}/docs/a.md`), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"))), { payload: { cwd: repo } });
+  const r = run(turn(...edit(`${repo}/docs/a.md`), during(bash(HEREDOC_COMPUTED), path.join(repo, "docs/a.md"))), { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /accounted for by another tool call/);
 });
 
 test("explained exempt evidence beside an unexplained code file names the code file", () => {
   const { repo } = repoFixture({ "docs/a.md": "# a\n", "src/gen.mjs": "export {};\n" });
-  const r = run(turn(...write(`${repo}/docs/a.md`), during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"), path.join(repo, "src/gen.mjs"))),
+  const r = run(turn(...write(`${repo}/docs/a.md`), during(bash(HEREDOC_COMPUTED), path.join(repo, "docs/a.md"), path.join(repo, "src/gen.mjs"))),
     { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /Changed: src\/gen\.mjs/);
@@ -1784,13 +1862,16 @@ test("the veto: no repository or no turn timestamp keeps today's pass", () => {
 });
 
 test("the intent check and the change check agree: an exempt write is not a first change, the unresolved heredoc is", () => {
-  const { repo } = repoFixture({ "docs/a.md": "# a\n" });
+  // The heredoc has to leave code in its window: one whose witnesses all come
+  // back empty is no change at all now, and the turn would pass before the
+  // intent check is reached.
+  const { repo } = repoFixture({ "docs/a.md": "# a\n", "src/gen.mjs": "export {};\n" });
   const VALIDATED = { ...CONVERGED_RECORD, intent: "validated" };
   const VALIDATOR_TYPE = "self-review:self-review-ticket-validator";
   const first = run(turn(...write(`${repo}/docs/a.md`), ...launch("tvA", VALIDATOR_TYPE), notification("tvA"),
-    bash(HEREDOC_OUTSIDE), ...reviewed(), ...writeMarker(VALIDATED)), { payload: { cwd: repo } });
+    during(bash(HEREDOC_COMPUTED), path.join(repo, "src/gen.mjs")), ...reviewed(), ...writeMarker(VALIDATED)), { payload: { cwd: repo } });
   assert.equal(first.stdout, "", "the validator finished before the first CODE change; the .md before it is not one");
-  const late = run(turn(...write(`${repo}/docs/a.md`), bash(HEREDOC_OUTSIDE), ...launch("tvB", VALIDATOR_TYPE), notification("tvB"),
+  const late = run(turn(...write(`${repo}/docs/a.md`), during(bash(HEREDOC_COMPUTED), path.join(repo, "src/gen.mjs")), ...launch("tvB", VALIDATOR_TYPE), notification("tvB"),
     ...reviewed(), ...writeMarker(VALIDATED)), { payload: { cwd: repo } });
   assert.ok(blocks(late));
   assert.match(late.json.reason, /shell command at entry \d+ whose write target the gate could not resolve/,
@@ -1807,35 +1888,34 @@ const setMtime = (file, ms) => utimesSync(file, new Date(ms), new Date(ms));
 const startOf = (call) => Date.parse(call[0].timestamp);
 const endOf = (call) => Date.parse(call[1].timestamp);
 
-test("#10: a concurrent writer after the call is not its evidence, and the block says so", () => {
+// Both used to block with "nothing in the working tree changed while this
+// command ran" — a block whose own text said there was nothing to review. Every
+// witness looked and none saw a write, so there is no change to record
+// (unresolved-write ruling, three witnesses).
+test("#10: a concurrent writer after the call is not its evidence, and with nothing else seen the call passes", () => {
   const { repo } = repoFixture({ "src/a.tsx": "x\n" });
-  const call = bash(HEREDOC_OUTSIDE);
+  const call = bash(HEREDOC_COMPUTED);
   setMtime(path.join(repo, "src/a.tsx"), endOf(call) + 4000);
-  const r = run(turn(call), { payload: { cwd: repo } });
-  assert.ok(blocks(r), "the write is still unresolved");
-  assert.doesNotMatch(r.json.reason, /a\.tsx/);
-  assert.match(r.json.reason, /nothing in the working tree changed while this command ran/);
+  assert.equal(run(turn(call), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("#10: a concurrent writer before the call is not its evidence", () => {
   const { repo } = repoFixture({ "src/a.tsx": "x\n" });
-  const call = bash(HEREDOC_OUTSIDE);
+  const call = bash(HEREDOC_COMPUTED);
   setMtime(path.join(repo, "src/a.tsx"), startOf(call) - 3000);
-  const r = run(turn(call), { payload: { cwd: repo } });
-  assert.ok(blocks(r));
-  assert.doesNotMatch(r.json.reason, /a\.tsx/);
+  assert.equal(run(turn(call), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("#10: an exempt file inside the window clears the call, whatever landed outside it", () => {
   const { repo } = repoFixture({ "src/a.tsx": "x\n", "docs/a.md": "# a\n" });
-  const call = during(bash(HEREDOC_OUTSIDE), path.join(repo, "docs/a.md"));
+  const call = during(bash(HEREDOC_COMPUTED), path.join(repo, "docs/a.md"));
   setMtime(path.join(repo, "src/a.tsx"), endOf(call) + 4000);
   assert.equal(run(turn(call), { payload: { cwd: repo } }).stdout, "");
 });
 
 test("#10: residual — a concurrent write inside the call's own window is still charged", () => {
   const { repo } = repoFixture({ "src/a.tsx": "x\n" });
-  const r = run(turn(during(bash(HEREDOC_OUTSIDE), path.join(repo, "src/a.tsx"))), { payload: { cwd: repo } });
+  const r = run(turn(during(bash(HEREDOC_COMPUTED), path.join(repo, "src/a.tsx"))), { payload: { cwd: repo } });
   assert.ok(blocks(r));
   assert.match(r.json.reason, /Changed: src\/a\.tsx/);
 });
@@ -1857,19 +1937,19 @@ test("#10: a call with no timestamp starts at the turn's; one with no end runs t
   const file = path.join(repo, "src/a.tsx");
   // Built in order, so the human prompt's stamp comes before the call's.
   const prompt = human("do the thing");
-  const call = bash(HEREDOC_OUTSIDE);
+  const call = bash(HEREDOC_COMPUTED);
   setMtime(file, Date.parse(prompt.timestamp) + 400);
-  assert.doesNotMatch(run([prompt, call, said("done")], { payload: { cwd: repo } }).json.reason, /a\.tsx/,
+  assert.equal(run([prompt, call, said("done")], { payload: { cwd: repo } }).stdout, "",
     "with its own stamp the call starts after the file");
   const unstamped = [{ ...call[0], timestamp: undefined }, call[1]];
   assert.match(run([prompt, unstamped, said("done")], { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/,
     "without one it starts where the turn does");
 
-  const open = bash(HEREDOC_OUTSIDE);
+  const open = bash(HEREDOC_COMPUTED);
   setMtime(file, endOf(open) + 4000);
   assert.match(run(turn(open[0]), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/, "no result");
   const id = `Bash${++seq}`;
-  const background = [toolUse("Bash", { command: HEREDOC_OUTSIDE, run_in_background: true }, id),
+  const background = [toolUse("Bash", { command: HEREDOC_COMPUTED, run_in_background: true }, id),
     toolResult(id, "Command running in background with ID: b1", { stdout: "", stderr: "", backgroundTaskId: "b1" })];
   setMtime(file, endOf(background) + 4000);
   assert.match(run(turn(background), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/,
@@ -1879,16 +1959,469 @@ test("#10: a call with no timestamp starts at the turn's; one with no end runs t
 test("#10: a whole-second mtime gets the coarse slack; a sub-second one does not", () => {
   const { repo } = repoFixture({ "src/a.tsx": "x\n" });
   const file = path.join(repo, "src/a.tsx");
-  const coarse = bash(HEREDOC_OUTSIDE);
+  const coarse = bash(HEREDOC_COMPUTED);
   const t = startOf(coarse);
   coarse[0] = { ...coarse[0], timestamp: new Date(t + 500).toISOString() };
   setMtime(file, t - 1000);                                  // 1.5 s before, on a whole second
   assert.match(run(turn(coarse), { payload: { cwd: repo } }).json.reason, /Changed: src\/a\.tsx/);
-  const fine = bash(HEREDOC_OUTSIDE);
+  const fine = bash(HEREDOC_COMPUTED);
   const u = startOf(fine);
   fine[0] = { ...fine[0], timestamp: new Date(u + 600).toISOString() };
   setMtime(file, u - 900);                                   // 1.5 s before, sub-second
-  assert.doesNotMatch(run(turn(fine), { payload: { cwd: repo } }).json.reason, /a\.tsx/);
+  assert.equal(run(turn(fine), { payload: { cwd: repo } }).stdout, "");
+});
+
+// ---------- three witnesses for an unresolved shell write ----------
+//
+// "Nothing in the working tree changed" was a verdict about the cwd's
+// repository only, and the field case it guarded (`cd ~/.claude/hooks; python3
+// - <<PY … open('guard.mjs','w')`) wrote OUTSIDE it. So an unresolved write is
+// judged against every place the command can be seen writing: the cwd's
+// repository, each directory it cd'd into, and the paths its own text names.
+// When all of them come back empty the write is no change (unresolved-write
+// ruling, tests 1–8).
+
+const heredocIn = (dir, body) => `cd ${dir}; python3 - <<'PY'\n${body}\nPY`;
+
+test("witnesses: an unresolved heredoc in a directory of the session's repository that no witness saw write anything passes silently", () => {
+  // Bounded: the only place it entered is the session's repository, so git is complete.
+  const { repo } = repoFixture({ "src/a.mjs": "export {};\n" });
+  assert.equal(run(turn(bash(heredocIn(path.join(repo, "src"), "open('a.mjs','w').write('x')"))), { payload: { cwd: repo } }).stdout, "");
+});
+
+test("witnesses: the field case — a file written in the directory the command cd'd into blocks, by name", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const out = plainDir();
+  writeFileSync(path.join(out, "guard.mjs"), "x\n");
+  const r = run(turn(during(bash(heredocIn(out, "open('guard.mjs','w').write('x')")), path.join(out, "guard.mjs"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r), "the cwd's repository saw nothing; the directory the command entered did");
+  assert.match(r.json.reason, /guard\.mjs/);
+});
+
+test("witnesses: a deep path in a second repository is seen through the literal the body names", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const other = repoFixture({ "src/deep/x.mjs": "export {};\n" });
+  const cmd = heredocIn(other.repo, "open('src/deep/x.mjs', 'w').write('x')");
+  const r = run(turn(during(bash(cmd), path.join(other.repo, "src/deep/x.mjs"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /src\/deep\/x\.mjs/);
+});
+
+test("witnesses: a patch applied in a sibling worktree blocks, naming the worktree (the replay's class-A shape)", () => {
+  // The field shape: paths in an unquoted array, a patch to scratch, then
+  // \`cd <worktree> && git apply\`. Its writes sit two levels down and keep no
+  // trace git in the session's repository can see; the \`cd\` out is what blocks.
+  const { repo } = repoFixture({ "src/a/b.mjs": "export {};\n" });
+  aged(path.join(repo, "src/a/b.mjs"));
+  const wt = plainDir("wt");
+  writeFileSync(path.join(wt, ".git"), "gitdir: /nowhere\n");
+  const cmd = `MINE=(src/a/b.mjs); git diff HEAD -- "\${MINE[@]}" > "$S/x.patch"; cd ${wt} && git apply "$S/x.patch"`;
+  const r = run(turn(bash(cmd)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command entered ${wt}, outside this repository`), r.json.reason);
+});
+
+test("witnesses: a heredoc in a second repository blocks, naming the directory it entered", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const other = repoFixture({ "top.mjs": "export {};\n" });
+  const r = run(turn(bash(heredocIn(other.repo, "p = 'to' + 'p.mjs'\nopen(p, 'w').write('x')"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command entered ${other.repo}, outside this repository`), r.json.reason);
+});
+
+test("witnesses: a nested repository inside the session's is outside it, not covered by the session's git", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const nested = path.join(repo, "nested");
+  mkdirSync(nested);
+  spawnSync("git", ["-C", nested, "init", "-q", "."], { encoding: "utf8" });
+  const r = run(turn(bash(heredocIn(nested, "p = 'gu' + 'ard.mjs'\nopen(p, 'w').write('x')"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /the command entered .*\/nested, outside this repository/);
+});
+
+// ---------- git runs only in the session's repository, bounded ----------
+//
+// A repository's config can make git execute code (core.fsmonitor, a clean
+// filter), so a cd into someone else's checkout must never run git there. A
+// `git` shim first on PATH sees every call the gate makes.
+
+const REAL_GIT = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+const gitShim = (script) => {
+  const bin = mkdtempSync(path.join(tmpdir(), "srg-shim-"));
+  writeFileSync(path.join(bin, "git"), `#!/bin/sh\n${script}\nexec '${REAL_GIT}' "$@"\n`);
+  chmodSync(path.join(bin, "git"), 0o755);
+  return { PATH: `${bin}:${process.env.PATH}` };
+};
+
+test("git: no -C the gate passes is outside the session's repository", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const other = repoFixture({ "src/a.mjs": "export {};\n" });
+  const argv = path.join(mkdtempSync(path.join(tmpdir(), "srg-argv-")), "argv");
+  const env = gitShim(`printf '%s\\n' "$@" >> '${argv}'`);
+  run(turn(bash(heredocIn(other.repo, "open('x.mjs','w').write('x')"))), { env, payload: { cwd: repo } });
+  run(turn(bash(`rm ${other.repo}/gone.mjs`)), { env, payload: { cwd: repo } });
+  const args = existsSync(argv) ? readFileSync(argv, "utf8").split("\n") : [];
+  const top = realpathSync(repo);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== "-C") continue;
+    const rel = path.relative(top, realpathSync(args[i + 1]));
+    assert.ok(!rel.startsWith("..") && !path.isAbsolute(rel), `git -C ${args[i + 1]} is outside ${repo}`);
+  }
+});
+
+test("git: a foreign repository's fsmonitor and clean filter never run", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const other = repoFixture({ "a.mjs": "export {};\n", ".gitattributes": "* filter=x\n" });
+  other.git("add", "-A");
+  other.git("commit", "-qm", "init");
+  const sentinels = mkdtempSync(path.join(tmpdir(), "srg-sentinel-"));
+  const [fsmonitor, clean] = [path.join(sentinels, "fsmonitor"), path.join(sentinels, "clean")];
+  other.git("config", "core.fsmonitor", `touch ${fsmonitor}`);
+  other.git("config", "filter.x.clean", `touch ${clean}`);
+  setMtime(path.join(other.repo, "a.mjs"), Date.now() + 60_000); // stat-dirty
+  run(turn(bash(heredocIn(other.repo, "open('x.mjs','w').write('x')"))), { payload: { cwd: repo } });
+  assert.ok(!existsSync(fsmonitor), "core.fsmonitor ran");
+  assert.ok(!existsSync(clean), "the clean filter ran");
+});
+
+test("git: a status killed by a signal blocks as 'did not finish', not 'no git repository'", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const env = gitShim(`case " $* " in *" status "*) kill -9 $$;; esac`);
+  const r = run(turn(bash(HEREDOC_OUTSIDE)), { env, payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /did not finish/);
+  assert.doesNotMatch(r.json.reason, /no git repository/);
+});
+
+test("git: a status past the default 1 MB buffer is parsed evidence, not blind", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const env = gitShim(`case " $* " in *" status "*) yes '?? missing/never-there-file-name-padding.mjs' | head -n 60000 | tr '\\n' '\\000'; exit 0;; esac`);
+  assert.equal(run(turn(bash(`python3 - <<'PY'\nopen(compute(), 'w').write('x')\nPY`)), { env, payload: { cwd: repo } }).stdout, "");
+});
+
+test("witnesses: an absolute path the body names is stat'ed, with no cd at all", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const out = plainDir();
+  writeFileSync(path.join(out, "x.mjs"), "x\n");
+  const r = run(turn(during(bash(`python3 - <<'PY'\nopen('${out}/x.mjs','w').write('x')\nPY`), path.join(out, "x.mjs"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /x\.mjs/);
+});
+
+test("witnesses: a scratch literal and an exempt literal changed in the window record no change", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const scratch = mkdtempSync(path.join(tmpdir(), "srg-scratch-"));
+  writeFileSync(path.join(scratch, "x.mjs"), "x\n");
+  const out = plainDir();
+  writeFileSync(path.join(out, "notes.md"), "# n\n");
+  const toScratch = during(bash(`python3 - <<'PY'\nopen('${scratch}/x.mjs','w').write('x')\nPY`), path.join(scratch, "x.mjs"));
+  assert.equal(run(turn(toScratch), { payload: { cwd: repo } }).stdout, "", "scratch is not work");
+  const toProse = during(bash(`python3 - <<'PY'\nopen('${out}/notes.md','w').write('x')\nPY`), path.join(out, "notes.md"));
+  assert.equal(run(turn(toProse), { payload: { cwd: repo } }).stdout, "", "prose is not code");
+});
+
+test("witnesses: a file the command names outside the repository is its write only inside the call's window", () => {
+  // A stat of a named file is complete evidence for that path, so a file
+  // literal outside the repository bounds itself; its mtime decides.
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const file = path.join(plainDir(), "guard.mjs");
+  writeFileSync(file, "x\n");
+  const call = () => bash(`python3 - <<'PY'\nopen('${file}','w').write('x')\nPY`);
+  const late = call();
+  setMtime(file, endOf(late) + 4000);
+  assert.equal(run(turn(late), { payload: { cwd: repo } }).stdout, "");
+  const r = run(turn(during(call(), file)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /guard\.mjs/);
+});
+
+test("witnesses: a cwd that is not a repository, or a call with no timestamp, still blocks as 'could not look'", () => {
+  const noRepo = run(turn(bash(HEREDOC_OUTSIDE)));
+  assert.ok(blocks(noRepo), "only complete evidence for the working tree may clear a write");
+  assert.match(noRepo.json.reason, /could not determine which files — no git repository/);
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const entries = turn(...bash(HEREDOC_OUTSIDE));
+  entries[0] = { ...entries[0], timestamp: "not a date" };
+  entries[1] = { ...entries[1], timestamp: "not a date" };
+  const unstamped = run(entries, { payload: { cwd: repo } });
+  assert.ok(blocks(unstamped));
+  assert.match(unstamped.json.reason, /no timestamp for the start of this turn/);
+});
+
+test("witnesses: a directory the command names outside the repository blocks, though it holds nothing new", () => {
+  // Directories are the unbounded sinks a command can name: `base = '/abs/x'`
+  // then `open(base + '/' + f)` is invisible to a stat of the literal (review
+  // round 4, reproduced live).
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const out = plainDir();
+  mkdirSync(path.join(out, "src"));
+  const r = run(turn(bash(`python3 - <<'PY'\nbase = '${out}/src'\nopen(base + '/' + 'g.mjs', 'w').write('x')\nPY`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command names ${out}/src, a directory outside this repository`), r.json.reason);
+});
+
+test("witnesses: a cd into a directory the gate cannot resolve blocks as 'could not look', not 'nothing changed'", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  for (const target of ["$TARGET", "-"]) {
+    const out = plainDir();
+    writeFileSync(path.join(out, "guard.mjs"), "x\n");
+    const r = run(turn(during(bash(`cd ${target}; python3 - <<'PY'\nopen('guard.mjs','w').write('x')\nPY`), path.join(out, "guard.mjs"))), { payload: { cwd: repo } });
+    assert.ok(blocks(r), target);
+    assert.match(r.json.reason, /cannot resolve/, target);
+  }
+});
+
+test("witnesses: after a cd the gate cannot resolve, a relative write target is unknown, not exempt by the session's cwd", () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), "srg-scratch-"));
+  const r = run(turn(bash(`cd "$REPO" && sed -i s/a/b/ src/a.py`)), { payload: { cwd: scratch } });
+  assert.ok(blocks(r), "src/a.py resolved against the scratch cwd would be exempt");
+  assert.match(r.json.reason, /could not determine which files/);
+});
+
+test("witnesses: a cd to an absolute path after an unresolvable one makes relative targets named again", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const known = plainDir();
+  mkdirSync(path.join(known, "src"));
+  writeFileSync(path.join(known, "src", "a.py"), "a\n");
+  const r = run(turn(bash(`cd "$REPO" && cd ${known} && sed -i s/a/b/ src/a.py`)), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  // plainDir lives under $HOME, and the reason prints home-relative paths.
+  assert.ok(r.json.reason.includes(path.join(path.basename(known), "src", "a.py")), r.json.reason);
+});
+
+test("witnesses: a bare cd goes home, which is outside the repository, so it blocks naming home", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const home = plainDir("home");
+  const r = run(turn(bash("cd; python3 - <<'PY'\np = 'gu' + 'ard.mjs'\nopen(p, 'w').write('x')\nPY")), { env: { HOME: home }, payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command entered ${home}, outside this repository`), r.json.reason);
+});
+
+test("witnesses: `cd ~` is the home directory, not a directory named ~ in the repository", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const home = plainDir("home");
+  const r = run(turn(bash("cd ~ && sed -i s/a/b/ $F")), { env: { HOME: home }, payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command entered ${home}, outside this repository`), r.json.reason);
+});
+
+test("witnesses: `cd ~user`, `~+` and `~-` name directories only the shell knows, so they block", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  for (const target of ["~root", "~+", "~-"]) {
+    const r = run(turn(bash(`cd ${target} && sed -i s/a/b/ $F`)), { payload: { cwd: repo } });
+    assert.ok(blocks(r), target);
+    assert.match(r.json.reason, /moves to a directory the gate cannot resolve/, target);
+  }
+});
+
+test("witnesses: a cd inside `( … )` ends with the group, and `popd` leaves the directory unknown", () => {
+  // Tracked linearly, `(cd /tmp); echo x > .hooks.py` resolved the redirect to
+  // /tmp/.hooks.py — scratch, exempt — though the shell wrote the repository's.
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  for (const cmd of ["pushd /tmp >/dev/null && popd >/dev/null && echo x > .hooks.py", "(cd /tmp); echo x > .hooks.py", "(cd /tmp && true); echo x > .hooks.py"]) {
+    const r = run(turn(bash(cmd)), { payload: { cwd: repo } });
+    assert.ok(blocks(r), cmd);
+  }
+});
+
+test("witnesses: a move keeps the file's old mtime, so the stat witness cannot clear it", () => {
+  // os.rename lands src/app.py with gen/out.py's mtime, long before the call:
+  // dated by mtime, the write looks like it never happened.
+  const { repo } = repoFixture({ "README.md": "# r\n", "src/app.py": "x = 1\n" });
+  aged(path.join(repo, "src/app.py"));
+  for (const body of ["import os\nos.rename('gen/out.py', 'src/app.py')", "import shutil\nshutil.copy2('vendor/x.py', 'src/app.py')"]) {
+    const r = run(turn(bash(`python3 - <<'PY'\n${body}\nPY`)), { payload: { cwd: repo } });
+    assert.ok(blocks(r), body);
+    assert.match(r.json.reason, /moves or copies files keeping their mtime/, body);
+  }
+  // The shell's own movers, whose operands are all opaque (round 6).
+  for (const cmd of ['mv "$A" "$B"', 'git mv "$A" "$B"', 'install -p "$A" "$B"']) {
+    const r = run(turn(bash(cmd)), { payload: { cwd: repo } });
+    assert.ok(blocks(r), cmd);
+    assert.match(r.json.reason, /moves or copies files keeping their mtime/, cmd);
+  }
+});
+
+test("witnesses: a cd outside the repository blocks even when nothing was written there, naming the directory", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const out = plainDir();
+  const r = run(turn(bash(heredocIn(out, "open('guard.mjs','w').write('x')"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes(`the command entered ${out}, outside this repository`), r.json.reason);
+});
+
+test("witnesses: command substitution, a backtick or a positional parameter in a cd target is unresolvable", () => {
+  // UNEXPANDED once missed `$(` and the backtick, so `cd "$(echo /x)"` resolved
+  // to a directory inside the cwd that does not exist, and cleared (round 4).
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const out = plainDir();
+  for (const target of [`"$(echo ${out})"`, "`pwd`/x", "$1", `$(echo ${out})/../${path.basename(out)}`]) {
+    const r = run(turn(bash(`cd ${target}; python3 - <<'PY'\nopen('guard.mjs','w').write('x')\nPY`)), { payload: { cwd: repo } });
+    assert.ok(blocks(r), target);
+    assert.match(r.json.reason, /cannot resolve/, target);
+  }
+});
+
+test("witnesses: a cd into scratch, or into an exempt.paths directory, does not block", () => {
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const scratch = mkdtempSync(path.join(tmpdir(), "srg-scratch-"));
+  assert.equal(run(turn(bash(heredocIn(scratch, "open('g.mjs','w').write('x')"))), { payload: { cwd: repo } }).stdout, "");
+  const proto = plainDir("proto");
+  const cfg = exemptConfig(`${proto}/**`);
+  assert.equal(run(turn(bash(heredocIn(proto, "open('g.mjs','w').write('x')"))), { ...cfg, payload: { cwd: repo } }).stdout, "");
+});
+
+test("witnesses: the wait loop's unresolved redirect after the last finder does not cost another round", () => {
+  // `$S` comes from a substitution, so the redirect's target never resolves:
+  // this armed the gate after every review that waited this way, and the
+  // marker that followed was refused as stale.
+  const { repo } = repoFixture({ "README.md": "# r\n" });
+  const wait = `S=$(cat ${SCRATCH}/work-dir); until node ${PLUGIN_ROOT}/scripts/wait.mjs --work "$S" > "$S/w.out"; do sleep 5; done`;
+  const r = run(turn(...write(`${repo}/src/a.ts`), ...reviewed(), bash(wait), ...writeMarker()), { payload: { cwd: repo } });
+  assert.equal(r.stdout, "", r.json?.reason);
+});
+
+// ---------- exempt.paths: absolute globs from the user's config ----------
+//
+// A standing rule in two sessions: a prototype tree whose writes the owner
+// never wants reviewed. Matched through `isExempt`, the one check every write
+// channel goes through, so an exempt-path write is "not a code change" in the
+// sense a `.md` write already is (exempt-paths ruling, tests 1–9). The trees
+// live under the real home: anything under a temp dir is scratch already.
+
+const exemptConfig = (...globs) => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "srcfg-")), "config.json");
+  writeFileSync(file, JSON.stringify({ exempt: { paths: globs } }));
+  return { env: { SELF_REVIEW_CONFIG: file } };
+};
+
+test("exempt.paths: an Edit under an exempt glob needs no marker", () => {
+  const proto = plainDir("proto");
+  assert.equal(run(turn(...edit(`${proto}/app/page.tsx`)), exemptConfig(`${proto}/**`)).stdout, "");
+  assert.ok(blocks(run(turn(...edit(`${proto}/app/page.tsx`)))), "and without the config it is code like any other");
+});
+
+test("exempt.paths: a redirect, a cp, and a directory operand into an exempt tree pass", () => {
+  const proto = plainDir("proto");
+  const cfg = exemptConfig(`${proto}/**`);
+  assert.equal(run(turn(bash(`printf x > ${proto}/a.tsx`)), cfg).stdout, "");
+  assert.equal(run(turn(bash(`cp ${proto}/a.tsx ${proto}/b.tsx`)), cfg).stdout, "");
+  assert.equal(run(turn(bash(`cp -r ${proto}/x ${proto}/sub/`)), cfg).stdout, "", "a directory operand writes inside the exempt tree");
+  assert.ok(blocks(run(turn(bash(`cp -r ${proto}/x ${PROJECT}/sub/`)), cfg)), "one outside it does not");
+});
+
+test("exempt.paths: a turn writing an exempt path and a code file blocks, naming only the code", () => {
+  const proto = plainDir("proto");
+  const r = run(turn(...write(`${proto}/a.tsx`), ...write(`${PROJECT}/src/b.mjs`)), exemptConfig(`${proto}/**`));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /src\/b\.mjs/);
+  assert.doesNotMatch(r.json.reason, /a\.tsx/);
+});
+
+test("exempt.paths: a later exempt write does not re-arm a converged marker; a later code write does", () => {
+  const proto = plainDir("proto");
+  const cfg = exemptConfig(`${proto}/**`);
+  const marked = [...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...marker()];
+  assert.equal(run(turn(...marked, ...write(`${proto}/x.tsx`)), cfg).stdout, "", "the marker survives the exempt write");
+  assert.ok(blocks(run(turn(...marked, ...write(`${proto}/x.tsx`), ...write(`${PROJECT}/src/c.ts`)), cfg)), "fail-closed: code after the marker still needs one");
+});
+
+test("exempt.paths: an unresolved write's git evidence under an exempt path does not arm; outside it does", () => {
+  const { repo } = repoFixture({ "proto/x.tsx": "x\n", "src/x.tsx": "x\n" });
+  const cfg = exemptConfig(`${repo}/proto/**`);
+  const computed = `python3 - <<'PY'\nimport os\np = os.path.join(compute())\nopen(p, 'w').write('x')\nPY`;
+  assert.equal(run(turn(during(bash(computed), path.join(repo, "proto/x.tsx"))), { ...cfg, payload: { cwd: repo } }).stdout, "");
+  const r = run(turn(during(bash(computed), path.join(repo, "src/x.tsx"))), { ...cfg, payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /src\/x\.tsx/);
+});
+
+test("exempt.paths: a mv out of an exempt tree into src/ gates", () => {
+  const proto = plainDir("proto");
+  const r = run(turn(bash(`mv ${proto}/x.tsx ${PROJECT}/src/x.tsx`)), exemptConfig(`${proto}/**`));
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /src\/x\.tsx/);
+});
+
+test("exempt.paths: a glob written through a symlink matches the file by its realpath, and the reverse", () => {
+  const real = plainDir("real");
+  const link = path.join(plainDir("links"), "proto");
+  symlinkSync(real, link);
+  assert.equal(run(turn(...write(`${real}/a.tsx`)), exemptConfig(`${link}/**`)).stdout, "", "glob via the link, file via the realpath");
+  assert.equal(run(turn(...write(`${link}/a.tsx`)), exemptConfig(`${real}/**`)).stdout, "", "glob via the realpath, file via the link");
+});
+
+test("exempt.paths: a symlink inside an exempt tree pointing out of it is judged by where it lands", () => {
+  const proto = plainDir("proto");
+  const other = plainDir("other");
+  symlinkSync(other, path.join(proto, "escape"));
+  const r = run(turn(...write(`${proto}/escape/a.tsx`)), exemptConfig(`${proto}/**`));
+  assert.ok(blocks(r), "the spelling is under the glob, the real location is not");
+  assert.match(r.json.reason, /a\.tsx/);
+});
+
+test("exempt.paths: a glob whose base dir does not exist yet, under a symlinked ancestor, matches the real path", () => {
+  const real = plainDir("real");
+  const link = path.join(plainDir("links"), "proto");
+  symlinkSync(real, link);
+  assert.equal(run(turn(...write(`${real}/new/sub/a.tsx`)), exemptConfig(`${link}/new/sub/**`)).stdout, "");
+});
+
+test("exempt.paths: a relative target is never path-exempt", () => {
+  const r = run(turn(...edit("proto/a.tsx")), exemptConfig(`${PROJECT}/proto/**`));
+  assert.ok(blocks(r), "relative: the gate cannot tell where it is, so it counts");
+});
+
+// ---------- a call that never ran is not a write ----------
+//
+// Filtered in `writeEvents`, so the change check and the intent check read the
+// same list. "Never ran" is the harness's own words at the start of an error
+// result — a Bash that ran and failed always starts `Exit code N`, so its
+// output cannot pose as a denial — or any error from an edit tool, which does
+// not write partially.
+
+const DENIALS = [
+  "Permission to use Bash with command printf has been denied.",
+  "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+  "PreToolUse:Bash hook error: [node guard.mjs]: blocked",
+];
+
+test("denied: each harness denial on a Bash with a resolvable code target records no change", () => {
+  for (const text of DENIALS) {
+    assert.equal(run(turn(...failed("Bash", { command: `printf x > ${PROJECT}/src/a.mjs` }, text))).stdout, "", text);
+  }
+});
+
+test("denied: an unresolved call that never ran records no change, even with no repository to ask", () => {
+  const cmd = `python3 - <<'PY'\nopen('${PROJECT}/x.mjs','w').write('x')\nPY`;
+  assert.equal(run(turn(...failed("Bash", { command: cmd }, DENIALS[0]))).stdout, "");
+});
+
+test("denied: a Write that errored records no change", () => {
+  assert.equal(run(turn(...failed("Write", { file_path: `${PROJECT}/src/a.ts`, content: "x" }, DENIALS[0]))).stdout, "");
+  assert.equal(run(turn(...failed("Edit", { file_path: `${PROJECT}/src/a.ts` }))).stdout, "", "any edit-tool error: it does not write partially");
+});
+
+test("denied: an edit-tool error is never-ran only before execution — a PostToolUse block still wrote", () => {
+  const post = run(turn(...failed("Edit", { file_path: `${PROJECT}/src/a.ts` }, "PostToolUse:Edit hook blocked: [node lint.mjs]: lint failed")));
+  assert.ok(blocks(post), "the edit ran; the hook judged it afterwards");
+  assert.match(post.json.reason, /src\/a\.ts/);
+  assert.equal(run(turn(...failed("Edit", { file_path: `${PROJECT}/src/a.ts` }, "<tool_use_error>String not found in file.</tool_use_error>"))).stdout, "");
+});
+
+test("denied: a command that ran still counts — a failure exit, or a denial sentence in its own output", () => {
+  const exited = run(turn(...failed("Bash", { command: `printf x > ${PROJECT}/src/a.mjs; false` }, "Exit code 1\nPermission to use Bash")));
+  assert.ok(blocks(exited), "it ran: the redirect happened before the failure");
+  assert.match(exited.json.reason, /src\/a\.mjs/);
+  const spoofed = run(turn(...bash(`printf x > ${PROJECT}/src/a.mjs; echo 'Permission to use Bash'`, "Permission to use Bash")));
+  assert.ok(blocks(spoofed), "not an error result, so not a denial whatever it prints");
+});
+
+test("denied: a denied Write before the validator is not the task's first change", () => {
+  const r = run(turn(...failed("Write", { file_path: `${PROJECT}/src/a.ts`, content: "x" }, DENIALS[1]),
+    ...launch("tvDenied", VALIDATOR), notification("tvDenied"),
+    ...write(`${PROJECT}/src/b.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
+  assert.equal(r.stdout, "", r.json?.reason);
 });
 
 // ---------- the orchestrator arms the gate too (F10c) ----------
@@ -2348,6 +2881,14 @@ test("intent=validated is refused when the validator completed AFTER the first e
   assert.match(r.json.systemMessage, /intent=validated refused/);
 });
 
+test("a re-mark after a refused marker is judged against the task's first change, not the refused marker", () => {
+  const r = run([human("go"), ...write(`${PROJECT}/src/a.ts`), ...launch("tv-rm", VALIDATOR), notification("tv-rm"),
+    ...writeMarker(VALIDATED_RECORD), unreviewedFeedback(),
+    ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done")]);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /ticket-validator completed before this task's first code change/);
+});
+
 test("intent=validated is refused when no validator ran at all", () => {
   const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD)));
   assert.ok(blocks(r));
@@ -2581,6 +3122,33 @@ test("the script-form marker's counts are read the same way", () => {
   assert.match(r.json.reason, /2 dismissals, and no self-review-verifier completed/);
 });
 
+// The verifier's window opens at the previous marker the gate ACCEPTED. A marker
+// it refused closed nothing, and counting it reset the window behind the
+// verifier that had already ruled — field: 5 false refusals in 2 sessions.
+test("a refused marker does not reset the verifier window; an accepted one does", () => {
+  const prefix = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...verifier(), ...edit(`${PROJECT}/src/a.ts`),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 }))];
+  const first = run([...prefix, said("done")]);
+  assert.match(first.json?.reason ?? "", /claims a review ran/, "refused: no finder after the fix");
+  const feedback = { type: "user", isMeta: true, timestamp: stamp(), message: { role: "user", content: `Stop hook feedback:\n${first.json.reason}` } };
+  const remarked = run([...prefix, feedback, ...reviewed(), ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })), said("done")]);
+  assert.equal(remarked.json, null, JSON.stringify(remarked.json));
+  // An accepted marker does close the window: the verifier ruled on its loop.
+  const accepted = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...verifier(),
+    ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })), said("done"),
+    human("next"), ...write(`${PROJECT}/src/b.ts`), ...reviewed(), ...writeMarker(CONVERGED({ fixed: 1, dismissed: 1 })), said("done")];
+  assert.match(run(accepted).json?.reason ?? "", /no self-review-verifier completed since the previous marker/);
+});
+
+test("a marker the gate released at the cap closes the verifier window like an accepted one", () => {
+  const entries = [human("go"), ...write(`${PROJECT}/src/a.ts`), ...verifier(), ...writeMarker(CONVERGED({ dismissed: 1 })),
+    unreviewedFeedback(), unreviewedFeedback(), said("done"),
+    human("next"), ...write(`${PROJECT}/src/b.ts`), ...reviewed(), ...writeMarker(CONVERGED({ dismissed: 1 })), said("done")];
+  const r = run(entries);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /no self-review-verifier completed since the previous marker/);
+});
+
 test("a verifier still running releases the turn rather than blocking", () => {
   const id = "vfrun";
   const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(),
@@ -2735,4 +3303,140 @@ test("#11: removing a path outside the session's tree and every repository is no
   assert.ok(blocks(run(turn(bash(`rm ${PROJECT}/old.ts`, "")))));
   const { repo } = repoFixture({ "keep.mjs": "x\n" });
   assert.ok(blocks(run(turn(bash(`rm -rf ${repo}/lib`, "")), { env: HOME_ENV })), "a deletion inside any repository gates");
+});
+
+// ---------- the gate decision log (state-location ruling, section 2) ----------
+//
+// One row per Stop, passes included — without them nothing gives the
+// denominator. The rule code is the only new fact: it names the return site,
+// and the handler strips it before printing, so what the model sees is
+// unchanged. Write-only: nothing in the gate reads `gate/`.
+
+const gateRows = (log) => {
+  const dir = path.join(log, "gate");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).flatMap((f) => readFileSync(path.join(dir, f), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
+};
+const unverifiedFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(),
+  message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} The converged marker was refused: these counts need a verifier behind them.` } });
+const DISMISSED = () => CONVERGED({ fixed: 1, dismissed: 1 });
+
+// Built lazily: every fixture builder advances `seq`, and each case wants its own.
+const RULE_CASES = {
+  "pass:no-transcript": () => [[], { payload: { transcript_path: null } }],
+  "pass:empty": () => [[]],
+  "pass:interrupted": () => [[human("go"), ...write(`${PROJECT}/src/a.ts`), interrupted()]],
+  "pass:no-change": () => [turn(...bash("ls", "a"))],
+  "pass:marker": () => [turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...marker())],
+  "release:reviewer-running": () => [turn(...write(`${PROJECT}/src/a.ts`), ...launch("rvPending"), ...marker())],
+  "release:editor-running": () => [turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...applier("apRun"), ...marker())],
+  "release:unreviewed-exhausted": () => [[human("go"), ...write(`${PROJECT}/src/a.ts`), unreviewedFeedback(), unreviewedFeedback(), ...marker(), said("done")]],
+  "release:verifier-running": () => [turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(),
+    ...call("Agent", { prompt: "verify", subagent_type: "self-review-verifier", name: "self-review-verifier-r1-b1" }, LAUNCHED("vfLog")),
+    ...writeMarker(DISMISSED()))],
+  "release:unverified-exhausted": () => [[human("go"), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), unverifiedFeedback(), unverifiedFeedback(), ...writeMarker(DISMISSED()), said("done")]],
+  "release:unvalidated-exhausted": () => [[human("go"), ...write(`${PROJECT}/src/a.ts`), unvalidatedFeedback(), unvalidatedFeedback(), ...reviewed(), ...writeMarker(VALIDATED_RECORD), said("done")]],
+  "release:pending": () => [turn(...write(`${PROJECT}/src/a.ts`), ...launch("agLog"))],
+  "release:reminders-exhausted": () => [[human("go"), ...write(`${PROJECT}/src/a.ts`), gateFeedback(), gateFeedback(), said("done")]],
+  "block:no-reviewer": () => [turn(...write(`${PROJECT}/src/a.ts`), ...marker())],
+  "block:no-verifier": () => [turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(DISMISSED()))],
+  "block:unvalidated": () => [turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...writeMarker(VALIDATED_RECORD))],
+  "block:rejected": () => [turn(...write(`${PROJECT}/src/a.ts`), ...writeMarker({ outcome: "converged", rounds: 2 }))],
+  "block:remark": () => [[human("go"), ...applier("apLog"), ...bash(...NOT_CONVERGED), notification("apLog"), said("done")]],
+  "block:unmarked": () => [turn(...write(`${PROJECT}/src/a.ts`))],
+};
+
+for (const [rule, build] of Object.entries(RULE_CASES)) {
+  test(`gate log: ${rule} prints its decision and writes exactly one row with that rule`, () => {
+    const [entries, opts] = build();
+    const r = run(entries, opts);
+    const decision = rule.split(":")[0];
+    if (decision === "pass") assert.equal(r.stdout, "", JSON.stringify(r.json));
+    else if (decision === "block") assert.ok(blocks(r), JSON.stringify(r.json));
+    else assert.ok(r.json && r.json.decision === undefined && r.json.systemMessage, JSON.stringify(r.json));
+    assert.ok(!/"rule"/.test(r.stdout), "the rule code is stripped before printing");
+    const rows = gateRows(r.log);
+    assert.equal(rows.length, 1, JSON.stringify(rows));
+    assert.equal(rows[0].rule, rule);
+    assert.equal(rows[0].decision, decision);
+    assert.deepEqual(Object.keys(rows[0]).filter((k) => k !== "marker").sort(),
+      ["cwd", "decision", "refusals", "reminders", "rule", "session", "ts", "version"]);
+    assert.equal(rows[0].session, "s");
+    assert.equal(rows[0].version, JSON.parse(readFileSync(path.join(PLUGIN_ROOT, ".claude-plugin/plugin.json"), "utf8")).version);
+  });
+}
+
+test("gate log: every rule code in the gate has a case above, and every case is a code in the gate", () => {
+  // The table is only a pin if it is the whole set: a return site added without
+  // a code would log `undefined`, and one added with a code and no case would
+  // log a decision nothing ever exercised.
+  const source = readFileSync(GATE, "utf8");
+  const codes = new Set([...source.matchAll(/rule: "((?:pass|block|release):[a-z-]+)"/g)].map((m) => m[1]));
+  assert.deepEqual([...codes].sort(), Object.keys(RULE_CASES).sort());
+});
+
+test("gate log: the counts are logged where the decision counted them", () => {
+  const capped = run([human("go"), ...write(`${PROJECT}/src/a.ts`), gateFeedback(), gateFeedback(), said("done")]);
+  assert.equal(gateRows(capped.log)[0].reminders, 2);
+  const refused = run([human("go"), ...write(`${PROJECT}/src/a.ts`), unreviewedFeedback(), ...marker(), said("done")]);
+  assert.equal(gateRows(refused.log)[0].refusals, 1);
+  assert.equal(gateRows(refused.log)[0].marker, "converged");
+});
+
+test("gate log: a Stop from a subdirectory of a repository logs the repository's top", () => {
+  const { repo } = repoFixture({ "sub/README.md": "# r\n" });
+  const r = run(turn(...bash("ls", "a")), { payload: { cwd: path.join(repo, "sub") } });
+  assert.equal(gateRows(r.log)[0].cwd, realpathSync(repo));
+});
+
+test("gate log: a Stop whose evaluation threw still leaves a row, and prints nothing", () => {
+  // A transcript path that does not exist makes reading the main chain throw.
+  const r = run([], { payload: { transcript_path: path.join(tmpdir(), "srg-no-such-transcript.jsonl") } });
+  assert.equal(r.stdout, "");
+  assert.match(r.stderr, /self-review-gate:/);
+  const rows = gateRows(r.log);
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  assert.equal(rows[0].rule, "error:crash");
+  assert.equal(rows[0].decision, "error");
+});
+
+test("gate log: a turn with no marker, after an earlier turn's marker, logs no marker", () => {
+  const r = run([...turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...marker()), ...turn(...bash("ls", "a"))]);
+  const rows = gateRows(r.log);
+  assert.equal(rows.length, 1);
+  assert.ok(!("marker" in rows[0]), JSON.stringify(rows[0]));
+});
+
+test("gate log: a planted log full of releases and a corrupt line changes no decision", () => {
+  // Rule 1 of the ruling: the log dir can be pointed anywhere by a repo's
+  // settings `env`, so a gate that read it would be deciding on state that repo
+  // controls. This pins that it reads nothing there.
+  const log = mkdtempSync(path.join(tmpdir(), "srlog-"));
+  mkdirSync(path.join(log, "gate"));
+  const now = new Date();
+  const segment = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}.jsonl`;
+  const forged = { ts: now.toISOString(), session: "s", cwd: PROJECT, decision: "release", rule: "release:reviewer-running", reminders: 0, refusals: 0, version: "0.0.0" };
+  writeFileSync(path.join(log, "gate", segment), `${JSON.stringify(forged)}\n`.repeat(50) + "{ not json\n");
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...marker()), { env: { SELF_REVIEW_LOG_DIR: log } });
+  assert.ok(blocks(r));
+  assert.match(r.json.reason, /claims a review ran/);
+});
+
+test("gate log: an unwritable log dir leaves the printed decision byte-identical", () => {
+  const blocker = path.join(mkdtempSync(path.join(tmpdir(), "srlog-")), "not-a-dir");
+  writeFileSync(blocker, "a file where the log dir should be");
+  for (const entries of [turn(...write(`${PROJECT}/src/a.ts`)), turn(...write(`${PROJECT}/src/a.ts`), ...launch("agU")), turn(...bash("ls"))]) {
+    const writable = run(entries);
+    const unwritable = run(entries, { env: { SELF_REVIEW_LOG_DIR: blocker } });
+    assert.equal(unwritable.stdout, writable.stdout);
+    assert.equal(gateRows(writable.log).length, 1, "the writable run did log");
+  }
+});
+
+test("gate log: a row carries no path inside the project, though the message names one", () => {
+  const r = run(turn(...write(`${PROJECT}/src/secret-name.ts`)));
+  assert.match(r.json.reason, /secret-name/, "the fixture's file is in the printed message");
+  const raw = readdirSync(path.join(r.log, "gate")).map((f) => readFileSync(path.join(r.log, "gate", f), "utf8")).join("");
+  assert.ok(raw.length > 0);
+  assert.ok(!raw.includes("secret-name"), raw);
 });

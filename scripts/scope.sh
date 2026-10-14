@@ -164,7 +164,10 @@ emit_plain() {
 out=$(emit)
 total=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
 if [ "$total" -gt "$MAX_LINES" ]; then
-  printf '%s\n' "$out" | head -n "$MAX_LINES"
+  # A here-string, never `printf | head`: head closes the pipe after MAX_LINES,
+  # printf takes SIGPIPE on a bundle larger than the pipe buffer, and pipefail
+  # turned the truncation itself into a silent exit 141 that killed round.sh.
+  sed -n "1,${MAX_LINES}p" <<<"$out"
   echo
   echo "# TRUNCATED: $total lines total, showing $MAX_LINES. Narrow with path arguments, or Read the files directly."
 else

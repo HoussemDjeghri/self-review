@@ -7,11 +7,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { deadAdvice, main, makeReader, orphanAdvice, render, sessionIdFrom } from "./wait.mjs";
+import { reviewFromWork } from "./findings.mjs";
+
+// A spawned wait.mjs appends to the log dir; the suite must not write into the
+// developer's own memory.
+process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "sr-log-"));
+
+test("--help prints the usage and exits 0", async () => {
+  const lines = [];
+  assert.equal(await main(["--help"], { log: (line) => lines.push(line) }), 0);
+  assert.match(lines.join("\n"), /usage/i);
+});
 
 const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 let seq = 0;
@@ -27,9 +38,9 @@ const said = (content, stop = null, baseMs = Date.now()) => ({
 
 // A work dir shaped like the session scratchpad, plus the subagents directory
 // the harness writes transcripts into.
-function layout({ names = ["self-review-finder-r1-ab"], round = 1, scopeAgeSeconds = 120 } = {}) {
+function layout({ names = ["self-review-finder-r1-ab"], round = 1, scopeAgeSeconds = 120, review = null } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "wait-"));
-  const work = path.join(root, SESSION, "scratchpad", "self-review");
+  const work = path.join(root, SESSION, "scratchpad", "self-review", ...(review ? [`review-${review}`] : []));
   const roundDir = path.join(work, `round-${round}`);
   mkdirSync(path.join(roundDir, "briefs"), { recursive: true });
   mkdirSync(path.join(roundDir, "state"), { recursive: true });
@@ -64,7 +75,10 @@ const stalledOn = (body, quotaLimits, baseMs = Date.now()) => [
 
 // Runs main with a clock that only moves when the script sleeps, so a call that
 // blocks for its full ceiling costs no wall-clock time here.
-async function run(argv, { start = Date.now(), config } = {}) {
+// `asleepMs` is added to the first sleep only: the host suspending the process
+// mid-wait, as a laptop lid does. The durable log goes to a temp dir of its
+// own, so a run of this file outside ./test.sh writes nothing to the real one.
+async function run(argv, { start = Date.now(), config, asleepMs = 0, logDir = mkdtempSync(path.join(tmpdir(), "wait-log-")) } = {}) {
   const lines = [];
   let clock = start;
   const previous = process.env.SELF_REVIEW_CONFIG;
@@ -77,9 +91,10 @@ async function run(argv, { start = Date.now(), config } = {}) {
     const code = await main(argv, {
       log: (line) => lines.push(line),
       now: () => clock,
-      sleep: (ms) => { clock += ms; return Promise.resolve(); },
+      sleep: (ms) => { clock += ms + asleepMs; asleepMs = 0; return Promise.resolve(); },
+      logDir,
     });
-    return { code, out: lines.join("\n"), elapsed: clock - start };
+    return { code, out: lines.join("\n"), elapsed: clock - start, logDir };
   } finally {
     if (config) {
       if (previous === undefined) delete process.env.SELF_REVIEW_CONFIG;
@@ -102,6 +117,20 @@ test("every reviewer finished: exits 0 at once, names them, and points at the co
   // findings are on disk under another name stops trusting the column.
   assert.match(r.out, /f-cd\s+finished\s+.*no file/);
   assert.match(r.out, /# settled — 2 finished, 0 stalled, 0 dead/);
+  assert.equal(r.elapsed, 0, "a settled round does not sleep");
+});
+
+test("a reviewer the harness filed as bare hex, named only in its sidecar, is found and settles the round", async () => {
+  // The 2026-09-28 smoke: three calls printed "(no transcript)" for finished
+  // agents and each idled its full ten minutes.
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  const file = path.join(subagents, "agent-a1489047d40a07e99.jsonl");
+  writeFileSync(file, report().map((e) => JSON.stringify(e)).join("\n") + "\n");
+  writeFileSync(path.join(subagents, "agent-a1489047d40a07e99.meta.json"), JSON.stringify({ name: "f-ab" }));
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /f-ab\s+finished\s+.*2 calls/);
+  assert.ok(!r.out.includes("no transcript"), r.out);
   assert.equal(r.elapsed, 0, "a settled round does not sleep");
 });
 
@@ -220,8 +249,9 @@ test("a different set of names starts its own wait and its own budget", async ()
   assert.equal(state.calls, 1);
 });
 
-test("a name with no transcript is active, and dead once this wait has waited out the stale limit", async () => {
-  const { work, subagents } = layout({ names: ["f-ab"] });
+test("a name with no transcript is active while another reviewer works, and dead once this wait has waited out the stale limit", async () => {
+  const { work, subagents } = layout({ names: ["f-ab", "f-cd"] });
+  spawn({ subagents, name: "f-cd", entries: working() });
   const first = await run(["--work", work, "--round", "1", "--session", subagents], { config: { callSeconds: 130, settleSeconds: 60, staleSeconds: 660, budgetMinutes: 30 } });
   assert.equal(first.code, 1, first.out);
   assert.match(first.out, /f-ab\s+active\s+.*\(no transcript\)/);
@@ -230,6 +260,90 @@ test("a name with no transcript is active, and dead once this wait has waited ou
   const later = await run(["--work", work, "--round", "1", "--session", subagents], { start: Date.now() + 12 * 60_000 });
   assert.equal(later.code, 0, later.out);
   assert.match(later.out, /f-ab\s+dead\s+.*\(no transcript\)/);
+});
+
+test("a name with no transcript while every other reviewer settled fails fast, naming the near matches", async () => {
+  // B7: ~8 calls sat out the full stale limit — longer than one call — on a
+  // name nothing would ever write under, every agent having already finished.
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  spawn({ subagents, name: "self-review-applier-k2-r1", entries: report(), hash: "fedcba9876543210" });
+  const typo = await run(["--work", work, "--round", "1", "--session", subagents, "f-ab", "self-review-applier-k2-r2"]);
+  assert.equal(typo.code, 2, typo.out);
+  assert.match(typo.out, /self-review-applier-k2-r2\s+unknown\s+.*did you mean self-review-applier-k2-r1\?/);
+  assert.match(typo.out, /a wrong name, not a slow agent/);
+  assert.ok(typo.elapsed >= 60_000 && typo.elapsed < 120_000, `failed after ${typo.elapsed}ms, not the stale limit`);
+
+  // Two names joined into one shell word: both are near matches.
+  const { work: work2, subagents: subagents2 } = layout({ names: [] });
+  spawn({ subagents: subagents2, name: "f-ab", entries: report() });
+  spawn({ subagents: subagents2, name: "f-cd", entries: report(), hash: "fedcba9876543210" });
+  const joined = await run(["--work", work2, "--round", "1", "--session", subagents2, "f-ab f-cd"]);
+  assert.equal(joined.code, 2, joined.out);
+  assert.match(joined.out, /did you mean f-ab or f-cd\?/);
+});
+
+test("a missing name is not failed while another reviewer is still working", async () => {
+  const { work, subagents } = layout({ names: ["f-ab", "f-cd"] });
+  spawn({ subagents, name: "f-cd", entries: working() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents], { config: { callSeconds: 200, settleSeconds: 60, staleSeconds: 660, budgetMinutes: 30 } });
+  assert.equal(r.code, 1, r.out);
+  assert.doesNotMatch(r.out, /unknown/);
+});
+
+test("a host that slept mid-wait is not read as dead reviewers, and the sleep is not spent from the budget", async () => {
+  // B8: a suspended laptop declared a whole round dead with "0m of budget left";
+  // the finders finished after it woke.
+  const { work, subagents, roundDir } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: working() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents], { asleepMs: 90 * 60_000 });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /f-ab\s+active/);
+  assert.match(r.out, /1 still active, 30m of budget left/);
+  assert.match(r.out, /host was asleep for 90m of this wait — not counted/);
+  const state = JSON.parse(readFileSync(path.join(roundDir, "wait.json"), "utf8"));
+  assert.equal(state.sleptMs, 90 * 60_000, "the next call inherits the sleep, not just this one");
+  assert.ok(!state.spent);
+});
+
+test("a reviewer silent since after the host woke is timed by the wall clock, not the awake clock", async () => {
+  // Subtracting every slept minute from now while the mtime stays wall-clock
+  // read 14 minutes of real silence after the wake as an agent still active.
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  const file = spawn({ subagents, name: "f-ab", entries: working() });
+  const start = Date.now();
+  const first = await run(["--work", work, "--round", "1", "--session", subagents], { start, asleepMs: 90 * 60_000 });
+  assert.equal(first.code, 1, first.out);
+  const wake = start + first.elapsed;
+  utimesSync(file, (wake + 60_000) / 1000, (wake + 60_000) / 1000);
+  const later = await run(["--work", work, "--round", "1", "--session", subagents], { start: wake + 15 * 60_000 });
+  assert.match(later.out, /f-ab\s+dead/, later.out);
+});
+
+test("finder state files are not orphans while the lead waits on a later stage", async () => {
+  // 145 of 910 wait calls named the round's finders as misnamed or as earlier
+  // attempts while the lead was waiting on the verifier or the applier.
+  const { work, subagents, roundDir } = layout({ names: ["self-review-finder-r1-ab"] });
+  writeFileSync(path.join(roundDir, "tier.json"), JSON.stringify({ finders: [{ name: "self-review-finder-r1-ab", agent: "self-review-finder" }] }));
+  writeFileSync(path.join(roundDir, "state", "self-review-finder-r1-ab.jsonl"), '{"summary":"one"}\n');
+  writeFileSync(path.join(roundDir, "state", "self-review-finder-r1-cd.jsonl"), '{"summary":"two"}\n');
+  spawn({ subagents, name: "self-review-applier-r1", entries: report() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents, "self-review-applier-r1"]);
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /plan row|no reviewer above/, r.out);
+});
+
+test("a plan row is recognised under the name brief.mjs printed, review number included", async () => {
+  // tier.json holds `self-review-finder-r1-ab`; the brief, the state file and
+  // the spawn carry `self-review-finder-k2-r1-ab`.
+  const { work, subagents, roundDir } = layout({ names: [], review: 2 });
+  writeFileSync(path.join(roundDir, "tier.json"), JSON.stringify({ finders: [{ name: "self-review-finder-r1-ab", agent: "self-review-finder" }] }));
+  writeFileSync(path.join(roundDir, "state", "self-review-finder-k2-r1-ab.jsonl"), '{"summary":"one"}\n');
+  spawn({ subagents, name: "self-review-finder-k2-r1-ab-x", entries: report() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents, "self-review-finder-k2-r1-ab-x"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /1 plan row filed under its own name/);
+  assert.doesNotMatch(r.out, /earlier attempt/);
 });
 
 test("a previous attempt's transcript under the same name is not this round's agent", async () => {
@@ -395,13 +509,24 @@ test("a plan row's state file under a finder spawned by another name is named as
   // the brief writes under the row's name, so the lead was told its live
   // finder's candidates came "from an earlier attempt".
   const rows = [{ name: "self-review-finder-r1-cb", status: "finished", lastAt: "—", calls: 1, stateLines: null, note: "" }];
-  const advice = orphanAdvice(rows, "/w/round-1/state", ["self-review-finder-r1-compact.jsonl", "old.jsonl"],
+  const advice = orphanAdvice(rows, "/w/round-1/state", ["self-review-finder-r1-compact.jsonl", "self-review-finder-r1-old.jsonl"],
     ["self-review-finder-r1-compact"]).join("\n");
   assert.match(advice, /1 plan row filed under its own name, which no reviewer above carries/);
   assert.match(advice, /Spawn with the name brief\.mjs printed/);
   assert.match(advice, /self-review-finder-r1-compact\.jsonl/);
   assert.match(advice, /1 state file in this round belongs to no reviewer above — an earlier attempt/, "a true orphan keeps its own line");
   assert.doesNotMatch(advice.split("earlier attempt")[1], /r1-compact/, "the row is not listed as an earlier attempt");
+});
+
+test("the orphan advice reads only the stage being waited on", () => {
+  const files = ["self-review-finder-k1-r1-ab.jsonl", "self-review-cold-grader-k1-r1-x.jsonl", "self-review-verifier-k1-r1-b1.jsonl"];
+  const planned = ["self-review-finder-k1-r1-ab", "self-review-cold-grader-k1-r1-x"];
+  const row = (name) => ({ name, status: "finished", lastAt: "—", calls: 1, stateLines: null, note: "" });
+  assert.deepEqual(orphanAdvice([row("self-review-applier-k1-r1")], "/w/round-1/state", files, planned), [],
+    "waiting on the applier, no finder or verifier file is news");
+  const verifying = orphanAdvice([row("self-review-verifier-k1-r1-b2")], "/w/round-1/state", files, planned).join("\n");
+  assert.match(verifying, /1 state file in this round belongs to no reviewer above/, "an earlier verifier batch is still named");
+  assert.doesNotMatch(verifying, /finder|cold-grader|plan row/);
 });
 
 test("a round where every state file is accounted for adds nothing to the table", () => {
@@ -424,4 +549,45 @@ test("the dead advice is one runnable salvage call naming every dead reviewer an
   const call = lines.find((l) => l.includes("salvage.mjs"));
   assert.equal(call, '#   → "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" sess-1 f-cd f-ef');
   assert.ok(!lines.some((l) => l.includes("f-ab")), lines.join("\n"));
+});
+
+const logRows = (logDir) => readFileSync(path.join(logDir, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+
+test("a wait that ends writes its final state and one numbers-only wait row keyed by the review", async () => {
+  const names = ["self-review-finder-k2-r1-ab", "self-review-cold-grader-k2-r1-x", "self-review-verifier-k2-r1-b1"];
+  const { work, subagents, roundDir } = layout({ names, review: 2 });
+  for (const [i, name] of names.entries()) spawn({ subagents, name, entries: report(), hash: `${i}123456789abcdef` });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents]);
+  assert.equal(r.code, 0, r.out);
+  const rows = logRows(r.logDir);
+  assert.equal(rows.length, 1);
+  const [row] = rows;
+  assert.deepEqual(Object.keys(row).sort(), ["calls", "cwd", "ended", "kind", "review", "roles", "round", "sleptMs", "statuses", "ts", "waitedMs"]);
+  assert.equal(row.kind, "wait");
+  assert.equal(row.review, reviewFromWork(work), "the key the converge rows carry, so the metrics join on it");
+  assert.deepEqual({ round: row.round, ended: row.ended, calls: row.calls }, { round: 1, ended: "settled", calls: 1 });
+  assert.deepEqual(row.roles, { finder: 1, "cold-grader": 1, verifier: 1 });
+  assert.deepEqual(row.statuses, { finished: 3 });
+  const state = JSON.parse(readFileSync(path.join(roundDir, "wait.json"), "utf8"));
+  assert.equal(state.ended, "settled");
+  assert.equal(state.waitedMs, row.waitedMs);
+});
+
+test("a call that only reaches its ceiling is not an end and logs nothing", async () => {
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: working() });
+  const r = await run(["--work", work, "--round", "1", "--session", subagents], { start: Date.now() });
+  assert.equal(r.code, 1, r.out);
+  assert.equal(existsSync(path.join(r.logDir, "log.jsonl")), false);
+});
+
+test("an unwritable log dir still settles the wait and still writes wait.json", async () => {
+  const { work, subagents, roundDir } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  // A directory under a regular file cannot be created, whoever runs this.
+  const blocker = path.join(mkdtempSync(path.join(tmpdir(), "wait-log-")), "file");
+  writeFileSync(blocker, "");
+  const r = await run(["--work", work, "--round", "1", "--session", subagents], { logDir: path.join(blocker, "log") });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(readFileSync(path.join(roundDir, "wait.json"), "utf8")).ended, "settled");
 });
