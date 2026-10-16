@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir, userInfo } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2224,22 +2224,259 @@ test("witnesses: a cd inside `( … )` ends with the group, and `popd` leaves th
   }
 });
 
-test("witnesses: a move keeps the file's old mtime, so the stat witness cannot clear it", () => {
-  // os.rename lands src/app.py with gen/out.py's mtime, long before the call:
-  // dated by mtime, the write looks like it never happened.
-  const { repo } = repoFixture({ "README.md": "# r\n", "src/app.py": "x = 1\n" });
-  aged(path.join(repo, "src/app.py"));
-  for (const body of ["import os\nos.rename('gen/out.py', 'src/app.py')", "import shutil\nshutil.copy2('vendor/x.py', 'src/app.py')"]) {
-    const r = run(turn(bash(`python3 - <<'PY'\n${body}\nPY`)), { payload: { cwd: repo } });
-    assert.ok(blocks(r), body);
-    assert.match(r.json.reason, /moves or copies files keeping their mtime/, body);
-  }
-  // The shell's own movers, whose operands are all opaque (round 6).
-  for (const cmd of ['mv "$A" "$B"', 'git mv "$A" "$B"', 'install -p "$A" "$B"']) {
-    const r = run(turn(bash(cmd)), { payload: { cwd: repo } });
+// ctime cannot be set, so a test of the ctime witness runs its command for real
+// and stamps the call around it. The pause comes first: every fixture file was
+// created or aged before it, so their ctimes sit outside the call's window and
+// only what the command itself did can fall inside.
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const live = (command, { cwd, env = {} }) => {
+  pause(250);
+  const id = `Bash${++seq}`;
+  const use = { ...toolUse("Bash", { command }, id), timestamp: new Date().toISOString() };
+  const res = spawnSync("bash", ["-c", command], { cwd, env: { ...process.env, ...env }, encoding: "utf8" });
+  assert.equal(res.status, 0, `${command}: ${res.stderr}`);
+  return [use, { ...toolResult(id, res.stdout, { stdout: res.stdout, stderr: "", interrupted: false }), timestamp: new Date().toISOString() }];
+};
+// An old code file outside the repository, and a tarball holding one.
+const oldSource = () => {
+  const out = plainDir();
+  mkdirSync(path.join(out, "gen"));
+  writeFileSync(path.join(out, "gen", "old.mjs"), "export const x = 1;\n");
+  aged(path.join(out, "gen", "old.mjs"));
+  spawnSync("tar", ["-cf", path.join(out, "gen.tar"), "-C", out, "gen"]);
+  return out;
+};
+
+// Every writer that keeps the source's mtime, each through `"$a"`/`"$b"` so the
+// parser cannot name the target. Dated by mtime these passed or went blind;
+// dated by either clock each names the file (witness-list ruling D, test 1).
+const KEEPERS = [
+  { name: "mv", cmd: 'mv "$a" "$b"' },
+  { name: "install -p", cmd: 'install -p "$a" "$b"' },
+  { name: "git mv", cmd: 'git mv "$a" "$b"', tracked: true },
+  { name: "ditto", cmd: 'ditto "$a" "$b"', darwin: true },
+  { name: "cp -p", cmd: 'cp -p "$a" "$b"' },
+  { name: "rsync -a", cmd: 'rsync -a "$a" "$b"' },
+  { name: "tar x", cmd: 'tar -xf "$a" -C "$b"', tar: true },
+  { name: "os.rename", cmd: "python3 - <<'PY'\nimport os\nos.rename(os.environ['a'], os.environ['b'])\nPY" },
+  { name: "shutil.copy2", cmd: "python3 - <<'PY'\nimport os, shutil\nshutil.copy2(os.environ['a'], os.environ['b'])\nPY" },
+  { name: "renameSync", cmd: "node - <<'JS'\nrequire('fs').renameSync(process.env.a, process.env.b)\nJS" },
+  { name: "tarfile.extractall", cmd: "python3 - <<'PY'\nimport os, tarfile\ntarfile.open(os.environ['a']).extractall(os.environ['b'])\nPY", tar: true },
+];
+for (const { name, cmd, tracked, darwin, tar } of KEEPERS) {
+  test(`witnesses: ${name} keeps the source's mtime, and the call still names the file by its ctime`, { skip: darwin && process.platform !== "darwin" }, () => {
+    const { repo, git } = repoFixture({ "README.md": "# r\n", "src/keep.txt": "k\n" });
+    let a, b, named;
+    if (tracked) {
+      writeFileSync(path.join(repo, "src", "old.mjs"), "export const x = 1;\n");
+      git("add", "."); git("commit", "-qm", "init");
+      aged(path.join(repo, "src", "old.mjs"));
+      [a, b, named] = ["src/old.mjs", "src/moved.mjs", "moved.mjs"];
+    } else {
+      git("add", "."); git("commit", "-qm", "init");
+      const out = oldSource();
+      [a, b, named] = tar ? [path.join(out, "gen.tar"), path.join(repo, "src"), "old.mjs"] : [path.join(out, "gen", "old.mjs"), path.join(repo, "src", "new.mjs"), "new.mjs"];
+    }
+    const r = run(turn(live(cmd, { cwd: repo, env: { a, b } })), { payload: { cwd: repo } });
+    assert.ok(blocks(r), `${name} passed`);
+    assert.ok(r.json.reason.includes(named), r.json.reason);
+    assert.doesNotMatch(r.json.reason, /could not look/);
+  });
+}
+
+test("parser: archive extraction is an unknown-target write; tar creation or listing is not, and unzip counts by name alone", () => {
+  // Outside a repository an unknown-target write blocks as "no git repository"
+  // and a non-write prints nothing, so the parser's verdict is the observable.
+  const writes = [
+    'tar xzf "$a"', 'tar -C "$b" -xf "$a"', 'tar --extract -f "$a"', 'ditto "$a" "$b"',
+    'unzip "$a" -d "$b"',
+    // read-only, but unzip is matched by name (witness-extractors ruling): pinned on purpose
+    'unzip -l "$a"',
+    "python3 - <<'PY'\nimport os, shutil\nshutil.unpack_archive(os.environ['a'])\nPY",
+    "python3 - <<'PY'\nimport os, tarfile\ntarfile.open(os.environ['a']).extractall()\nPY",
+    // A redirect beside the writer must not resolve the segment to its prose log.
+    'tar xvf "$a" -C src > extracted.txt', 'unzip "$a" -d src > unzip.log', 'patch -p1 < "$a" > patch.log',
+  ];
+  for (const cmd of writes) {
+    const r = run(turn(bash(cmd)), { payload: { cwd: plainDir() } });
     assert.ok(blocks(r), cmd);
-    assert.match(r.json.reason, /moves or copies files keeping their mtime/, cmd);
+    assert.match(r.json.reason, /no git repository/, cmd);
   }
+  const reads = [
+    'tar -tf "$a"', 'tar -czf "$a" src', 'tar cf "$a" x',
+    "python3 - <<'PY'\nimport pandas as pd\nprint(pd.read_csv('x.csv')['id'].str.extract(r'(\\d+)'))\nPY",
+  ];
+  for (const cmd of reads) assert.equal(run(turn(bash(cmd)), { payload: { cwd: plainDir() } }).stdout, "", cmd);
+});
+
+test("parser: bsdtar, 7z, cpio and python -m zipfile are not recognised as writes (pinned misses)", () => {
+  // Pins a known gap, not a wanted behaviour (witness-extractors ruling): each
+  // has a flag grammar and none appeared in 192,770 local commands.
+  for (const cmd of ['bsdtar -xf "$a"', '7z x "$a"', 'cpio -i < "$a"', 'python3 -m zipfile -e "$a" "$b"']) {
+    assert.equal(run(turn(bash(cmd)), { payload: { cwd: plainDir() } }).stdout, "", cmd);
+  }
+});
+
+test("witnesses: ditto extracting a scratch zip into a bare directory name is witnessed", { skip: process.platform !== "darwin" }, () => {
+  const { repo } = committed({ "src/keep.txt": "k\n" });
+  const out = plainDir();
+  mkdirSync(path.join(out, "gen"));
+  writeFileSync(path.join(out, "gen", "run.mjs"), "x\n");
+  spawnSync("ditto", ["-ck", "gen", "a.zip"], { cwd: out });
+  const zip = path.join(out, "a.zip");
+  const r = run(turn(live(`ditto -xk ${zip} out`, { cwd: repo })), { payload: { cwd: repo } });
+  assert.equal(blocks(r), true, r.json?.reason);
+  assert.ok(r.json.reason.includes("run.mjs"), r.json.reason);
+});
+
+test("witnesses: a directory of code moved in whole is named by the moved directory's ctime and its parent's; one of prose clears", () => {
+  for (const [file, gates] of [["old.mjs", true], ["old.md", false]]) {
+    const { repo, git } = repoFixture({ "README.md": "# r\n", "src/keep.txt": "k\n" });
+    git("add", "."); git("commit", "-qm", "init");
+    const out = plainDir();
+    mkdirSync(path.join(out, "gen"));
+    writeFileSync(path.join(out, "gen", file), "x\n");
+    aged(path.join(out, "gen", file));
+    const r = run(turn(live('mv "$a" "$b"', { cwd: repo, env: { a: path.join(out, "gen"), b: path.join(repo, "src", "gen") } })), { payload: { cwd: repo } });
+    assert.equal(blocks(r), gates, r.json?.reason ?? file);
+    if (gates) assert.ok(r.json.reason.includes(file), r.json.reason);
+  }
+});
+
+test("witnesses: a new file in a directory does not pull in that directory's older untracked code", () => {
+  // Creating an entry bumps the directory's ctime but not its parent's, which
+  // is what tells it from a move.
+  const { repo, git } = repoFixture({ "README.md": "# r\n" });
+  git("add", "."); git("commit", "-qm", "init");
+  mkdirSync(path.join(repo, "src"));
+  writeFileSync(path.join(repo, "src", "old.mjs"), "x\n");
+  aged(path.join(repo, "src", "old.mjs"));
+  const r = run(turn(live("python3 - <<'PY'\nopen('src/' + 'notes.md', 'w').write('x')\nPY", { cwd: repo })), { payload: { cwd: repo } });
+  assert.equal(blocks(r), false, r.json?.reason);
+});
+
+test("witnesses: one call creating entries in a directory and in its parent pulls in the child's old untracked code (known over-blame)", () => {
+  // The rule's pinned cost (witness-list ruling, test 4): a create in src/ and
+  // one in src/a/ look exactly like src/a being moved into src/.
+  const { repo, git } = repoFixture({ "README.md": "# r\n" });
+  git("add", "."); git("commit", "-qm", "init");
+  mkdirSync(path.join(repo, "src", "a"), { recursive: true });
+  writeFileSync(path.join(repo, "src", "a", "old.mjs"), "x\n");
+  aged(path.join(repo, "src", "a", "old.mjs"));
+  const r = run(turn(live("python3 - <<'PY'\nopen('src/' + 'n.md', 'w').write('x')\nopen('src/a/' + 'n.md', 'w').write('x')\nPY", { cwd: repo })), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes("old.mjs"), r.json.reason);
+});
+
+test("witnesses: a Python edit whose replacement text mentions os.replace( is a content write, not a blind move", () => {
+  // MTIME_KEEPING matched the text and set the call blind, though nothing moved.
+  const { repo } = repoFixture({ "README.md": "# r\n", "src/a.py": "x\n" });
+  const body = "p = 'src/a.py'\ns = open(p).read()\nopen(p, 'w').write(s.replace('x', 'os.replace(a, b)'))";
+  assert.equal(run(turn(bash(`python3 - <<'PY'\n${body}\nPY`)), { payload: { cwd: repo } }).stdout, "", "nothing changed in the window");
+  const r = run(turn(during(bash(`python3 - <<'PY'\n${body}\nPY`), path.join(repo, "src", "a.py"))), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes("a.py"), r.json.reason);
+});
+
+test("witnesses: the platform keeps the ctime premise — rename(2) advances the moved file's, the moved directory's and the new parent's", () => {
+  // The ruling's own failure mode (test 6): on a filesystem where this fails,
+  // ctime cannot date a move and the ruling falls back to an allowlist there.
+  const root = plainDir("premise");
+  mkdirSync(path.join(root, "from", "dir"), { recursive: true });
+  mkdirSync(path.join(root, "to"));
+  for (const f of [path.join(root, "from", "f.mjs"), path.join(root, "from", "dir", "g.mjs")]) { writeFileSync(f, "x\n"); aged(f); }
+  const ctime = (p) => statSync(p).ctimeMs;
+  const fileCtime = ctime(path.join(root, "from", "f.mjs"));
+  pause(50);
+  renameSync(path.join(root, "from", "f.mjs"), path.join(root, "to", "f.mjs"));
+  assert.ok(ctime(path.join(root, "to", "f.mjs")) > fileCtime, "moved file's ctime");
+  assert.equal(statSync(path.join(root, "to", "f.mjs")).mtimeMs, 1_600_000_000_000, "a rename keeps mtime, which is why ctime is read");
+  const dir = statSync(path.join(root, "from", "dir"));
+  const parentCtime = ctime(path.join(root, "to"));
+  pause(50);
+  renameSync(path.join(root, "from", "dir"), path.join(root, "to", "dir"));
+  assert.ok(ctime(path.join(root, "to", "dir")) > dir.ctimeMs, "moved directory's ctime");
+  assert.ok(ctime(path.join(root, "to")) > parentCtime, "new parent's ctime");
+  assert.equal(statSync(path.join(root, "to", "dir")).mtimeMs, dir.mtimeMs, "a rename keeps the moved directory's mtime, which clause 2 of the directory rule reads");
+});
+
+// The directory rule across calls (dir-window ruling, tests 9–11): witnesses are
+// read at Stop, so whatever a LATER call does to the destination is in the stats.
+const movedIn = (repo, file = "old.mjs") => {
+  const out = plainDir();
+  mkdirSync(path.join(out, "gen"));
+  writeFileSync(path.join(out, "gen", file), "x\n");
+  aged(path.join(out, "gen", file));
+  return live('mv "$a" "$b"', { cwd: repo, env: { a: path.join(out, "gen"), b: path.join(repo, "src", "gen") } });
+};
+const committed = (files) => {
+  const fixture = repoFixture({ "README.md": "# r\n", ...files });
+  fixture.git("add", "."); fixture.git("commit", "-qm", "init");
+  return fixture;
+};
+
+test("witnesses: a directory moved in is still named after a later call creates a file beside it", () => {
+  const { repo } = committed({ "src/keep.txt": "k\n" });
+  const r = run(turn(movedIn(repo), live("printf x > src/README.md", { cwd: repo })), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes("old.mjs"), r.json.reason);
+});
+
+test("witnesses: later edits in a directory and at the top do not pull its old untracked code into an earlier call", () => {
+  // Lower-bound-only would blame here: Edit rewrites by atomic rename, so the
+  // two directories' ctimes both advance. Their mtimes do too, which is what
+  // tells this from a move.
+  const { repo } = committed({ "src/x.md": "a\n", "CHANGELOG.md": "a\n" });
+  writeFileSync(path.join(repo, "src", "old.mjs"), "x\n");
+  aged(path.join(repo, "src", "old.mjs"));
+  const first = live("python3 - <<'PY'\nimport os\nopen(os.environ['T'], 'w').write('x')\nPY", { cwd: repo, env: { T: path.join(plainDir(), "out.txt") } });
+  // Two calls, as two Edits are; one call touching both is test 4's over-blame.
+  const edits = ["src/x.md", "CHANGELOG.md"].map((f) => live(`printf b > ${f}.tmp && mv ${f}.tmp ${f}`, { cwd: repo }));
+  assert.equal(run(turn(first, ...edits), { payload: { cwd: repo } }).stdout, "");
+});
+
+test("witnesses: a later write inside the moved directory hides the move (known miss)", () => {
+  // Pinned, not wanted: the write advances the moved directory's mtime, so
+  // neither clause fires. If this shape proves common, the fix is a stat of the
+  // directories when each call ends, not a looser predicate (dir-window ruling).
+  const { repo } = committed({ "src/keep.txt": "k\n" });
+  const r = run(turn(movedIn(repo), live("printf x > src/gen/README.md", { cwd: repo })), { payload: { cwd: repo } });
+  assert.equal(blocks(r), false, r.json?.reason);
+});
+
+test("witnesses: a later chmod of a moved-in file hides it from the call that moved it (known miss)", () => {
+  // Pinned, not wanted: the chmod moves the file's ctime into call 2's window,
+  // and chmod is not a write, so no call owns it. The fix is a stat of the
+  // files when each call ends, not a looser predicate (dir-window ruling).
+  const { repo } = committed({ "src/keep.txt": "k\n" });
+  const old = path.join(plainDir(), "old.mjs");
+  writeFileSync(old, "x\n");
+  aged(old);
+  const r = run(turn(
+    live('mv "$a" "$b"', { cwd: repo, env: { a: old, b: path.join(repo, "src", "run.mjs") } }),
+    live("chmod +x src/run.mjs", { cwd: repo }),
+  ), { payload: { cwd: repo } });
+  assert.equal(blocks(r), false, r.json?.reason);
+});
+
+test("witnesses: a chmod-only change to an old code file inside the window is named", () => {
+  // The witness is broader than content: a mode change moves ctime (ruling test 7).
+  const { repo, git } = repoFixture({ "README.md": "# r\n", "src/old.mjs": "x\n" });
+  git("add", "."); git("commit", "-qm", "init");
+  aged(path.join(repo, "src", "old.mjs"));
+  const r = run(turn(live('chmod +x "$a"; printf x > "$b"', { cwd: repo, env: { a: "src/old.mjs", b: path.join(repo, "notes.md") } })), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes("old.mjs"), r.json.reason);
+});
+
+test("witnesses: a symlink created in the window is named by its own ctime, not its old target's", () => {
+  const { repo } = committed({ "src/keep.txt": "k\n" });
+  const old = path.join(plainDir(), "old.mjs");
+  writeFileSync(old, "x\n");
+  aged(old);
+  const r = run(turn(live('ln -s "$a" "$b"', { cwd: repo, env: { a: old, b: path.join(repo, "src", "link.mjs") } })), { payload: { cwd: repo } });
+  assert.ok(blocks(r));
+  assert.ok(r.json.reason.includes("link.mjs"), r.json.reason);
 });
 
 test("witnesses: a cd outside the repository blocks even when nothing was written there, naming the directory", () => {

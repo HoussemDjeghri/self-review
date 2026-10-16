@@ -273,6 +273,8 @@ uncovered. An empty `[]` on a large, logic-heavy change is suspect — finders
 are told to pass half-believed candidates through — so read that transcript
 before trusting it. Merge candidates at the same line and mechanism, keeping the
 most concrete failure scenario; drop nothing else — verification decides.
+Every candidate ends as a row: `record` refuses `[]` while the round's
+`state/*.jsonl` files (a verifier's excepted) hold candidate objects.
 
 ### 2d · Verify
 
@@ -385,9 +387,9 @@ vocabulary. Copy a candidate's `prior_id` (the eight bracketed characters of the
 `prior.md` line it re-raised) onto the record unchanged — nothing downstream can
 reconstruct it, and dropping it is silent. It validates every record before
 writing any, so a rejection costs a retry; `record --help` prints the schema.
-Record **every** round — `[]` when it had nothing to record, or `converge` calls
-the round `UNRECORDED`. With `--work` it then prints the round's verdict and a
-`next:` line, the exact call that acts on it (§3). Where the memory lives:
+Record **every** round — `[]` when it had nothing to record (§2c: refused over
+filed candidates), or `converge` calls the round `UNRECORDED`. It then prints
+the round's verdict and a `next:` line, the exact call that acts on it (§3). Where the memory lives:
 `references/scripts.md` → **Findings memory**.
 
 ### 2f · A dead, stalled or silent agent — recovery is in `references/recovery.md`

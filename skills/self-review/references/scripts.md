@@ -67,6 +67,9 @@ brief.mjs --round N --plan <w>/round-N/tier.json --intent <w>/intent.md --scope 
 findings.mjs record --work <w> --round N --in <w>/round-N/findings.json
 ```
 
+`record` refuses an empty batch (exit 3, no receipt) while `round-N/state/`
+holds candidate objects in any `*.jsonl` file but a `self-review-verifier-*` one.
+
 From round 2 on, give `scope.sh` round 1's `--base` and paths again — without
 them it scopes the whole working tree — and give `tier.mjs` `--cap` (round.sh
 also passes `--cap-markers` with round 1's non-empty markers; without it every
@@ -180,7 +183,7 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/impact.mjs` — blast radius: broken references, tests, callers, docs (§0); writes `impact.md` + `impact.json`
 - `scripts/tier.mjs` — the tier, its reasons, and the round's finder rows (§0); writes `tier.json`
 - `scripts/brief.mjs` — one brief per finder row, held to the token budget, and the `Agent` line for each (§2b); `--verify` does the same for a verifier batch (§2d)
-- `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record --work` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
+- `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
 - `scripts/preflight.sh` — the project's own checks for the touched ecosystems (§1)
 - `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1)
 - `scripts/treecheck.sh` — says whether the working tree moved while reviewers ran (§2c); `--changed` lists what moved since a round's snapshot, which `round.sh` adds to a path-scoped later round

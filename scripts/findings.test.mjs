@@ -1,7 +1,7 @@
 // Run: node --test plugin/scripts/findings.test.mjs   (or ./test.sh for everything)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -189,13 +189,13 @@ test("long fields are clamped so ten lines stay a bounded cost", () => {
 
 test("a cut inside a surrogate pair never reaches a brief as U+FFFD", () => {
   const logDir = workdir(), repo = gitRepo();
-  const work = workdir(), scope = path.join(work, "scope.diff"), out = path.join(work, "prior.md");
+  const work = scoped(workdir(), repo), scope = path.join(work, "scope.diff"), out = path.join(work, "prior.md");
   writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n c\n+added\n");
   // The emoji straddles the render clamp (110 code points), which is where the
   // corruption surfaced: JSON.stringify keeps a lone surrogate, writeFileSync
   // turns it into a replacement character.
   recordFindings([candidate({ summary: `${"b".repeat(108)}\u{1F600}${"c".repeat(30)}` })], { review: "r", round: 1, repoRoot: repo, logDir });
-  main(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--repo", repo], { log: () => {} });
+  main(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--work", work], { log: () => {} });
   const text = readFileSync(out, "utf8");
   assert.equal(text.includes("\uFFFD"), false, `a replacement character reached the brief: ${text}`);
   assert.ok(text.includes("…"), "and it is still clamped");
@@ -235,22 +235,6 @@ test("prior hides the review that is running, so a finder is never told what was
     { file: "src/a.ts", line: 2, class: "correctness", summary: "round 1 of this one", verdict: "fixed", review: "now" },
   ];
   assert.deepEqual(rankPrior(rows, ["src/a.ts"], { max: 10, exclude: "now" }).map((r) => r.summary), ["from an old review"]);
-});
-
-test("an id that needed cleaning still excludes its own review", () => {
-  const logDir = workdir(), repo = gitRepo();
-  const work = workdir(), scope = path.join(work, "scope.diff"), out = path.join(work, "prior.md");
-  writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n c\n+added\n");
-  // The operator pasted the whole scratchpad path instead of the UUID: record
-  // stores the cleaned form, so a raw comparison in prior matched nothing and
-  // handed the running review its own findings.
-  const messy = `  /private/tmp/claude-501/${"x".repeat(140)}/self-review\t`;
-  const cli = (extra) => main(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--repo", repo, ...extra], { log: () => {} });
-  recordFindings([candidate()], { review: messy, round: 1, repoRoot: repo, logDir });
-  cli([]);
-  assert.match(readFileSync(out, "utf8"), /null deref/, "no --review: everything is prior");
-  cli(["--review", messy]);
-  assert.equal(readFileSync(out, "utf8").trim(), "", "the same id, cleaned on both sides, excludes the running review");
 });
 
 test("the same finding recorded twice shows once, with its latest verdict", () => {
@@ -324,7 +308,8 @@ test("CLI: record reads stdin, prior writes a file brief.mjs can consume", () =>
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
   const run = (args, input) => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
 
-  const rec = run(["record", "--review", "rev-9", "--round", "1", "--log-dir", logDir],
+  const mine = scoped(workdir(), repo), other = scoped(workdir(), repo);
+  const rec = run(["record", "--work", mine, "--round", "1", "--log-dir", logDir],
     JSON.stringify([candidate({ file: "src/pay.ts", summary: "double charge on retry" }), candidate({ verdict: "open", file: "src/pay.ts", line: 20, summary: "cap unclear" })]));
   assert.equal(rec.status, 0, rec.stderr);
   assert.match(rec.stdout, /2 findings/);
@@ -334,18 +319,18 @@ test("CLI: record reads stdin, prior writes a file brief.mjs can consume", () =>
   const scope = path.join(work, "scope.diff");
   writeFileSync(scope, "--- a/src/pay.ts\n+++ b/src/pay.ts\n@@ -1,2 +1,3 @@\n context\n+added\n");
   const out = path.join(work, "prior.md");
-  const prior = run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir]);
+  const prior = run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--work", other]);
   assert.equal(prior.status, 0, prior.stderr);
   const text = readFileSync(out, "utf8");
   assert.match(text, /src\/pay\.ts:10 · correctness · double charge on retry · fixed/);
   assert.equal(text.split("\n").filter(Boolean).length, 2);
 
-  const excluded = run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--review", "rev-9"]);
+  const excluded = run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--work", mine]);
   assert.equal(excluded.status, 0, excluded.stderr);
   assert.equal(readFileSync(out, "utf8").trim(), "", "the running review is excluded, and the file still exists");
 
   writeFileSync(path.join(work, "intent.md"), "INTENT\nUser asked: \"pay\"\n");
-  run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir]);
+  run(["prior", "--scope", scope, "--out", out, "--log-dir", logDir, "--work", other]);
   const brief = spawnSync(process.execPath, [BRIEF, "--tier", "S", "--intent", path.join(work, "intent.md"),
     "--scope", scope, "--prior", out, "--out", path.join(work, "briefs")], { encoding: "utf8", cwd: repo });
   assert.equal(brief.status, 0, brief.stderr);
@@ -355,39 +340,39 @@ test("CLI: record reads stdin, prior writes a file brief.mjs can consume", () =>
 });
 
 test("CLI: a missing subcommand, a bad flag and unreadable input are usage errors, not crashes", () => {
-  const logDir = workdir();
+  const logDir = workdir(), work = scoped(workdir(), gitRepo());
   const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8" });
   assert.equal(run([]).status, 2);
   assert.match(run([]).stderr, /record|prior/);
   assert.equal(run(["sing"]).status, 2);
-  assert.equal(run(["record", "--log-dir", logDir], "[]").status, 2, "--work or --review is required");
-  assert.equal(run(["prior", "--log-dir", logDir]).status, 2, "--scope is required");
-  assert.equal(run(["prior", "--scope", "/no/such/scope.diff", "--log-dir", logDir]).status, 3);
-  assert.equal(run(["record", "--review", "r", "--log-dir", logDir], "{oops").status, 3);
-  assert.match(run(["record", "--review", "r", "--log-dir", logDir], "{oops").stderr, /findings.mjs:/);
+  assert.match(run(["record", "--log-dir", logDir], "[]").stderr, /pass --work <this review's work dir>/, "--work is required");
+  assert.equal(run(["prior", "--work", work, "--log-dir", logDir]).status, 2, "--scope is required");
+  assert.equal(run(["prior", "--scope", "/no/such/scope.diff", "--work", work, "--log-dir", logDir]).status, 3);
+  assert.equal(run(["record", "--work", work, "--log-dir", logDir], "{oops").status, 3);
+  assert.match(run(["record", "--work", work, "--log-dir", logDir], "{oops").stderr, /findings.mjs:/);
 });
 
 test("CLI: --round is validated, defaults to 1, and the error names what was typed", () => {
-  const logDir = workdir(), repo = gitRepo();
+  const logDir = workdir(), repo = gitRepo(), work = scoped(workdir(), repo);
   const run = (args, input = "[]") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
   const record = JSON.stringify([candidate()]);
   for (const round of ["abc", "0", "-1", "1.5"]) {
-    const bad = run(["record", "--review", "r", "--round", round, "--log-dir", logDir], record);
+    const bad = run(["record", "--work", work, "--round", round, "--log-dir", logDir], record);
     assert.equal(bad.status, 2, `--round ${round}`);
     assert.match(bad.stderr, new RegExp(`not "${round}"`), "the message quotes the value the user typed");
   }
   assert.equal(existsSync(findingsFile(repo, { logDir })), false, "a rejected round writes nothing");
-  assert.equal(run(["record", "--review", "r", "--log-dir", logDir], record).status, 0);
+  assert.equal(run(["record", "--work", work, "--log-dir", logDir], record).status, 0);
   assert.equal(stored(logDir, repo)[0].round, 1, "an omitted --round is round 1");
 });
 
 test("prior reads the config even when --max is passed — the path the skill uses", () => {
   const logDir = workdir(), repo = gitRepo();
-  const work = workdir(), scope = path.join(work, "scope.diff"), out = path.join(work, "prior.md");
+  const work = scoped(workdir(), repo), scope = path.join(work, "scope.diff"), out = path.join(work, "prior.md");
   writeFileSync(scope, "--- a/package.json\n+++ b/package.json\n@@ -1,1 +1,2 @@\n c\n+added\n");
   recordFindings([candidate({ file: "deploy/values.yaml", line: 3, class: "config", summary: "a config finding" })],
     { review: "r", round: 1, repoRoot: repo, logDir });
-  main(["prior", "--scope", scope, "--out", out, "--max", "5", "--log-dir", logDir, "--repo", repo], { log: () => {} });
+  main(["prior", "--scope", scope, "--out", out, "--max", "5", "--log-dir", logDir, "--work", work], { log: () => {} });
   assert.match(readFileSync(out, "utf8"), /a config finding/,
     "a lazily-evaluated config load is skipped by --max, and the exempt lists with it");
 });
@@ -400,14 +385,16 @@ test("record accepts JSONL as well as a JSON array — the state files are JSONL
   assert.equal(stored(logDir, repo).length, 2);
 });
 
-test("main() returns what it wrote, so the loop's one call is one line of output", () => {
-  const logDir = workdir(), repo = gitRepo();
+test("main() returns what it wrote, and the loop's one call says it first, then the verdict and next:", () => {
+  const logDir = workdir(), work = scoped(workdir(), gitRepo());
   const lines = [];
-  const result = main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"],
+  const result = main(["record", "--work", work, "--round", "1", "--log-dir", logDir, "--in", "-"],
     { log: (l) => lines.push(l), stdin: JSON.stringify([candidate()]) });
   assert.equal(result.count, 1);
-  assert.equal(lines.length, 1);
+  assert.equal(lines.length, 3);
   assert.match(lines[0], /1 finding .*fixed/);
+  assert.match(lines[1], /^CONTINUE — /);
+  assert.match(lines[2], /^next: /);
 });
 
 test("the review identity comes from the work dir, and two sessions are not one review", () => {
@@ -433,8 +420,8 @@ test("the review identity comes from the work dir, and two sessions are not one 
   assert.match(readFileSync(out, "utf8"), /null deref/, "another session's review is prior work");
 
   const both = run(["record", "--work", sessionA, "--review", "r", "--log-dir", logDir], "[]");
-  assert.equal(both.status, 2, "two spellings of one identity is a usage error");
-  assert.match(both.stderr, /not both/);
+  assert.equal(both.status, 2, "there is no second spelling of the identity");
+  assert.match(both.stderr, /unknown argument --review/);
 });
 
 test("convergence: W is computed from the records, over the angles two rounds share", () => {
@@ -862,7 +849,7 @@ test("--help prints the usage and the whole record vocabulary, and exits 0", () 
   for (const args of [["--help"], ["-h"], ["help"], ["record", "--help"], ["record", "--work", "/x", "-h"]]) {
     const out = cli(args);
     assert.equal(out.status, 0, `${args.join(" ")}: ${out.stderr}`);
-    assert.match(out.stdout, /findings\.mjs record \(--work <dir> \| --review <id>/, args.join(" "));
+    assert.match(out.stdout, /findings\.mjs record --work <dir> /, args.join(" "));
     for (const word of ["fixed", "dismissed", "open", "blocker", "major", "minor", "correctness", "cold-run", "pre-existing"]) {
       assert.match(out.stdout, new RegExp(`\\b${word}\\b`), `${args.join(" ")}: ${word}`);
     }
@@ -875,18 +862,18 @@ test("--help prints the usage and the whole record vocabulary, and exits 0", () 
   }
 });
 
-test("--help never advertises --work with --repo, the pair main() refuses", () => {
+test("--help advertises neither --review nor --repo, which main() rejects as unknown", () => {
   for (const args of [["--help"], ["converge", "--help"], ["record", "--help"], ["prior", "--help"], ["engagement", "--help"]]) {
     const out = cli(args);
     assert.equal(out.status, 0, out.stderr);
-    assert.doesNotMatch(out.stdout, /--work <dir>[^|\n]*\[--repo/, args.join(" "));
+    assert.doesNotMatch(out.stdout, /--review|--repo/, args.join(" "));
   }
 });
 
 test("an unknown flag names the flags the command does take", () => {
   const out = cli(["record", "--rounds", "2"], "[]");
   assert.equal(out.status, 2);
-  assert.match(out.stderr, /unknown argument --rounds — record takes --work, --review, --round, --in, --repo, --log-dir/);
+  assert.match(out.stderr, /unknown argument --rounds — record takes --work, --round, --in, --log-dir/);
 });
 
 test("a candidate exactly as SKILL.md §2c/§2e tells the lead to write it is accepted", () => {
@@ -1033,7 +1020,7 @@ test("nextAction: UNRECORDED prints the record call, and a path with a space is 
   assert.match(nextAction(verdictOf("CLEAN"), COUNTS, { work: null, tier: null, scripts: SCRIPTS }), /--tier <S\|M\|L> /,
     "an unknown tier is a placeholder, never a guess");
   assert.match(nextAction(verdictOf("CONTINUE"), COUNTS, { work: null, tier: null, scripts: SCRIPTS }), /--work <work> --round 3 --intent <work>\/intent\.md$/,
-    "a --review caller has no work dir to name");
+    "an unknown work dir is a placeholder");
 });
 
 /** A review dir with a round-N plan, recorded through the CLI. */
@@ -1108,9 +1095,9 @@ test("convergence: no STOP reason calls a round that fixed nothing unreviewed", 
 const unfixedRow = (over = {}) => kept({ verdict: "unfixed", summary: "confirmed, not fixed", ...over });
 
 test("unfixed: record accepts it, tally prints it, and the applier's word is hinted to it", () => {
-  const logDir = workdir(), repo = gitRepo();
+  const logDir = workdir(), work = scoped(workdir(), gitRepo());
   const lines = [];
-  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"],
+  main(["record", "--work", work, "--round", "1", "--log-dir", logDir, "--in", "-"],
     { log: (l) => lines.push(l), stdin: JSON.stringify([candidate({ verdict: "unfixed" })]) });
   assert.match(lines[0], /1 finding recorded \(1 unfixed\)/);
   assert.match(problems([candidate({ verdict: "blocked" })]), /got "blocked" — did you mean unfixed\?/);
@@ -1180,11 +1167,11 @@ test("unfixed: UNRECORDED still outranks it", () => {
 });
 
 test("unfixed: the marker's --open excludes it, no count is NaN, and the converge row carries it", () => {
-  const logDir = workdir(), repo = gitRepo();
+  const logDir = workdir(), work = scoped(workdir(), gitRepo());
   const lines = [];
   const entries = [candidate({ verdict: "unfixed", summary: "left" }), candidate({ verdict: "open", summary: "asked" })];
-  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"], { log: () => {}, stdin: JSON.stringify(entries) });
-  main(["converge", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
+  main(["record", "--work", work, "--round", "1", "--log-dir", logDir, "--in", "-"], { log: () => {}, stdin: JSON.stringify(entries) });
+  main(["converge", "--work", work, "--round", "1", "--log-dir", logDir], { log: (l) => lines.push(l) });
   const out = lines.join("\n");
   assert.match(out, /^ESCALATE — 1 CONFIRMED finding\(s\) left unfixed/m, out);
   assert.match(out, /--fixed 0 --dismissed 0 --open 1 /, out);
@@ -1201,23 +1188,6 @@ test("unfixed: the marker's --open excludes it, no count is NaN, and the converg
 const cliIn = (cwd) => (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd });
 const rowsIn = (logDir, repo) => (existsSync(findingsFile(repo, { logDir })) ? stored(logDir, repo) : []);
 const twoRepos = () => ({ a: gitRepo({ origin: "https://github.com/o/a.git" }), b: gitRepo({ origin: "https://github.com/o/b.git" }) });
-
-test("converge --review on a round with no rows is CLEAN: a --review caller has no receipt to hold", () => {
-  const logDir = workdir(), repo = gitRepo();
-  const lines = [];
-  main(["record", "--review", "r", "--round", "1", "--log-dir", logDir, "--repo", repo, "--in", "-"], { log: () => {}, stdin: JSON.stringify([candidate()]) });
-  main(["converge", "--review", "r", "--round", "2", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
-  assert.match(lines.join("\n"), /^CLEAN — round 2 /m, lines.join("\n"));
-  assert.doesNotMatch(lines.join("\n"), /^UNRECORDED/m);
-});
-
-test("converge --review on an id with nothing on record is UNRECORDED: a typo is not a clean review", () => {
-  const logDir = workdir(), repo = gitRepo();
-  const lines = [];
-  main(["converge", "--review", "typo", "--round", "1", "--log-dir", logDir, "--repo", repo], { log: (l) => lines.push(l) });
-  assert.match(lines.join("\n"), /^UNRECORDED — /m, lines.join("\n"));
-  assert.doesNotMatch(lines.join("\n"), /^CLEAN/m);
-});
 
 test("nextAction: a tier read from tier.json is shell-quoted like every other dynamic word", () => {
   const next = nextAction(verdictOf("CLEAN"), COUNTS, { work: "/w/review-1", tier: "L; rm -rf x", scripts: SCRIPTS });
@@ -1249,13 +1219,30 @@ test("record-repo: run from repo A on a scope naming repo B, the rows land in B 
   assert.match(out.stdout, /^CONTINUE — /m, "the fixed row is seen, not a false CLEAN");
 });
 
-test("record-repo: --work with --repo is a usage error for every command", () => {
+test("record-repo: --repo and --review are unknown arguments for every command", () => {
   const logDir = workdir(), { a, b } = twoRepos();
   const work = scoped(path.join(workdir(), "review-1"), b);
   for (const command of ["record", "converge", "prior", "engagement"]) {
-    const out = cliIn(a)([command, "--work", work, "--repo", b, "--log-dir", logDir], "[]");
-    assert.equal(out.status, 2, command);
-    assert.match(out.stderr, /--work or --repo, not both/, command);
+    for (const [flag, value] of [["--repo", b], ["--review", "r"]]) {
+      const out = cliIn(a)([command, "--work", work, flag, value, "--log-dir", logDir], "[]");
+      assert.equal(out.status, 2, `${command} ${flag}`);
+      assert.match(out.stderr, new RegExp(`unknown argument ${flag} `), `${command} ${flag}`);
+    }
+  }
+});
+
+test("record-repo: every command without --work exits 2 before it reads or writes anything", () => {
+  const logDir = workdir(), { a } = twoRepos();
+  const input = path.join(workdir(), "findings.json");
+  writeFileSync(input, JSON.stringify([candidate()]));
+  const scope = path.join(workdir(), "scope.diff");
+  writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n c\n+added\n");
+  const args = { record: ["--in", input], converge: [], prior: ["--scope", scope, "--out", path.join(logDir, "prior.md")], engagement: [] };
+  for (const [command, extra] of Object.entries(args)) {
+    const out = cliIn(a)([command, ...extra, "--log-dir", logDir], "{oops");
+    assert.equal(out.status, 2, `${command}: ${out.stderr}`);
+    assert.match(out.stderr, /pass --work <this review's work dir>/, command);
+    assert.deepEqual(readdirSync(logDir), [], `${command} wrote nothing`);
   }
 });
 
@@ -1304,4 +1291,114 @@ test("record-repo: prior --work run from repo A reads repo B's memory", () => {
   writeFileSync(scope, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n context\n+added\n");
   assert.equal(cliIn(a)(["prior", "--scope", scope, "--out", out, "--work", work, "--log-dir", logDir]).status, 0);
   assert.match(readFileSync(out, "utf8"), /null deref/);
+});
+
+// Empty-record A (questions/empty-record-answer.md): a `[]` over candidates the
+// round's reviewers filed is the forgotten round dressed as a clean one.
+const emptyRecordWork = (state = {}, rounds = [1]) => {
+  const repo = gitRepo();
+  const work = scoped(workdir(), repo, rounds);
+  for (const [name, text] of Object.entries(state)) {
+    const [round, file] = name.includes("/") ? name.split("/") : ["round-1", name];
+    mkdirSync(path.join(work, round, "state"), { recursive: true });
+    writeFileSync(path.join(work, round, "state", file), text);
+  }
+  const logDir = workdir();
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args, "--work", work, "--log-dir", logDir], { input, encoding: "utf8", cwd: repo });
+  return { work, logDir, run, receipt: (round = 1) => existsSync(path.join(work, `round-${round}`, "recorded.json")) };
+};
+const twoCandidates = `${JSON.stringify({ file: "a.mjs", line: 1, summary: "x" })}\n${JSON.stringify({ file: "a.mjs", line: 2, summary: "y" })}\n`;
+
+test("record refuses [] over filed candidates, names the file and its count, and writes nothing", () => {
+  const { logDir, run, receipt } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": twoCandidates });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2\)/);
+  assert.equal(receipt(), false);
+  assert.deepEqual(readdirSync(logDir), [], "no memory row was written");
+});
+
+test("record with a row over the same filed candidates records and writes the receipt", () => {
+  const { run, receipt } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": twoCandidates });
+  const out = run(["record", "--round", "1"], JSON.stringify([candidate()]));
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(receipt(), true);
+});
+
+test("a verifier's verdict lines are not candidates: [] records, CLEAN", () => {
+  const { run, receipt } = emptyRecordWork({ "self-review-verifier-k1-r2-b1.jsonl": `${JSON.stringify({ id: "r1-1", verdict: "REFUTED" })}\n` });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^CLEAN — /m);
+  assert.equal(receipt(), true);
+});
+
+test("state files that are empty, hold [] or hold only prose are no candidates", () => {
+  const { run, receipt } = emptyRecordWork({
+    "self-review-finder-k1-r1-a.jsonl": "",
+    "self-review-finder-k1-r1-b.jsonl": "[]\n",
+    "self-review-finder-k1-r1-c.jsonl": "reading the scope\nnothing found, moving on\n",
+  });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(receipt(), true);
+});
+
+test("a round with no state dir records []", () => {
+  const { run, receipt } = emptyRecordWork();
+  assert.equal(run(["record", "--round", "1"], "[]").status, 0);
+  assert.equal(receipt(), true);
+});
+
+test("a misnamed state file counts: waiting on the wrong name is how [] gets recorded", () => {
+  const { run, receipt } = emptyRecordWork({ "finder-abd-attempt-1.jsonl": `${JSON.stringify({ summary: "x" })}\n` });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /finder-abd-attempt-1\.jsonl \(1\)/);
+  assert.equal(receipt(), false);
+});
+
+test("a cold grader's state file counts", () => {
+  const { run, receipt } = emptyRecordWork({ "self-review-cold-grader-k1-r1-x.jsonl": `${JSON.stringify({ summary: "x" })}\n` });
+  assert.equal(run(["record", "--round", "1"], "[]").status, 3);
+  assert.equal(receipt(), false);
+});
+
+test("a one-line array of objects in a state file counts each object", () => {
+  const { run } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": `${JSON.stringify([{ summary: "x" }, { summary: "y" }, 3])}\n` });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2\)/);
+});
+
+test("only the recorded round's state is read: round 1's candidates do not block round 2's []", () => {
+  const { run, receipt } = emptyRecordWork({ "round-1/self-review-finder-k1-r1-abd.jsonl": twoCandidates }, [1, 2]);
+  assert.equal(run(["record", "--round", "1"], JSON.stringify([candidate()])).status, 0);
+  const out = run(["record", "--round", "2"], "[]");
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(receipt(2), true);
+});
+
+test("after the refusal, converge calls the round UNRECORDED", () => {
+  const { run } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": twoCandidates });
+  assert.equal(run(["record", "--round", "1"], "[]").status, 3);
+  const out = run(["converge", "--round", "1"]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^UNRECORDED — /m);
+});
+
+test("a state file that is not .jsonl is not read: [] records", () => {
+  const { run, receipt } = emptyRecordWork({ "notes.txt": `${JSON.stringify({ summary: "x" })}\n`, "self-review-finder-k1-r1-a.jsonl.tmp": `${JSON.stringify({ summary: "y" })}\n` });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(receipt(), true);
+});
+
+test("a state path that cannot be listed fails closed: exit 3, no receipt", () => {
+  const { work, run, receipt } = emptyRecordWork();
+  writeFileSync(path.join(work, "round-1", "state"), "not a directory\n");
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /cannot list the round's state dir/);
+  assert.equal(receipt(), false);
 });

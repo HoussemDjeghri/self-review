@@ -3,14 +3,12 @@
  * findings.mjs — what past reviews of this repository already found.
  *
  * Usage:
- *   findings.mjs record   (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--in <file|->] [--log-dir <dir>]
- *   findings.mjs prior    --scope <scope.diff> (--work <dir> | --review <id> [--repo <dir>]) [--out prior.md] [--max N] [--log-dir <dir>]
- *   findings.mjs converge (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--budget N] [--log-dir <dir>]
+ *   findings.mjs record   --work <dir> [--round N] [--in <file|->] [--log-dir <dir>]
+ *   findings.mjs prior    --scope <scope.diff> --work <dir> [--out prior.md] [--max N] [--log-dir <dir>]
+ *   findings.mjs converge --work <dir> [--round N] [--budget N] [--log-dir <dir>]
  *
  * `--work` is the round's work dir; the review's identity and its repository
- * (the round-1 scope's) are derived from it, so `--work` with `--repo` is
- * refused. `--review <id> [--repo <dir>]` instead when a caller has no work
- * dir, e.g. the evals.
+ * (the round-1 scope's) are derived from it.
  *
  * A review that cannot remember starts every round cold: the same near-miss in
  * the same file gets re-discovered by a fresh agent every time, at the price of
@@ -42,7 +40,7 @@ import { auditEngagement, engagementFile, engagementLine, openEngagement } from 
 import { parseDiff } from "./lib/diff.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
 import { classifyPath } from "./lib/paths.mjs";
-import { gitRoot, workRepo } from "./lib/repo.mjs";
+import { workRepo } from "./lib/repo.mjs";
 
 const fail = (message, exitCode = 3) => Object.assign(new Error(message), { exitCode });
 const usage = (message) => fail(message, 2);
@@ -124,7 +122,7 @@ const clean = (value, limit) => {
  * The stored form of a review id. Both commands derive it here: `record` wrote
  * the cleaned id and `prior` compared the raw flag, so any id that needed
  * cleaning (a full scratchpad path, > 120 characters) silently stopped
- * excluding the review it names — which is the one thing the flag exists for.
+ * excluding the review it names — which is the one thing that id exists for.
  */
 export const reviewId = (value) => clean(value ?? "", LIMITS.review);
 
@@ -356,7 +354,7 @@ export const findingsFile = (repoRoot, { logDir = LOG_DIR } = {}) =>
 export function recordFindings(entries, { review, round, rawRound, repoRoot = process.cwd(), logDir = LOG_DIR, now = () => new Date().toISOString() }) {
   if (!Array.isArray(entries)) throw fail("expected a JSON array, or one JSON object per line");
   const id = reviewId(review);
-  if (!id) throw usage("pass --work <this review's work dir> (or --review <id> when there is none)");
+  if (!id) throw usage("pass --work <this review's work dir>");
   if (!Number.isInteger(round) || round < 1) throw usage(`--round needs a positive integer, not ${JSON.stringify(rawRound ?? round)}`);
   const ts = now();
   const vetted = entries.map((entry, index) => toRecord(entry, index + 1, { review: id, round, ts }));
@@ -661,17 +659,17 @@ const shellWord = (word) => (/^(?:<[\w|]+>)?[\w@%+=:,./-]*$/.test(word) ? word :
  * `counts` are this review's records across all its rounds. `--intent` is left
  * for the lead: whether the ticket was validated is stored nowhere this reads.
  */
-export function nextAction(result, counts, { work = null, review = null, tier = null, scripts = HERE } = {}) {
+export function nextAction(result, counts, { work = null, tier = null, scripts = HERE } = {}) {
   const { round, verdict } = result;
   const dir = work ?? "<work>";
-  const identity = !work && review ? `--review ${shellWord(review)}` : `--work ${shellWord(dir)}`;
+  const identity = `--work ${shellWord(dir)}`;
   const script = (name) => shellWord(path.join(scripts, name));
   const nextRound = [script("round.sh"), "--work", shellWord(dir), "--round", round + 1, "--intent", shellWord(path.join(dir, "intent.md"))].join(" ");
   const marker = (outcome) => [script("converged.sh"), outcome, "--rounds", counts.rounds, "--fixed", counts.fixed,
     "--dismissed", counts.dismissed, "--open", counts.open, "--tier", tier === null || tier === undefined ? "<S|M|L>" : shellWord(tier), "--intent", "<validated|author|skipped>"].join(" ");
   if (verdict === "UNRECORDED") {
     return `next: ${script("findings.mjs")} record ${identity} --round ${round} --in <findings.json>\n`
-      + "  `[]` if it had nothing to record; record then prints the round's verdict and the call after it";
+      + "  `[]` if it had nothing to record (refused while this round's state/ files hold candidates: record each as a row); record then prints the round's verdict and the call after it";
   }
   if (verdict === "CLEAN") return `next: ${marker("--converged")}`;
   const unfixed = result.unfixed ?? [];
@@ -729,27 +727,27 @@ export function logConvergence(result, { review, cwd = process.cwd(), logDir = L
 
 // --- CLI --------------------------------------------------------------------
 const FLAGS = {
-  record: ["work", "review", "round", "in", "repo", "log-dir"],
-  prior: ["scope", "out", "max", "work", "review", "repo", "log-dir"],
-  converge: ["work", "review", "round", "budget", "repo", "log-dir"],
+  record: ["work", "round", "in", "log-dir"],
+  prior: ["scope", "out", "max", "work", "log-dir"],
+  converge: ["work", "round", "budget", "log-dir"],
   // Ruling 1's item 2: tree-guard proves it engaged, and this opens the log it
   // proves it into. `round.sh` runs it before any reviewer starts; `converge`
   // reads it back.
-  engagement: ["work", "review", "round", "repo", "log-dir"],
+  engagement: ["work", "round", "log-dir"],
 };
 
 // The interface used to be learned by failing: `--help` was refused as "pass a
 // command", 45 times in 18 sessions, and every refusal sent the caller grepping
 // this file for the schema it could have printed.
 const USAGE = {
-  record: "findings.mjs record (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--in <file|->] [--log-dir <dir>]\n"
-    + "  this round's verdicts, a JSON array or one object per line, on stdin or --in; `[]` records a round with nothing to record;\n"
-    + "  with --work it then prints the round's verdict and `next:`, the call that acts on it",
-  prior: "findings.mjs prior --scope <scope.diff> (--work <dir> | --review <id> [--repo <dir>]) [--out prior.md] [--max N] [--log-dir <dir>]\n"
+  record: "findings.mjs record --work <dir> [--round N] [--in <file|->] [--log-dir <dir>]\n"
+    + "  this round's verdicts, a JSON array or one object per line, on stdin or --in; `[]` records a round with nothing to record, and is refused (exit 3) while the round's state/*.jsonl files hold candidates;\n"
+    + "  then prints the round's verdict and `next:`, the call that acts on it",
+  prior: "findings.mjs prior --scope <scope.diff> --work <dir> [--out prior.md] [--max N] [--log-dir <dir>]\n"
     + "  the past findings that touch this change, one line each, for brief.mjs --prior",
-  converge: "findings.mjs converge (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--budget N] [--log-dir <dir>]\n"
+  converge: "findings.mjs converge --work <dir> [--round N] [--budget N] [--log-dir <dir>]\n"
     + "  each round's W, one verdict — CLEAN, CONTINUE, ESCALATE, STOP or UNRECORDED (SKILL §3) — and `next:`, the call that acts on it",
-  engagement: "findings.mjs engagement (--work <dir> | --review <id> [--repo <dir>]) [--round N] [--log-dir <dir>]\n"
+  engagement: "findings.mjs engagement --work <dir> [--round N] [--log-dir <dir>]\n"
     + "  opens the round's tree-guard engagement log (round.sh runs it)",
 };
 const RECORD_HELP = [
@@ -763,8 +761,7 @@ const RECORD_HELP = [
 ].join("\n");
 const helpFor = (command) => (command
   ? [`usage: ${USAGE[command]}`, ...(command === "record" ? [RECORD_HELP] : [])]
-  : ["usage:", ...Object.values(USAGE).map((line) => `  ${line.replace(/\n/g, "\n  ")}`),
-    "  --review <id> stands in for --work when a caller has no work dir", RECORD_HELP]).join("\n");
+  : ["usage:", ...Object.values(USAGE).map((line) => `  ${line.replace(/\n/g, "\n  ")}`), RECORD_HELP]).join("\n");
 const asksForHelp = (arg) => arg === "--help" || arg === "-h";
 
 // Where `record` says it ran for a round. An empty round leaves no row in the
@@ -783,8 +780,39 @@ function receiptRounds(work) {
     .filter((round) => existsSync(receiptFile(work, round)));
 }
 
+// Candidates the round's reviewers filed under `round-N/state/` (SKILL §2c),
+// per file. A verifier's lines are verdicts, possibly on earlier rounds'
+// dismissals, so they say nothing about this round and are excluded by name;
+// every other `.jsonl` counts, misnamed ones included, because a lead waiting on
+// the wrong name reads "no file" and records `[]` over them. A line that does
+// not parse counts as nothing: the check refuses, so it leans towards not.
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+function objectLines(text) {
+  let count = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let value;
+    try { value = JSON.parse(line); } catch { continue; }
+    count += Array.isArray(value) ? value.filter(isObject).length : isObject(value) ? 1 : 0;
+  }
+  return count;
+}
+function filedCandidates(work, round) {
+  const dir = path.join(work, `round-${round}`, "state");
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw fail(`cannot list the round's state dir ${dir} (${error.message})`);
+  }
+  return names.filter((name) => name.endsWith(".jsonl") && !name.startsWith("self-review-verifier-"))
+    .map((name) => ({ name, count: objectLines(read(path.join(dir, name), "a reviewer's state file")) }))
+    .filter(({ count }) => count > 0);
+}
+
 /**
- * One round's verdict, as `converge` and `record --work` both state it.
+ * One round's verdict, as `converge` and `record` both state it.
  *
  * The round cap already exists: `tier.mjs` computed it and wrote it into this
  * round's `tier.json` as `roundsCap`. Requiring it to be retyped as a flag
@@ -794,21 +822,15 @@ function receiptRounds(work) {
  * wins, so forcing a cap stays possible. The same plan names the tier the
  * marker in `next:` carries.
  */
-function judge(mine, round, { work, review, budget }) {
+function judge(mine, round, { work, budget }) {
   let plan = {};
-  if (work) {
-    try { plan = JSON.parse(readFileSync(path.join(work, `round-${round}`, "tier.json"), "utf8")) ?? {}; } catch { /* no plan for this round: the cap is genuinely unknown, and converge says so */ }
-  }
+  try { plan = JSON.parse(readFileSync(path.join(work, `round-${round}`, "tier.json"), "utf8")) ?? {}; } catch { /* no plan for this round: the cap is genuinely unknown, and converge says so */ }
   let budgetFrom = budget === null ? "" : " (given)";
   if (budget === null && Number.isInteger(plan.roundsCap) && plan.roundsCap >= 1) {
     budget = plan.roundsCap;
     budgetFrom = ` (round ${round}'s tier.json)`;
   }
-  // `--review` callers have no work dir to hold a receipt, so for them a round
-  // is recorded when the review has a row in it or an earlier round. Nothing in
-  // the plugin calls `converge --review`, so this fails closed: a review with
-  // nothing on record cannot be told apart from a typo, and a typo is not CLEAN.
-  const recorded = work ? existsSync(receiptFile(work, round)) : mine.some((record) => record.round <= round);
+  const recorded = existsSync(receiptFile(work, round));
   const result = convergence(mine, round, { budget, recorded });
   // `--open` in the marker stays the count of questions; `unfixed` is counted
   // so it cannot turn its own slot into a NaN.
@@ -817,11 +839,11 @@ function judge(mine, round, { work, review, budget }) {
   // The marker's tier is the review's, which round 1 planned; a later round
   // forced to S for an extension does not relabel the review.
   let first = plan;
-  if (work && round !== 1) {
+  if (round !== 1) {
     try { first = JSON.parse(readFileSync(path.join(work, "round-1", "tier.json"), "utf8")) ?? {}; } catch { first = {}; }
   }
   const tier = typeof first.tier === "string" && first.tier ? first.tier : null;
-  return { result, budget, budgetFrom, next: nextAction(result, counts, { work, review, tier }) };
+  return { result, budget, budgetFrom, next: nextAction(result, counts, { work, tier }) };
 }
 
 // Rows the memory file holds but no reader can use. Said on stderr, never
@@ -875,14 +897,12 @@ export function main(argv, { log = console.log, stdin } = {}) {
     return { help: true };
   }
   const options = parseArgs(rest, command);
-  // One way to say it per call: two spellings of one identity is what this
-  // flag's own history is made of.
-  if (options.work && options.review) throw usage("pass --work or --review, not both");
-  // A review has one repository, read from its own scope: an override that
-  // still parses would become the new way to key it on the wrong one.
-  if (options.work && options.repo) throw usage("pass --work or --repo, not both: a review dir's repository is its round-1 scope's");
-  const review = options.work ? reviewFromWork(options.work) : reviewId(options.review);
-  const repoRoot = options.work ? workRepo(options.work) : options.repo ? path.resolve(options.repo) : gitRoot();
+  // The work dir is the only identity: the review is named by it and the
+  // repository is its round-1 scope's, so there is no second spelling to
+  // disagree with it. Checked before any input is read.
+  if (!options.work) throw usage("pass --work <this review's work dir>");
+  const review = reviewFromWork(options.work);
+  const repoRoot = workRepo(options.work);
   const logDir = options.logDir ? path.resolve(options.logDir) : LOG_DIR;
 
   if (command === "record") {
@@ -897,28 +917,33 @@ export function main(argv, { log = console.log, stdin } = {}) {
     const round = Number(options.round ?? 1);
     // A round round.sh never planned is a typo, not a round: recording it
     // would invent a round dir and a receipt converge then believes.
-    if (options.work && Number.isInteger(round) && round >= 1) {
+    if (Number.isInteger(round) && round >= 1) {
       const plan = path.join(options.work, `round-${round}`, "tier.json");
       if (!existsSync(plan)) throw usage(`no plan at ${plan} — round ${round} was never planned; round.sh writes it`);
+    }
+    // An empty batch over filed candidates is a forgotten round, not a clean
+    // one: refused before anything is written, so no receipt and converge says
+    // UNRECORDED (questions/empty-record-answer.md).
+    if (entries.length === 0) {
+      const filed = filedCandidates(options.work, round);
+      if (filed.length) {
+        throw fail(`refusing to record round ${round} as empty: its reviewers filed candidates in ${path.join(options.work, `round-${round}`, "state")} — `
+          + `${filed.map(({ name, count }) => `${name} (${count})`).join(", ")}. Every candidate ends as a row (fixed, dismissed with proof, open or unfixed); a merge still leaves one.`);
+      }
     }
     const result = recordFindings(entries, { review, round, rawRound: options.round, repoRoot, logDir });
     // After the records, never before: a receipt for a write that failed is
     // the forgotten round dressed as a clean one.
-    if (options.work) {
-      const receipt = receiptFile(options.work, round);
-      writeFileSync(receipt, `${JSON.stringify({ review, round, count: result.count, ts: new Date().toISOString() })}\n`);
-    }
+    writeFileSync(receiptFile(options.work, round), `${JSON.stringify({ review, round, count: result.count, ts: new Date().toISOString() })}\n`);
     const counts = tally(result.records);
     log(`# ${result.count} finding${result.count === 1 ? "" : "s"} recorded${counts ? ` (${counts})` : ""} → ${result.file}`);
     // Recording is the last act of a round, so the verdict on it is due now —
     // not at the top of a round the verdict may say not to run.
-    if (options.work) {
-      const { records, skipped, malformed } = readRecords(result.file);
-      warnUnusable(skipped, malformed);
-      const verdict = judge(records.filter((record) => record.review === review), round, { work: options.work, budget: null });
-      log(`${verdict.result.verdict} — ${verdict.result.reason}`);
-      log(verdict.next);
-    }
+    const { records, skipped, malformed } = readRecords(result.file);
+    warnUnusable(skipped, malformed);
+    const verdict = judge(records.filter((record) => record.review === review), round, { work: options.work, budget: null });
+    log(`${verdict.result.verdict} — ${verdict.result.reason}`);
+    log(verdict.next);
     return result;
   }
 
@@ -935,12 +960,12 @@ export function main(argv, { log = console.log, stdin } = {}) {
     warnUnusable(skipped, malformed);
     const mine = records.filter((record) => record.review === review);
     // A clean round has a receipt and no rows, and it is the newest round.
-    const rounds = [...mine.map((record) => record.round), ...(options.work ? receiptRounds(options.work) : [])];
+    const rounds = [...mine.map((record) => record.round), ...receiptRounds(options.work)];
     const round = Number(options.round ?? (rounds.length ? Math.max(...rounds) : 1));
     if (!Number.isInteger(round) || round < 1) throw usage(`--round needs a positive integer, not ${JSON.stringify(options.round)}`);
     const given = options.budget === undefined ? null : Number(options.budget);
     if (given !== null && (!Number.isInteger(given) || given < 1)) throw usage(`--budget needs a positive integer, not ${JSON.stringify(options.budget)}`);
-    const { result, budget, budgetFrom, next } = judge(mine, round, { work: options.work, review: options.review, budget: given });
+    const { result, budget, budgetFrom, next } = judge(mine, round, { work: options.work, budget: given });
     logConvergence(result, { review, logDir });
     for (const n of [result.previousRound, round].filter((n) => n !== null)) {
       const at = convergence(mine, n);

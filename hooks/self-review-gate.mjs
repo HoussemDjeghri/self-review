@@ -116,7 +116,7 @@
  * A gate must never break the session: every failure path is a silent exit 0.
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
@@ -361,6 +361,19 @@ const ARG_WRITE_PATTERNS = [
   /\b(npm|pnpm|yarn|bun)\s+(?:(?:i|install|add)\b(?:\s+-\S+)*\s+[^-\s]|(?:remove|rm|uninstall|un|init|link|update|up)\b)/,
   /\bcargo\s+(add|remove|init|new)\b|\bgo\s+(get|mod\s+(tidy|edit|init))\b|\b(poetry|uv)\s+(add|remove|init)\b/,
 ];
+// An archive names what it reads, not what it writes: the files it extracts are
+// in its content, into `-C` or the current directory. Like a patch, the write is
+// unknown and the witness decides (witness-list ruling, test 1). This covers tar
+// by its extract flag, and unzip and ditto by name alone: unzip's read-only
+// `-l`/`-t` costs one witness stat, and ditto's operands cannot tell the
+// destination from the archive. bsdtar, 7z, cpio and `python3 -m zipfile -e`
+// are deliberately not recognised (witness-extractors ruling: zero uses in
+// 192,770 local commands, and each has a flag grammar).
+const extractsArchive = (ws) => {
+  const at = afterPrefixes(ws);
+  if (ws[at] === "unzip" || ws[at] === "ditto") return true;
+  return ws[at] === "tar" && ws.slice(at + 1).some((w, i) => w === "--extract" || w === "--get" || (/^-?[A-Za-z]*x[A-Za-z]*$/.test(w) && (i === 0 || w.startsWith("-"))));
+};
 // patch and `git apply|am` name the patch they read, not the files it rewrites,
 // which only its content says: the write is unknown, never the operand. Taken
 // as a target, a patch in a temp file resolved to scratch and passed.
@@ -369,15 +382,10 @@ const PATCH_APPLIERS = /\bgit\s+(apply|am)\b/;
 // heredocs, where the target is computed by the script and unknowable here.
 const SCRIPT_WRITE_PATTERNS = [
   /\bopen\(\s*[^)]*,\s*(?:mode\s*=\s*)?(['"])[wax]\+?b?\1/, // python open() for writing
-  /\.write_text\(|\.write_bytes\(|\bshutil\.(copy\w*|move|rmtree)\(|\bos\.(remove|unlink|rename|replace)\(/,
+  /\.write_text\(|\.write_bytes\(|\bshutil\.(copy\w*|move|rmtree|unpack_archive)\(|\bos\.(remove|unlink|rename|replace)\(|\.extractall\(/,
   /\b(?:fs\.|fsp\.|fs\.promises\.)?(writeFileSync|writeFile|appendFileSync|appendFile|rmSync|unlinkSync|renameSync|copyFileSync)\(/,
   /\bSet-Content\b|\bOut-File\b/,
 ];
-// Writers that keep the source's mtime: a move, or a copy that preserves
-// times. The stat witness dates a file by its mtime, so for these it cannot
-// look, and only a witness that looked may clear an unresolved write.
-const MTIME_KEEPING = /\bos\.(rename|replace)\(|\bshutil\.(move|copy2|copytree)\(|\b(renameSync|copyFileSync|cpSync|rename|copyFile|cp)\(|\btar\s+(-?[a-zA-Z]*x|--extract)|\brsync\s+(-[a-zA-Z]*[at]|--archive|--times)|\bcp\s+(-[a-zA-Z]*[pa]|--preserve|--archive)|\bmv\s|\binstall\s+(-[a-zA-Z]*p|--preserve-timestamps)/;
-const MTIME_BLIND = "could not look: the command moves or copies files keeping their mtime, which the gate dates writes by";
 
 // `S=/tmp/x; … > "$S/out"` is the common shape of scratch writes (long paths
 // get a variable). Substituting the command's own assignments lets the scratch
@@ -518,11 +526,15 @@ function pathOperands(ws) {
 // not scratch).
 function segmentWriteTargets(segment, ws) {
   const masked = maskQuotes(segment);
+  // Checked before the redirect: `tar xf "$a" > log` used to resolve to `log`
+  // alone — a named prose target — and the extraction was never witnessed. The
+  // redirect's own target goes unnamed, but the whole call is then decided by
+  // the witness, which reads git status inside the repository.
+  if (commandOf(ws) === "patch" || PATCH_APPLIERS.test(masked) || extractsArchive(ws)) return [];
   if (REDIRECT_RE.test(masked) || TEE_RE.test(masked)) {
     const after = (re) => [...masked.matchAll(re)].map((m) => wordAt(segment, m.index + m[0].length));
     return [...after(/(?:^|[^<>&0-9])>{1,2}(?!&)\s*/g), ...after(/\btee\b(?:\s+-\w+)*\s+/g)].filter((p) => p && p !== "/dev/null");
   }
-  if (commandOf(ws) === "patch" || PATCH_APPLIERS.test(masked)) return [];
   if (COMMAND_WRITERS.has(commandOf(ws)) || ARG_WRITE_PATTERNS.some((re) => re.test(masked))) return pathOperands(ws);
   if (INTERPRETER_RE.test(commandOf(ws)) && SCRIPT_WRITE_PATTERNS.some((re) => re.test(segment))) return [];
   return null;
@@ -582,7 +594,6 @@ function analyzeShell(text, dir, acc) {
     }
     acc.writes = true;
     if (found.length === 0 || opaque.length) acc.unknown = true;
-    if (acc.unknown && MTIME_KEEPING.test(segment)) acc.blind ??= MTIME_BLIND;
     acc.targets.push(...named.map(({ t, at }) => at + (t.endsWith("/") ? "/" : "")));
     after();
   }
@@ -613,7 +624,7 @@ function bashWrites(command, cwd) {
   for (const { interpreter, body } of scripts) {
     if (SHELL_INTERPRETERS.has(interpreter)) { analyzeShell(body, dir, acc); continue; }
     for (const m of body.matchAll(QUOTED_RE)) addLiteral(acc, m[2], dir);
-    if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; if (MTIME_KEEPING.test(body)) acc.blind ??= MTIME_BLIND; }
+    if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; }
   }
   if (!acc.writes) return null;
   const named = [...new Set(acc.targets)];
@@ -646,11 +657,12 @@ function statusPaths(stdout) {
 
 /**
  * Writes by EVIDENCE rather than by command shape: every file git reports as
- * changed, with its mtime. Which of them a given call wrote is decided per call
+ * changed, with its clocks. Which of them a given call wrote is decided per call
  * by `callWindow`, in memory, so a Stop still costs one git call however many
  * events ask.
  *
- * Returns `{ file, mtimeMs }` records, or the REASON there is nothing to ask —
+ * Returns `{ file, mtimeMs, ctimeMs, moves }` records, or the REASON there is
+ * nothing to ask —
  * which is a different answer from "nothing was written". It used to return a
  * bare null and the caller named one cause for all of them, so a transcript
  * whose turn has no parseable timestamp reported "no git repository" from
@@ -684,21 +696,48 @@ function changedFiles(cwd) {
   if (status.error || status.signal) return "git status did not finish within 10 s";
   if (status.status !== 0 || typeof status.stdout !== "string") return "no git repository";
   const files = [];
+  const dirStat = statCache();
   for (const rel of statusPaths(status.stdout)) {
     const file = path.resolve(top, rel);
     // A deleted file has no mtime and nothing to review. It is also not what
     // this fallback is for: the question is what the turn WROTE.
     let stat;
-    try { stat = statSync(file); } catch { continue; }
-    files.push({ file, mtimeMs: stat.mtimeMs });
+    // A symlink's own ctime is its creation; statSync would read its target's clocks.
+    try { stat = lstatSync(file); } catch { continue; }
+    files.push({ file, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, moves: ancestorMoves(file, top, dirStat) });
   }
   return files;
+}
+
+// A file inside a directory moved whole keeps both of its clocks; only the
+// moved directory's ctime and its new parent's advance, and the moved
+// directory's mtime stays put (witness-list ruling §3, dir-window ruling;
+// measured on APFS, ext4, overlayfs and tmpfs). So each file carries, for every
+// ancestor A strictly below the repository top, A's two clocks and its parent's
+// ctime — `wroteIn` reads a move from them.
+function ancestorMoves(file, top, dirStat) {
+  const moves = [];
+  for (let dir = path.dirname(file); dir !== top && dir.startsWith(top + path.sep); dir = path.dirname(dir)) {
+    const own = dirStat(dir), parent = dirStat(path.dirname(dir));
+    if (own && parent) moves.push({ mtimeMs: own.mtimeMs, ctimeMs: own.ctimeMs, parentCtimeMs: parent.ctimeMs });
+  }
+  return moves;
+}
+
+// One stat per directory per Stop, however many status entries share it.
+function statCache() {
+  const seen = new Map();
+  return (dir) => {
+    if (!seen.has(dir)) { try { seen.set(dir, statSync(dir)); } catch { seen.set(dir, null); } }
+    return seen.get(dir);
+  };
 }
 
 /**
  * The execution window of one shell call, by the transcript's own clock: from
  * the assistant entry that holds the tool_use to the user entry that holds its
- * result. A file is that call's evidence only if its mtime falls inside.
+ * result. A file is that call's evidence only if one of its clocks falls inside
+ * — or, for a directory moved in whole, since the call began (`wroteIn`).
  *
  * It used to be the whole turn, and a turn is long enough for another writer to
  * land in it: a session whose only write was a heredoc into a doc in ANOTHER
@@ -723,9 +762,41 @@ function callWindow(event, turn, since, finishedAt) {
   return { from, to: Number.isFinite(end) ? end : Infinity };
 }
 
-function inWindow({ from, to }, mtimeMs) {
-  const slack = mtimeMs % 1000 === 0 ? 2000 : 100;
-  return from - slack <= mtimeMs && mtimeMs <= to + slack;
+// A whole-second time is a coarse filesystem or one some tool set.
+const slackOf = (ms) => (ms % 1000 === 0 ? 2000 : 100);
+
+function inWindow({ from, to }, ms) {
+  return from - slackOf(ms) <= ms && ms <= to + slackOf(ms);
+}
+
+// Since the call began, by the transcript's clock: no upper bound.
+const sinceStart = ({ from }, ms) => ms >= from - slackOf(ms);
+
+// Whether a call wrote a file, by either clock (witness-list ruling D). mtime is
+// set by `utime()`, so a move or a time-preserving copy keeps it; ctime is set
+// by the kernel on every write, create, link, rename and `utime()`, and no
+// user-level API keeps or backdates it. Reading both is what lets the witness
+// stop caring which tool did the write — the blocklist of mtime-keeping writers
+// it replaces kept missing one more (`mv`, `git mv`, `install -p`, `ditto`).
+//
+// A directory moved in whole is the one write both clocks of a file miss, so the
+// moved ancestor A dates it, two ways:
+//  1. A's ctime and its parent's both in the window: a rename bumps both, while
+//     creating a file in A bumps only A, so an ordinary write into a directory
+//     does not pull in its older untracked files.
+//  2. A's ctime and its parent's both since the call began, and A's own mtime
+//     before it. Clause 1 alone was lost to the next call: a later Write into the
+//     parent pushes its ctime past the window, and the moved files go unnamed —
+//     `mv "$S/gen" src/` then a Write of `src/README.md`. A rename leaves A's
+//     mtime old where a create inside A advances it, so this does not fire for
+//     ordinary edits (Edit is itself an atomic rename, measured). A later write
+//     INSIDE A advances its mtime and still hides the move: a pinned miss.
+// Clause 2 can name an earlier unresolved call for a move a later resolved `mv`
+// made; the turn gates either way, which the ruling accepts.
+function wroteIn(window, { mtimeMs, ctimeMs, moves = [] }) {
+  return inWindow(window, mtimeMs) || inWindow(window, ctimeMs)
+    || moves.some((a) => (inWindow(window, a.ctimeMs) && inWindow(window, a.parentCtimeMs))
+      || (sinceStart(window, a.ctimeMs) && sinceStart(window, a.parentCtimeMs) && a.mtimeMs < window.from - slackOf(a.mtimeMs)));
 }
 
 // When each tool call's result came back, by tool_use id.
@@ -854,7 +925,7 @@ function collectChanges(turn, cwd, since) {
   const changes = [];
   const events = [...writeEvents(turn, -1, turn.length, cwd)];
   // One git call per Stop at most, and only when a command shape needs it; each
-  // event then keeps the files whose mtime falls inside its own call's window.
+  // event then keeps the files whose clocks fall inside its own call's window.
   let evidence;
   const finishedAt = resultTimes(turn);
   const witnessed = (event) => {
@@ -862,7 +933,7 @@ function collectChanges(turn, cwd, since) {
     if (cwd && !window) return "no timestamp for the start of this turn";
     if (evidence === undefined) evidence = changedFiles(cwd);
     if (!Array.isArray(evidence)) return evidence;
-    return evidence.filter(({ mtimeMs }) => inWindow(window, mtimeMs)).map(({ file }) => file);
+    return evidence.filter((record) => wroteIn(window, record)).map(({ file }) => file);
   };
   // An unresolved write is cleared only when the places it could have written
   // are bounded: every directory the command entered or names is inside the
@@ -898,7 +969,7 @@ function collectChanges(turn, cwd, since) {
       try { stat = statSync(file); } catch { continue; } // names nothing that exists
       if (stat.isDirectory()) {
         if (!bounded(file)) blind ??= `could not look: the command names ${file}, a directory outside this repository`;
-      } else if (stat.isFile() && !isExempt(file) && inWindow(window, stat.mtimeMs)) {
+      } else if (stat.isFile() && !isExempt(file) && wroteIn(window, stat)) {
         written.add(file);
       }
     }
