@@ -69,8 +69,8 @@ findings.mjs record --work <w> --round N --in <w>/round-N/findings.json
 
 From round 2 on, give `scope.sh` round 1's `--base` and paths again — without
 them it scopes the whole working tree — and give `tier.mjs` `--cap` (round.sh
-also passes `--cap-markers` with round 1's non-empty markers; without it the
-ceiling has no marker exception). A hand-built review stays hand-built:
+also passes `--cap-markers` with round 1's non-empty markers; without it every
+escalating marker round 1 already had counts as new and lifts the ceiling). A hand-built review stays hand-built:
 `round.sh` refuses its round 2, because it replays `round-1/scope-args` and
 `scope-cwd`, which only `round.sh` writes — do not write them by hand.
 `brief.mjs --tier S|M|L` is the last resort for when `tier.mjs` itself cannot
