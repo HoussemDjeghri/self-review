@@ -84,9 +84,12 @@ config: `references/scripts.md` → **Config**.
 ## 0 · Establish the scope and the intent
 
 **One work dir per review.** `round.sh --new-review` allocates
-`<reviews>/review-<k>/` under `<reviews>` = `<scratchpad>/self-review/` (else
-`mktemp -d`) and prints `work: <path>` first; **`<work>` is that path from then
-on** — every round (`<work>/round-<n>/`), the ledger, the marker. A new change
+`<reviews>/review-<k>/` under `<reviews>` = `<scratchpad>/self-review/` and
+prints `work: <path>` first; **`<work>` is that path from then on** — every
+round (`<work>/round-<n>/`), the ledger, the marker. Without a scratchpad
+(headless), `<reviews>` is what `"${CLAUDE_PLUGIN_ROOT}/scripts/reviews-dir.sh"` prints — the same
+private path on every call in one session (with the same `$TMPDIR`), ticket
+included, so there is nothing to remember. A new change
 is a new review even in the same session; never reuse an earlier `<work>`,
 because a shared dir compares W against another review's rounds and takes its
 tier ceiling. What `round.sh` refuses, and why a refused `>` is fixed in allow rules:
@@ -120,7 +123,8 @@ Then set the round up in **one call**:
 ```
 
 Round `N` ≥ 2 is `round.sh --work <work> --round <N> --intent <work>/intent.md`;
-it prints `findings.mjs converge`'s verdict on round `N−1` above the plan (§3),
+it replays round 1's scope (paths and `--base` are refused: a new scope is a
+new review), prints `findings.mjs converge`'s verdict on round `N−1` above the plan (§3),
 and when that verdict is `STOP` or `UNRECORDED` it refuses the round (exit 5,
 nothing created) and prints the `next:` call to run instead.
 That one call is scope, pre-flight, impact, tier, prior findings and every
@@ -222,7 +226,16 @@ rename, retype or inline them: the name is what the guards match and how
 `wait.mjs` finds the state file, and angle `X`'s `self-review-cold-grader` has
 **no Bash**, so a finder in its place hands a shell to the one angle designed
 without one. Without `tier.json`, `brief.mjs --tier S|M|L` prints a default
-plan's lines. What a brief carries: `references/scripts.md` → **Briefs**.
+plan's lines — but writes no plan, so that round cannot be recorded with
+`--work` (the recordable hand-built sequence: `references/scripts.md` →
+**Without round.sh**). What a brief carries: `references/scripts.md` → **Briefs**.
+
+The loop runs from a session that can spawn this plugin's agents — in an agent
+team, the lead; a teammate cannot spawn them. A teammate either hands its
+change to the lead (message it the scope) and ends with
+`converged.sh --not-applicable other --note "handed to lead: <scope>"`, or
+reviews it in one honest single pass (below) and ends `--not-converged` with
+its real counts — never `converged`, which the gate refuses without reviewers.
 
 If a *reviewer* type is missing, use `general-purpose` with that agent file
 (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) pasted at the top of the brief, under
@@ -237,8 +250,9 @@ subagent. While they read, do not edit, commit or rebase files in scope: a
 finder on a moved tree returns line numbers that point nowhere. Never use a fork
 for a reviewer and never review inline: a fork inherits the context that made
 the mistake, and inline review is what this skill replaces. Without the Agent
-tool, work through every angle yourself, sequentially, and say so — an honest
-single pass is fine; one described as the loop is not. A finder that returns
+tool, or as a teammate that cannot spawn this plugin's agents, work through
+every angle yourself, sequentially, and say so — an honest single pass is fine;
+one described as the loop is not. A finder that returns
 `failed` or `stopped` is salvaged (§2f), then re-spawned once at most; if that
 fails, report its angle as uncovered rather than waiting.
 
@@ -248,7 +262,7 @@ fails, report its angle as uncovered rather than waiting.
 first. A report is the finder's last message, which a wake-up does not carry.
 In one call, read every finished report —
 `scripts/salvage.mjs <session-id> <name> <name>…` (no names lists the agents; the session id is the UUID in your
-scratchpad path) — and run `scripts/treecheck.sh --work <work> --round <n>`,
+scratchpad path, or `$CLAUDE_CODE_SESSION_ID` without one) — and run `scripts/treecheck.sh --work <work> --round <n>`,
 which is silent unless the tree moved while reviewers ran; its line goes into
 the report **verbatim**, because a reviewer that wrote into the repository, or
 undid something to clean up, took uncommitted work with it.
@@ -332,7 +346,11 @@ from your `review-<k>` work dir, `<r>` the round) so `wait.mjs` and
 `salvage.mjs` find it (prompt `Read <path> and follow it.`), then
 `wait.mjs` on that name — never one per finding, since concurrent edits collide,
 never beside a finder, and **no edits while it runs**. It reports `applied` /
-`deviated` / `blocked` per directive.
+`deviated` / `blocked` per directive. Every later round replays round 1's scope and
+adds any file changed since round 1 outside its paths (`scope +:`); scope
+outside git cannot be widened, and a repository round 1 took no snapshot of says
+so (`scope +: not widened`); there a fix in another file is yours to read
+against the finding.
 
 If it never reports (killed, a usage-limit reset), do not re-dispatch the same
 file: its edits are already in the tree (§2f). When it reports: re-run the
@@ -483,7 +501,7 @@ gated.
 **Write the file** — the default; a scratch write needs no permission rule:
 
 ```
-Write  <work>/CONVERGED.json          # i.e. <scratchpad>/self-review/review-<k>/CONVERGED.json
+Write  <work>/CONVERGED.json          # i.e. <reviews>/review-<k>/CONVERGED.json
 {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author"}
 ```
 
@@ -512,7 +530,7 @@ transcript entry, so a write in the same command or a parallel call shares its
 position and the gate never clears (scratch-only writes beside it are exempt).
 
 Then the final report (`references/briefs.md`): outcome first — rounds, fixed,
-dismissed, open — then a line per fix, the open questions with
+dismissed, open — then a line per fix (five at most, then the ledger's path), the open questions with
 recommendations, and the checks you ran with their real results.
 
 ## On demand and beyond files

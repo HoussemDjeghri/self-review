@@ -6,7 +6,7 @@
 // detection does not, and it turns a silent loss into a named one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -167,6 +167,31 @@ test("a snapshot that failed is retried by the next --record for the same round"
   assert.ok(restore, `the retry's ref should be there to offer: ${changed.stdout}`);
   assert.equal(git("restore", `--source=${restore[1]}`, "--", ".").status, 0);
   assert.equal(readFileSync(path.join(repo, "src.mjs"), "utf8"), "export const one = 2;\n");
+});
+
+test("--changed names what differs from the round's snapshot, and says when there is none", () => {
+  const { repo, work } = fixture();
+  const none = run(repo, "--work", work, "--round", "1", "--root", repo, "--changed");
+  assert.equal(none.status, 3);
+  assert.equal(none.stdout, "");
+  assert.match(none.stderr, /no snapshot for round 1/);
+  assert.equal(run(repo, "--work", work, "--round", "1", "--root", repo, "--record").status, 0);
+  writeFileSync(path.join(repo, "fix.test.mjs"), "// written after the snapshot\n");
+  const changed = run(repo, "--work", work, "--round", "1", "--root", repo, "--changed");
+  assert.equal(changed.status, 0, changed.stderr);
+  const real = realpathSync(repo);
+  assert.deepEqual(changed.stdout.split("\0").filter(Boolean).map((f) => f.replace(real, repo)), [path.join(repo, "fix.test.mjs")],
+    "src.mjs was already dirty at the snapshot, so it is not new");
+});
+
+test("--changed lists a file deleted since the snapshot", () => {
+  const { repo, work } = fixture();
+  assert.equal(run(repo, "--work", work, "--round", "1", "--root", repo, "--record").status, 0);
+  rmSync(path.join(repo, "src.mjs"));
+  const changed = run(repo, "--work", work, "--round", "1", "--root", repo, "--changed");
+  assert.equal(changed.status, 0, changed.stderr);
+  const real = realpathSync(repo);
+  assert.deepEqual(changed.stdout.split("\0").filter(Boolean).map((f) => f.replace(real, repo)), [path.join(repo, "src.mjs")]);
 });
 
 test("no recorded snapshot is said out loud, not passed as clean", () => {

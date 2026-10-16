@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -384,7 +384,13 @@ test("usage errors are refused rather than guessed at", async () => {
   await refuses(["--work", work, "--round", "0"], /positive integer/);
   await refuses(["--work", work, "--round", "1", "--wat", "x"], /unknown argument --wat/);
   await refuses(["--work", work, "--round", "9", "--session", subagents], /no names given and no briefs/);
-  await refuses(["--work", "/tmp/no-session-id-here", "--round", "1", "f-ab"], /pass --session/);
+  const sessionEnv = process.env.CLAUDE_CODE_SESSION_ID;
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    await refuses(["--work", "/tmp/no-session-id-here", "--round", "1", "f-ab"], /pass --session/);
+  } finally {
+    if (sessionEnv !== undefined) process.env.CLAUDE_CODE_SESSION_ID = sessionEnv;
+  }
 });
 
 test("the session id comes from the scratchpad path, so the normal call needs no --session", () => {
@@ -392,6 +398,24 @@ test("the session id comes from the scratchpad path, so the normal call needs no
   assert.equal(sessionIdFrom(`/tmp/x/${SESSION}/scratchpad`), SESSION);
   assert.equal(sessionIdFrom("/tmp/x/not-a-uuid/scratchpad/self-review"), null);
   assert.equal(sessionIdFrom("/tmp/work"), null);
+});
+
+test("a work dir outside a scratchpad takes the session from CLAUDE_CODE_SESSION_ID, and names both sources when neither has one", async () => {
+  const { root, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  // The same work dir, minus the session id its path would otherwise carry.
+  renameSync(path.join(root, SESSION), path.join(root, "headless"));
+  const work = path.join(root, "headless", "scratchpad", "self-review");
+  const previous = process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    process.env.CLAUDE_CODE_SESSION_ID = subagents;
+    assert.equal((await run(["--work", work, "--round", "1", "f-ab"])).code, 0);
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    await assert.rejects(run(["--work", work, "--round", "1", "f-ab"]), /--work or CLAUDE_CODE_SESSION_ID; pass --session/);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+    else process.env.CLAUDE_CODE_SESSION_ID = previous;
+  }
 });
 
 test("a transcript is re-parsed only when it has grown", () => {

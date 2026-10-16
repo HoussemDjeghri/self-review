@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.8.6" src="https://img.shields.io/badge/version-0.8.6-191919">
+  <img alt="version 0.8.7" src="https://img.shields.io/badge/version-0.8.7-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -235,6 +235,8 @@ additive only**: the one thing a repository may contribute is extra *words* for
 the risk markers (`tier.riskPaths`, `tier.riskContent`), appended to the lists
 you already have — its own word for "payments", never a shorter list. Every
 other setting is the reviewer's.
+The Stop gate reads none of it: it loads your config alone, so a repository's
+file shapes the round's tier and never when the gate arms or what releases it.
 
 That is narrower than it started, and the narrowing is the story: a repository
 is reviewed by whoever clones it, so the attacker in this threat model is the

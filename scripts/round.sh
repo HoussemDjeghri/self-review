@@ -2,10 +2,10 @@
 # round — everything a review round needs before it can spawn a reviewer, in
 # ONE call.
 #
-# Usage: round.sh --new-review --work <base> --intent <file> [options] [path ...]
-#        round.sh --work <review dir> --round <n> --intent <file> [options] [path ...]
+# Usage: round.sh --new-review --work <base> --intent <file> [--base <ref>] [options] [path ...]
+#        round.sh --work <review dir> --round <n> [--intent <file>] [--force S|M|L --reason "…"] [--no-preflight]
 #        round.sh --work <review dir> --round 1 --intent <file> --force S|M|L --reason "…"
-#   options: [--base <ref>] [--force S|M|L --reason "…"] [--no-preflight]
+#   options: [--force S|M|L --reason "…"] [--no-preflight]; --base and paths belong to --new-review only — a later round replays round 1's scope
 #
 # `--new-review` starts a review: it allocates `<base>/review-<k>/` (the first
 # k whose plain `mkdir` succeeds), runs its round 1, and prints `work: <path>`
@@ -107,9 +107,20 @@ if [ "$new_review" -eq 1 ]; then
   round=1
 fi
 [ -n "$round" ]  || die "--round is required (or --new-review to start a review)"
-[ -n "$intent" ] || die "--intent is required"
 case "$round" in ''|*[!0-9]*) die "--round needs a positive integer, got: $round" ;; esac
 [ "$round" -ge 1 ] || die "--round needs a positive integer, got: $round"
+# From round 2 the review's own intent is the default, as its scope is below.
+[ -n "$intent" ] || [ "$round" -lt 2 ] || intent="$work/intent.md"
+[ -n "$intent" ] || die "--intent is required"
+# Refused before anything is created; the replay itself is with the scope below.
+if [ "$round" -ge 2 ]; then
+  [ -z "$base" ] && [ -z "${paths[0]+set}" ] || die "round $round reuses round 1's scope; paths and --base re-scope the change, which is a new review: round.sh --new-review --work <base> --intent <file>"
+  [ -f "$work/round-1/scope-args" ] && [ -f "$work/round-1/scope-cwd" ] || die "no recorded scope for round 1 ($work/round-1/scope-args, scope-cwd) — either --work is not the work: path --new-review printed, or this review dir predates rounds replaying it. Finish it as not-converged or start it again with --new-review; a later round never falls back to the cwd"
+  # The snapshot refs are keyed by the work path's spelling, which round 1
+  # recorded absolute; a relative or trailing-slash --work must match it.
+  work="$(abs_path "$work")"
+  [ -d "$(cat "$work/round-1/scope-cwd")" ] || die "round 1 ran in $(cat "$work/round-1/scope-cwd"), which no longer exists — its scope cannot be replayed"
+fi
 [ -f "$intent" ] || die "no intent file at $intent — write it before the round: it is what keeps reviewers from reviewing the wrong thing"
 [ -n "$force" ] || [ -z "$reason" ] || die "--reason belongs to --force"
 # The mirror of it. Without this the pairing was still caught — by tier.mjs,
@@ -216,8 +227,60 @@ scope="$dir/scope.diff"
 # A re-plan reviews the change round 1 captured, so nothing upstream of the plan
 # runs again: not scope, paperwork, pre-flight, impact, the cold run or the
 # tree record. None of their inputs changed, and forcing a tier is not one.
+#
+# Rounds 2 and later REPLAY round 1's scope rather than taking one: a review is
+# one change, and the same rule the re-plan already enforces. Taken per round,
+# it re-scoped silently — `round.sh --round 2` with no paths reads the cwd's
+# whole working tree, so a review begun with `--base` or a path list, or run
+# from another directory, reviewed a different change from round 2 on and
+# nothing said so (handoff-same-scope-answer.md). Round 1 records its arguments
+# and the directory they are relative to; a later round runs scope.sh there,
+# and refuses rather than guessing when the record is missing.
 if [ "$replan" -eq 0 ]; then
-  "$here/scope.sh" --work "$work" ${base:+--base "$base"} ${paths[@]+"${paths[@]}"} > "$scope"
+  if [ "$round" -eq 1 ]; then
+    scope_cwd="$PWD"
+    # NUL-separated, so a path may hold any byte but NUL and the replay never evaluates it.
+    for a in ${base:+--base "$base"} ${paths[@]+"${paths[@]}"}; do printf '%s\0' "$a"; done > "$dir/scope-args"
+    printf '%s\n' "$scope_cwd" > "$dir/scope-cwd"
+  else
+    scope_cwd="$(cat "$work/round-1/scope-cwd")"
+    replay=(); while IFS= read -r -d '' a; do replay+=("$a"); done < "$work/round-1/scope-args"
+    if [ "${replay[0]:-}" = "--base" ]; then base="${replay[1]}"; replay=("${replay[@]:2}"); fi
+    paths=(${replay[@]+"${replay[@]}"})
+    # A fix can land outside round 1's paths (a test beside the module, say),
+    # and a pure replay would never review it again. So a path-scoped round
+    # adds every file changed since round 1's snapshot that its paths do not
+    # already cover (replay-widen-answer.md). Unscoped and --base-only reviews
+    # already see those files.
+    r1_roots=(); while IFS= read -r r; do [ -n "$r" ] && r1_roots+=("$r"); done < <(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; s/^# repo: //p' "$work/round-1/scope.diff" 2>/dev/null | awk '!seen[$0]++')
+    if [ -n "${paths[0]+set}" ] && [ -n "${r1_roots[0]+set}" ]; then
+      covered=(); for p in "${paths[@]}"; do covered+=("$(cd "$scope_cwd" && abs_path "$p")"); done
+      widened=(); changed="$(mktemp)"
+      for r1_root in "${r1_roots[@]}"; do
+        tc=0; "$here/treecheck.sh" --work "$work" --round 1 --root "$r1_root" --changed >> "$changed" 2> "$changed.err" || tc=$?
+        case "$tc" in
+          0) ;;
+          3) echo "scope +: not widened in $r1_root — round 1 has no tree snapshot of it, so a fix there outside its paths is not in this round's scope; read any such fix yourself" ;;
+          *) err="$(cat "$changed.err")"; rm -f "$changed" "$changed.err"; die "treecheck.sh --changed failed in $r1_root (${err:-exit $tc}), so the files a fix changed outside round 1's paths are unknown — a pure replay would review less than it says" ;;
+        esac
+      done
+      while IFS= read -r -d '' f; do
+        inside=0; for c in "${covered[@]}"; do case "$f" in "$c"|"$c"/*) inside=1; break ;; esac; done
+        [ "$inside" -eq 1 ] || widened+=("$f")
+      done < "$changed"
+      rm -f "$changed" "$changed.err"
+      if [ -n "${widened[0]+set}" ]; then
+        paths+=("${widened[@]}")
+        echo "scope +: ${widened[*]} (changed since round 1, outside its paths)"
+      fi
+    fi
+  fi
+  # In this shell, not a subshell: the ERR trap names a step that dies only here.
+  # Absolute first, because the work dir may be given relative to the cwd we leave.
+  scope_abs="$(abs_path "$scope")"; work_abs="$(abs_path "$work")"
+  cd "$scope_cwd"
+  "$here/scope.sh" --work "$work_abs" ${base:+--base "$base"} ${paths[@]+"${paths[@]}"} > "$scope_abs"
+  cd "$OLDPWD"
 fi
 
 # The repository under review is the scope's, never the cwd's: given paths are
@@ -267,7 +330,7 @@ elif ! paperwork="$(node --input-type=module -e '
     process.stdout.write([
       `round.sh: the scope contains self-review paperwork — ${dir}/ (${count(files)} files, ${count(lines)} lines)`,
       "  it is the work dir of an earlier review, inside the repository; a round would review its own notes.",
-      `  remove it (rm -r ${dir}/), or scope only the change: round.sh … <paths>`,
+      `  remove it (rm -r ${dir}/), or scope only the change: round.sh --new-review … <paths> (a later round replays the scope of round 1)`,
     ].join("\n") + "\n");
   }
 ' "$here" "$scope")"; then
@@ -738,3 +801,11 @@ fi
 # Where pre-flight ran is part of reading its verdict: a FAIL from the install
 # copy that the checkout does not reproduce is the finding, not an artefact.
 [ -z "$pf" ] || { echo "pre-flight (from ${pf_from}):"; echo "$pf"; }
+# The staged copy's path is a trap this script sets on purpose (`cold run – ü`),
+# and a failure there reads correctly only to someone who knows that, so the
+# output says so (cl-c-preflight-urlpath-answer.md). It reads preflight.txt, not
+# $pf: the artifact-suite verdict is appended to $pf but runs under the work
+# dir, so its FAIL says nothing about the staged path.
+if [ -n "$pf_from" ] && [ -n "${repo_root:-}" ] && [ "$pf_from" != "$repo_root" ] && grep -q '^FAIL ' "$dir/preflight.txt" 2>/dev/null; then
+  echo "  this copy's path holds a space, an en dash and ü on purpose; a check that fails here and passes in the checkout resolved a path unsafely — a percent-encoded URL path (new URL(…).pathname, not fileURLToPath), an unquoted shell variable, or an ASCII-only assumption; rerun that check in the checkout to tell which"
+fi

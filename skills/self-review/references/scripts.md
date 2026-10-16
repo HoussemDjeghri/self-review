@@ -26,7 +26,11 @@ and keeps the old plan as `tier.replaced-<n>.json` and `briefs.replaced-<n>/`.
 It is refused (exit 2) once `round-2/` exists, once a finder has filed into
 `round-1/state/`, or when paths or `--base` are given — re-scoping is a new
 review. From round 2, a `STOP` or `UNRECORDED` verdict on the previous round
-refuses the round (exit 5, nothing created) and prints the `next:` call.
+refuses the round (exit 5, nothing created) and prints the `next:` call. A
+later round also refuses paths and `--base`, a review dir with no recorded
+round-1 scope (`scope-args`, `scope-cwd`: one begun before rounds replayed it),
+and a round-1 cwd that no longer exists. Finish such a review as not-converged,
+or start it again with `--new-review`.
 
 The `>` target is checked on its own as a file write (Claude Code's redirection
 rule), which the session scratchpad passes — hence SKILL.md §0's advice when
@@ -47,6 +51,31 @@ run `coldrun.sh` by hand and pass its transcript to `brief.mjs --cold`, or do
 not spawn X. A grader with no transcript can only file "not exercised". Every
 one of them carries its usage in its header comment and prints it on `--help`,
 so falling back does not mean reconstructing flags from prose.
+
+A hand-built round is recordable only if it writes what `record --work` reads.
+`<w>` is a fresh `<reviews>/review-<k>/` you allocate by hand — outside the
+repository (`scope.sh --work` refuses one inside it), and never reused, since the
+review id is a hash of the path and a reused dir merges two reviews. Write the
+INTENT block to `<w>/intent.md` first; then, for round `N`:
+
+```bash
+mkdir -p <w>/round-N
+scope.sh --work <w> [--base <ref>] [paths…] > <w>/round-N/scope.diff
+tier.mjs --scope <w>/round-N/scope.diff --out <w>/round-N/ --round N [--cap <round 1's tier>]
+brief.mjs --round N --plan <w>/round-N/tier.json --intent <w>/intent.md --scope <w>/round-N/scope.diff --out <w>/round-N/briefs/
+# spawn the printed Agent lines, wait, verify; write the verified candidates to <w>/round-N/findings.json
+findings.mjs record --work <w> --round N --in <w>/round-N/findings.json
+```
+
+From round 2 on, give `scope.sh` round 1's `--base` and paths again — without
+them it scopes the whole working tree — and give `tier.mjs` `--cap` (round.sh
+also passes `--cap-markers` with round 1's non-empty markers; without it the
+ceiling has no marker exception). A hand-built review stays hand-built:
+`round.sh` refuses its round 2, because it replays `round-1/scope-args` and
+`scope-cwd`, which only `round.sh` writes — do not write them by hand.
+`brief.mjs --tier S|M|L` is the last resort for when `tier.mjs` itself cannot
+run; it writes no plan, so that round cannot be recorded with `--work` and the
+review ends not-converged.
 
 ## Plugin root
 
@@ -95,6 +124,14 @@ failure — `--out` keeps that tail out of your context. It exits 0 even when a
 check fails: the report is the answer. Skip checks per project with
 `preflight.skip` in the config.
 
+`round.sh` runs it on a staged copy whose path holds a space, an en dash and
+`ü` on purpose, and says so under the verdicts when a check fails there. The
+three usual causes of a failure that the checkout does not reproduce: a
+percent-encoded URL path — `new URL(import.meta.url).pathname` yields `%20` and
+`%C3%BC`, `fileURLToPath` does not — an unquoted shell variable splitting on the
+space, and code that assumes ASCII paths. It is the project's bug, and a
+finding.
+
 **`preflight.artifactRoot`** is the other pre-flight key, and it is off by
 default. Name a subdirectory (`"plugin"`) and round 1 also copies it out and
 runs its `*.test.mjs` files with that subdirectory as the root — the one shape
@@ -137,7 +174,7 @@ changed file the next review has to review. A record missing the finder's
 
 Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin directory.
 
-- `scripts/round.sh` — **the entry point**: a whole round's setup in one call, the tier ceiling a later round inherits, the round-1 re-plan, and the refusal after `STOP` (§0)
+- `scripts/round.sh` — **the entry point**: a whole round's setup in one call, the tier ceiling a later round inherits, the round-1 re-plan, the replay of round 1's scope for every later round, and the refusal after `STOP` (§0)
 - `scripts/lib/path.sh` — `abs_path`, shared by `round.sh` and `scope.sh`
 - `scripts/scope.sh` — scope bundle (diff + untracked files; each path diffed against its own repo, plain text only for paths in none)
 - `scripts/impact.mjs` — blast radius: broken references, tests, callers, docs (§0); writes `impact.md` + `impact.json`
@@ -146,7 +183,8 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record --work` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
 - `scripts/preflight.sh` — the project's own checks for the touched ecosystems (§1)
 - `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1)
-- `scripts/treecheck.sh` — says whether the working tree moved while reviewers ran (§2c)
+- `scripts/treecheck.sh` — says whether the working tree moved while reviewers ran (§2c); `--changed` lists what moved since a round's snapshot, which `round.sh` adds to a path-scoped later round
+- `scripts/reviews-dir.sh` — the headless `<reviews>`: one private dir per `$CLAUDE_CODE_SESSION_ID`, refused rather than replaced (§0)
 - `scripts/root.mjs` — prints the installed plugin root when `${CLAUDE_PLUGIN_ROOT}` is unexpanded (§0)
 - `scripts/audit.mjs` — what a review cost, per review, from the session transcripts
 - `scripts/converged.sh` — the script form of the marker (§4) + `~/.claude/self-review/log.jsonl`

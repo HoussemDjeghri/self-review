@@ -352,8 +352,12 @@ export async function main(argv, {
       : []);
   if (names.length === 0) throw usage(`no names given and no briefs under ${briefsDir}`);
 
-  const sessionId = options.session ?? sessionIdFrom(workDir);
-  if (!sessionId) throw usage("could not read a session id from --work; pass --session <id>");
+  // A session with no scratchpad (headless `claude -p`) puts <work> under
+  // mktemp, so the path names no session; Claude Code exports the id to every
+  // Bash call, and that is the session whose subagents/ directory holds the
+  // reviewers.
+  const sessionId = options.session ?? sessionIdFrom(workDir) ?? (process.env.CLAUDE_CODE_SESSION_ID || null);
+  if (!sessionId) throw usage("could not read a session id from --work or CLAUDE_CODE_SESSION_ID; pass --session <id>");
   const dir = resolveSubagentsDir(sessionId);
   if (!existsSync(dir)) {
     throw Object.assign(

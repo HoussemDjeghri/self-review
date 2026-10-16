@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # treecheck — did the working tree change while the reviewers ran?
 #
-# Usage: treecheck.sh --work <dir> --round <n> [--root <repo>] [--record]
+# Usage: treecheck.sh --work <dir> --round <n> [--root <repo>] [--record | --changed]
 #
 # `--record` writes the snapshot round.sh takes before it prints the briefs;
 # the default compares the current state against it and names what moved.
+# `--changed` prints, NUL-separated and absolute, the files that differ between
+# round <n>'s snapshot ref and the tree now (deleted files included — scope.sh renders a
+# path that no longer exists as its deletion); round.sh adds
+# them to a later round's replayed paths. It exits 3 when the round has no
+# snapshot (never taken, or pruned), so the caller can say the widening did not
+# happen.
 #
 # It exists because a read-only finder ran the writer it was reviewing against
 # the real repository and then `git checkout -- <files>` to undo it. The undo is
@@ -25,18 +31,20 @@
 # Exit: 0 whether or not the tree moved — a detector that breaks the `&&` chain
 # it is run in gets dropped from the chain; 2 usage, or no recorded snapshot to
 # compare against, which is a thing the caller must hear rather than read as
-# "clean".
+# "clean"; 3 from `--changed` when the round has no snapshot, so the caller
+# can say its scope was not widened.
 set -euo pipefail
 
 die() { echo "treecheck.sh: $*" >&2; exit 2; }
 
-work=""; round=""; root=""; record=0
+work=""; round=""; root=""; record=0; changed=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --work)   [ $# -ge 2 ] || die "--work needs a directory"; work="$2"; shift 2 ;;
     --round)  [ $# -ge 2 ] || die "--round needs a number";   round="$2"; shift 2 ;;
     --root)   [ $# -ge 2 ] || die "--root needs a directory"; root="$2"; shift 2 ;;
     --record) record=1; shift ;;
+    --changed) changed=1; shift ;;
     -h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -117,6 +125,23 @@ prune_snapshots() {
       [ "$((now - ts))" -gt 604800 ] && git -C "$root" update-ref -d "$ref" || true
     done
 }
+
+# What a fix changed since round <n>, measured against its snapshot rather than
+# HEAD: the snapshot holds the dirty tree as it was, so work that predates the
+# round cancels out and only edits made during the review remain
+# (replay-widen-answer.md). Same temp-index move as record_snapshot.
+if [ "$changed" -eq 1 ]; then
+  [ "$record" -eq 0 ] || die "--record and --changed are separate calls"
+  git -C "$root" rev-parse --verify -q "$(snapshot_ref)^{commit}" >/dev/null 2>&1 || { echo "treecheck.sh: no snapshot for round $round of this review" >&2; exit 3; }
+  top="$(git -C "$root" rev-parse --show-toplevel)"
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  cp "$(git -C "$root" rev-parse --path-format=absolute --git-path index 2>/dev/null)" "$tmp/index" 2>/dev/null || true
+  GIT_INDEX_FILE="$tmp/index" git -C "$root" add -A
+  now_tree="$(GIT_INDEX_FILE="$tmp/index" git -C "$root" write-tree)"
+  git -C "$root" diff-tree -r -z --name-only "$(snapshot_ref)^{tree}" "$now_tree" |
+    while IFS= read -r -d '' f; do printf '%s\0' "$top/$f"; done
+  exit 0
+fi
 
 before="$work/round-$round/tree-before.txt"
 if [ "$record" -eq 1 ]; then

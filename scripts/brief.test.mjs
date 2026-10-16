@@ -378,6 +378,12 @@ test("what the ledger carried is stated, and an empty one at round 2 says so", (
   writeFileSync(real, "# ledger\n\n## dismissed\n- D1 — refuted: the lock is held\n- D2 — refuted: unreachable\n");
   assert.match(run(3, real), /^# 2 dismissed findings carried into every brief$/m);
 
+  // A written ledger whose dismissed section holds only its placeholder: no
+  // dismissals, and no scolding either — the lead did update it.
+  const none = path.join(dir, "none.md");
+  writeFileSync(none, "# ledger\n\n## fixed\n- r1-1 fixed\n\n## dismissed\n_No dismissals yet._\n\n## open\n- r1-2 open\n");
+  assert.match(run(2, none), /^# 0 dismissed findings carried into every brief$/m);
+
   // Round 1 has nothing to carry by definition, so it must not be scolded.
   const round1 = run(1, placeholder);
   assert.doesNotMatch(round1, /never updated/);

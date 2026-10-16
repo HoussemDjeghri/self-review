@@ -35,6 +35,7 @@ import { isMain } from "../hooks/lib/config.mjs";
 import { COUNTS, LABELS, OUTCOMES as MARKER_OUTCOMES, fieldsFromFlags, formatSummary, isCounted, validateMarker } from "../hooks/lib/marker.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "../hooks/lib/shell.mjs";
 import { readRecords, reviewFromWork } from "./findings.mjs";
+import { isHumanPrompt } from "../hooks/lib/transcript.mjs";
 
 const DEFAULT_PROJECTS = path.join(homedir(), ".claude", "projects");
 const DEFAULT_LOG_DIR = process.env.SELF_REVIEW_LOG_DIR || path.join(homedir(), ".claude", "self-review");
@@ -578,6 +579,66 @@ function markerOf(entry) {
 const spawnsReviewer = (entry) =>
   toolUses(entry).some((use) => use.name === "Agent" && /self-review-(finder|verifier)|round \d/i.test(JSON.stringify(use.input ?? {})));
 
+// Where a review really started, for the residue: the skill load, because its
+// body is part of what the review leaves behind (11k of ~45k measured on one
+// review), not the first spawn after it. A session that ran the loop without
+// loading the skill starts at its last loop-script invocation before the spawn instead.
+const loadsSkill = (entry) =>
+  toolUses(entry).some((use) => use.name === "Skill" && /^(self-review:)?self-review$/.test(String(use.input?.skill ?? ""))) ||
+  (entry.type === "user" && /<command-name>\/?(self-review:)?self-review<\/command-name>/.test(textOf(entry.message)));
+const LOOP_SCRIPT = /(^|\/)(preflight|scope|round)\.sh$/;
+// Invoked, not named: `shellcheck …/round.sh` and `cat …/round.sh` are this
+// repository developing the plugin, not a review starting.
+export const invokesLoopScript = (command) =>
+  command.split(/&&|\|\||;|\n/).some((segment) => {
+    const words = segment.trim().replace(/["']/g, "").split(/\s+/).filter((word) => !/^\w+=/.test(word));
+    return LOOP_SCRIPT.test((/^(ba)?sh$/.test(words[0]) ? words[1] : words[0]) ?? "");
+  });
+const runsLoopScript = (entry) =>
+  toolUses(entry).some((use) => use.name === "Bash" && invokesLoopScript(String(use.input?.command ?? "")));
+
+// The main session's model calls, once each, with the context each one carried:
+// a message streamed as several entries repeats its id and its usage.
+function mainCalls(entries) {
+  const seen = new Set();
+  const calls = [];
+  entries.forEach((entry, index) => {
+    const usage = entry.message?.usage;
+    if (entry.type !== "assistant" || entry.isSidechain || !usage) return;
+    const id = entry.message.id ?? entry.uuid;
+    if (seen.has(id)) return;
+    seen.add(id);
+    calls.push({ index, ctx: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) });
+  });
+  return calls;
+}
+
+/**
+ * What one review left in the main context, and how many later calls paid for
+ * it. `residue` is the context of the first main call after the marker minus
+ * that of the last main call at or before the review's start (the call that
+ * loaded the skill, ran the script or spawned the first reviewer carries the
+ * pre-review context); `laterCalls` counts the
+ * main calls after the marker until the next compaction or the session's end,
+ * each of which re-bills the residue. Null when it cannot be measured: no call
+ * on one side, or a compaction anywhere between the two calls (inside the
+ * review, or just before it started or just after its marker), which resets the
+ * context the difference is taken over.
+ */
+export function residueOf({ startIndex, endIndex }, calls, compactions) {
+  if (endIndex === null || endIndex === undefined) return { residue: null, laterCalls: null, compacted: null };
+  const compacted = compactions.some((at) => at > startIndex && at < endIndex);
+  const before = calls.filter((call) => call.index <= startIndex).at(-1);
+  const after = calls.find((call) => call.index > endIndex);
+  const reset = before && after && compactions.some((at) => at > before.index && at < after.index);
+  const nextCompaction = compactions.find((at) => at > endIndex) ?? Infinity;
+  return {
+    residue: before && after && !reset ? after.ctx - before.ctx : null,
+    laterCalls: calls.filter((call) => call.index > endIndex && call.index < nextCompaction).length,
+    compacted,
+  };
+}
+
 // Both marker forms are logged (the script logs itself, the gate logs the file
 // write), so log.jsonl carries summaries for reviews whose marker call is no
 // longer in the transcript — a long session drops old tool calls.
@@ -622,20 +683,30 @@ export function auditSession(sessionJsonl, { logDir = DEFAULT_LOG_DIR } = {}) {
   const agents = agentsOf(sessionJsonl);
   const windows = [];
   let open = null;
+  // The latest skill load and the latest loop script invoked since the last window
+  // closed or the last human prompt: the review's start for the residue, if one came before its spawn.
+  let skillAt = null, scriptAt = null;
 
-  for (const entry of entries) {
-    if (entry.type !== "assistant") continue;
-    if (!open && spawnsReviewer(entry)) open = { startedAt: entry.timestamp ?? null, turns: [], summary: null, endedAt: null, markerSource: null };
-    if (!open) continue;
+  entries.forEach((entry, index) => {
+    if (!open && isHumanPrompt(entry)) skillAt = scriptAt = null;
+    if (!open && loadsSkill(entry)) skillAt = index;
+    if (!open && runsLoopScript(entry)) scriptAt = index;
+    if (entry.type !== "assistant") return;
+    if (!open && spawnsReviewer(entry)) {
+      open = { startedAt: entry.timestamp ?? null, startIndex: skillAt ?? scriptAt ?? index, startKind: skillAt !== null ? "skill" : scriptAt !== null ? "script" : "spawn", endIndex: null, turns: [], summary: null, endedAt: null, markerSource: null };
+    }
+    if (!open) return;
     open.turns.push(entry);
     const summary = markerOf(entry);
-    if (summary === null) continue;
+    if (summary === null) return;
     open.summary = summary;
     open.endedAt = entry.timestamp ?? null;
+    open.endIndex = index;
     open.markerSource = "transcript";
     windows.push(open);
     open = null;
-  }
+    skillAt = scriptAt = null;
+  });
   if (open) windows.push(open);
 
   const log = logRecords(logDir, entries.find((entry) => entry.cwd)?.cwd);
@@ -658,7 +729,9 @@ export function auditSession(sessionJsonl, { logDir = DEFAULT_LOG_DIR } = {}) {
     window.endedAt = logged.ts;
     window.markerSource = "log";
   });
-  const reviews = windows.map((window) => finish(window, agents, log));
+  const calls = mainCalls(entries);
+  const compactions = entries.flatMap((entry, index) => (entry.type === "system" && entry.subtype === "compact_boundary" ? [index] : []));
+  const reviews = windows.map((window) => ({ ...finish(window, agents, log), ...residueOf(window, calls, compactions), startKind: window.startKind }));
 
   return {
     session: path.basename(sessionJsonl, ".jsonl"),
@@ -718,7 +791,13 @@ function finish(review, agents, log = []) {
     // already counted. Both are the same mistake — a review belongs to one
     // window and only a global view knows which.
     appliers: appliers.map((agent) => ({ round: agent.round, depth: agent.depth })),
-    tokens: { main: usageOf(review.turns), finders: tokensOf(finders), verifier: tokensOf(verifiers) },
+    // Every role's spend, so the main session's share is a share of the whole
+    // review: `applier` was computed and left out of the denominator, which
+    // overstated it (47% against 44% in October).
+    tokens: {
+      main: usageOf(review.turns), finders: tokensOf(finders), verifier: tokensOf(verifiers),
+      applier: tokensOf(appliers),
+    },
     tooling: { calls: sum(mine, (r) => r.toolingCalls), ofToolCalls: sum(mine, (r) => r.toolCalls) },
     // Rounds come from the marker, decisions from the log: fewer decisions than
     // rounds means the record is incomplete, not that no round earned its extra.
@@ -738,6 +817,11 @@ function* sessionFiles(root) {
     else if (entry.name.endsWith(".jsonl")) yield full;
   }
 }
+
+// A review's whole spend, every role included; the per-review line and the
+// per-tier table both divide by it.
+const ROLES = ["main", "finders", "verifier", "applier"];
+const spentOf = (review, field) => ROLES.reduce((total, role) => total + (review.tokens[role]?.[field] ?? 0), 0);
 
 export function aggregate(reviews) {
   const byTier = new Map();
@@ -759,8 +843,8 @@ export function aggregate(reviews) {
     if (isCounted(review.outcome)) {
       row.agents += review.agents.finders + review.agents.verifiers;
       row.turns += review.turns;
-      row.billedInput += review.tokens.main.billedInput + review.tokens.finders.billedInput + review.tokens.verifier.billedInput;
-      row.output += review.tokens.main.output + review.tokens.finders.output + review.tokens.verifier.output;
+      row.billedInput += spentOf(review, "billedInput");
+      row.output += spentOf(review, "output");
     }
     byTier.set(tier, row);
   }
@@ -773,12 +857,14 @@ function report(audits, reflagRowsIn = []) {
   if (!reviews.length) return "no reviews found (a review is a reviewer spawn followed by a convergence marker)";
   const lines = ["== REVIEWS =="];
   for (const review of reviews) {
-    const spent = review.tokens.main.billedInput + review.tokens.finders.billedInput + review.tokens.verifier.billedInput;
+    const spent = spentOf(review, "billedInput");
+    const kilo = (n) => (n === null || n === undefined ? "?" : `${(n / 1000).toFixed(1)}k`);
     lines.push(
       `  ${(review.startedAt ?? "").slice(0, 16)} ${review.session.slice(0, 8)} tier=${review.tier ?? "?"} ${review.outcome}` +
       ` rounds=${review.rounds ?? "?"} fixed=${review.fixed ?? "?"} dismissed=${review.dismissed ?? "?"}` +
-      ` agents=${review.agents.finders}f+${review.agents.verifiers}v turns=${review.turns}` +
+      ` agents=${review.agents.finders}f+${review.agents.verifiers}v+${review.agents.appliers ?? 0}a turns=${review.turns}` +
       ` billed-in=${millions(spent)} (main ${Math.round(100 * review.tokens.main.billedInput / Math.max(1, spent))}%)` +
+      ` residue=${review.compacted ? "compacted" : kilo(review.residue)}@${review.startKind} later=${review.laterCalls ?? "?"}` +
       ` tooling=${review.tooling.calls}/${review.tooling.ofToolCalls} reviewer calls`);
     for (const row of review.overlap) {
       const share = row.total ? ` (${Math.round(100 * row.shared / row.total)}%)` : "";
@@ -830,8 +916,16 @@ function report(audits, reflagRowsIn = []) {
   return lines.join("\n");
 }
 
+const USAGE = "usage: audit.mjs [--json] [--log-dir <dir>] [session.jsonl…]";
+
 function main(argv) {
   const fail = (message, exitCode) => { throw Object.assign(new Error(message), { exitCode }); };
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(USAGE + "\n");
+    return;
+  }
+  const unknown = argv.find((arg) => arg.startsWith("--") && arg !== "--json" && arg !== "--log-dir");
+  if (unknown !== undefined) fail(`unknown argument: ${unknown}\n${USAGE}`, 2);
   const asJson = argv.includes("--json");
   const logAt = argv.indexOf("--log-dir");
   if (logAt !== -1 && argv[logAt + 1] === undefined) fail("--log-dir needs a directory", 2);

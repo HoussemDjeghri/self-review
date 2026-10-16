@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { aggregate, appliedBy, auditSession, candidatesOf, overlapOf, ownerWindows, parseSummary, reflagOf, reflagRows, recordsByReview } from "./audit.mjs";
+import { aggregate, appliedBy, auditSession, candidatesOf, invokesLoopScript, overlapOf, ownerWindows, parseSummary, reflagOf, reflagRows, recordsByReview, residueOf } from "./audit.mjs";
 
 const SCRIPT = fileURLToPath(new URL("audit.mjs", import.meta.url));
 // auditSession's default logDir is the machine's real ~/.claude/self-review,
@@ -137,6 +137,124 @@ test("a review runs from the first reviewer spawn to the marker, with its agents
   assert.equal(review.tooling.ofToolCalls, 2);
   assert.equal(review.tokens.finders.calls, 2);
   assert.ok(review.tokens.main.billedInput > 0);
+});
+
+// ---------- the residue instrument ----------
+//
+// What a review leaves in the main context is the cost every later turn pays for
+// it, so the audit reports it per review rather than leaving it to a side script.
+const withCtx = (timestamp, ctx, content) => ({
+  type: "assistant", timestamp,
+  message: { id: `msg-${nextId++}`, model: "claude-opus-5", usage: { input_tokens: 0, cache_read_input_tokens: ctx, cache_creation_input_tokens: 0, output_tokens: 5 }, content },
+});
+const skillLoad = { type: "tool_use", name: "Skill", input: { skill: "self-review:self-review" } };
+const compaction = (timestamp) => ({ type: "system", subtype: "compact_boundary", timestamp });
+
+test("residue is the main context just after the marker minus the call that loaded the skill, and later calls run to the next compaction", () => {
+  const file = session([
+    withCtx("2026-10-15T10:00:00Z", 40_000, [{ type: "text", text: "the work" }]),
+    withCtx("2026-10-15T10:01:00Z", 41_000, [skillLoad]),
+    withCtx("2026-10-15T10:02:00Z", 52_000, [spawn("r1-abd")]),
+    withCtx("2026-10-15T10:30:00Z", 70_000, [bashMarker("rounds=1 fixed=0 dismissed=0 open=0 tier=M")]),
+    withCtx("2026-10-15T10:31:00Z", 71_500, [{ type: "text", text: "after" }]),
+    withCtx("2026-10-15T10:32:00Z", 72_000, [{ type: "text", text: "after" }]),
+    compaction("2026-10-15T10:33:00Z"),
+    withCtx("2026-10-15T10:34:00Z", 9_000, [{ type: "text", text: "compacted" }]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.residue, 71_500 - 41_000, "the skill body is part of what the review left, so the baseline is the call that loaded it, not the spawn");
+  assert.equal(review.laterCalls, 2, "the call after compaction no longer carries it");
+  assert.equal(review.compacted, false);
+});
+
+test("a review that compacted partway has no residue to report, and says so", () => {
+  const calls = [{ index: 0, ctx: 10 }, { index: 5, ctx: 90 }];
+  assert.deepEqual(residueOf({ startIndex: 1, endIndex: 4 }, calls, [2]), { residue: null, laterCalls: 1, compacted: true });
+  assert.deepEqual(residueOf({ startIndex: 1, endIndex: null }, calls, []), { residue: null, laterCalls: null, compacted: null },
+    "an unmarked review has no after");
+  assert.equal(residueOf({ startIndex: 0, endIndex: 4 }, calls, []).residue, 80, "the call at the start is the baseline");
+  assert.equal(residueOf({ startIndex: 0, endIndex: 4 }, [{ index: 5, ctx: 90 }], []).residue, null, "no call at or before the start");
+});
+
+test("a call exactly at the review's start is its residue baseline", () => {
+  const calls = [{ index: 0, ctx: 10 }, { index: 1, ctx: 30 }, { index: 5, ctx: 90 }];
+  assert.equal(residueOf({ startIndex: 1, endIndex: 4 }, calls, []).residue, 90 - 30);
+});
+
+test("a loop script starts a review only when it is invoked, not when it is named", () => {
+  assert.equal(invokesLoopScript("shellcheck plugin/scripts/round.sh"), false);
+  assert.equal(invokesLoopScript(`"\${CLAUDE_PLUGIN_ROOT}/scripts/round.sh" --new-review --work x`), true);
+  assert.equal(invokesLoopScript("cd x && bash scripts/preflight.sh"), true);
+  assert.equal(invokesLoopScript("cat plugin/scripts/scope.sh"), false);
+});
+
+test("of two loop-script invocations before the spawn, the later one starts the review", () => {
+  const loop = (command) => ({ type: "tool_use", name: "Bash", input: { command } });
+  const file = session([
+    withCtx("2026-10-15T10:00:00Z", 40_000, [{ type: "text", text: "the work" }]),
+    withCtx("2026-10-15T10:01:00Z", 41_000, [loop("bash scripts/preflight.sh")]),
+    withCtx("2026-10-15T10:02:00Z", 45_000, [loop("scripts/round.sh --new-review --work x")]),
+    withCtx("2026-10-15T10:03:00Z", 52_000, [spawn("r1-abd")]),
+    withCtx("2026-10-15T10:30:00Z", 70_000, [bashMarker("rounds=1 fixed=0 dismissed=0 open=0 tier=M")]),
+    withCtx("2026-10-15T10:31:00Z", 71_500, [{ type: "text", text: "after" }]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.residue, 71_500 - 45_000, "the start is the later invocation, and that call is the baseline");
+  assert.equal(review.startKind, "script");
+});
+
+test("a human prompt between a skill load and the spawn means the load did not start the review", () => {
+  const file = session([
+    withCtx("2026-10-15T10:00:00Z", 40_000, [{ type: "text", text: "the work" }]),
+    withCtx("2026-10-15T10:01:00Z", 41_000, [skillLoad]),
+    { type: "user", timestamp: "2026-10-15T10:02:00Z", message: { role: "user", content: "now do something else first" } },
+    withCtx("2026-10-15T10:03:00Z", 52_000, [spawn("r1-abd")]),
+    withCtx("2026-10-15T10:30:00Z", 70_000, [bashMarker("rounds=1 fixed=0 dismissed=0 open=0 tier=M")]),
+    withCtx("2026-10-15T10:31:00Z", 71_500, [{ type: "text", text: "after" }]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.notEqual(review.startKind, "skill");
+  assert.notEqual(review.startIndex, 1, "the skill load's index is not the start");
+});
+
+test("a compaction just outside the review still voids its residue, though the review did not compact", () => {
+  const calls = [{ index: 0, ctx: 10 }, { index: 6, ctx: 90 }];
+  const afterMarker = residueOf({ startIndex: 1, endIndex: 4 }, calls, [5]);
+  assert.equal(afterMarker.residue, null, "the call after the marker is measured over a reset context");
+  assert.equal(afterMarker.compacted, false);
+  const beforeStart = residueOf({ startIndex: 2, endIndex: 4 }, calls, [1]);
+  assert.equal(beforeStart.residue, null, "the call before the start is measured over a context that was reset since");
+  assert.equal(beforeStart.compacted, false);
+});
+
+test("an applier's spend counts in the denominator", () => {
+  const launch = { type: "tool_use", name: "Agent", input: { subagent_type: "self-review:self-review-finder", name: "self-review-finder-r1-a", prompt: "read the brief" } };
+  const file = session(
+    [
+      withCtx("2026-10-15T10:00:00Z", 30_000, [{ type: "text", text: "the work" }]),
+      withCtx("2026-10-15T10:01:00Z", 31_000, [skillLoad]),
+      withCtx("2026-10-15T10:02:00Z", 33_000, [launch]),
+      withCtx("2026-10-15T11:30:00Z", 36_000, [bashMarker("rounds=2 fixed=1 dismissed=0 open=0 tier=L")]),
+      withCtx("2026-10-15T11:31:00Z", 36_000, [{ type: "text", text: "reported" }]),
+    ],
+    [
+      ["self-review-applier-r1-0b", [assistant("2026-10-15T10:40:00Z", [{ type: "text", text: "applied" }])], { agentType: "self-review:self-review-applier", spawnDepth: 1 }],
+    ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.outcome, "converged", "the finder launch opens the review window");
+  assert.equal(review.tokens.applier.calls, 1);
+  const [row] = aggregate([review]);
+  const roles = ["main", "finders", "verifier", "applier"];
+  assert.equal(row.billedInput, roles.reduce((t, r) => t + review.tokens[r].billedInput, 0));
+  assert.ok(review.tokens.applier.billedInput > 0, "the applier spent, so leaving it out would change the main share");
+  const out = spawnSync(process.execPath, [SCRIPT, "--log-dir", NO_LOG, file], { encoding: "utf8" }).stdout;
+  assert.match(out, /agents=0f\+0v\+1a /);
+  assert.match(out, /residue=5\.0k@skill later=1/);
+  const main = review.tokens.main.billedInput;
+  const share = Math.round(100 * main / row.billedInput);
+  assert.match(out, new RegExp(`\\(main ${share}%\\)`));
+  assert.ok(share < Math.round(100 * main / (main + review.tokens.finders.billedInput + review.tokens.verifier.billedInput)),
+    "the applier lowers the main share once it is counted");
 });
 
 test("the scratch-file marker ends a review exactly like the script", () => {
@@ -337,6 +455,15 @@ test("the CLI reports bad input instead of throwing a stack trace at the user", 
   assert.match(ok.stdout, /== REVIEWS ==/);
   assert.match(ok.stdout, /tier=M converged rounds=1 fixed=2/);
   assert.match(run([file, "--json", "--log-dir", NO_LOG]).stdout, /"markerSource": "transcript"/);
+});
+
+test("the CLI refuses a flag it does not know, and --help prints the usage", () => {
+  const unknown = spawnSync("node", [SCRIPT, "--nope"], { encoding: "utf8" });
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /unknown argument: --nope/);
+  const help = spawnSync("node", [SCRIPT, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /^usage:/);
 });
 
 test("a marker logged after the session ended belongs to a later review, not this one", () => {
@@ -605,7 +732,7 @@ test("a round with an applier is attributed to it, and a round without one to th
   const label = appliedBy([{ round: 2, depth: 1 }, { round: 3, depth: 2 }, { round: null, depth: 1 }]);
   assert.equal(label(1), "lead", "no applier that round: the lead's own hand is the baseline");
   assert.equal(label(2), "applier@1");
-  assert.equal(label(3), "applier@2", "an applier the orchestrator dispatched is a different arm");
+  assert.equal(label(3), "applier@2", "an applier dispatched from a subagent is a different arm");
 });
 
 test("a recorded review is claimed by the tightest window that contains it, not by every one that overlaps", () => {

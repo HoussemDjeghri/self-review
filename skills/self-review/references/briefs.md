@@ -103,7 +103,7 @@ Do not touch: <the neighbouring thing that looks wrong and is out of scope>
 D2 · …
 ```
 
-## The ledger (keep it in `<scratch>/self-review/ledger.md`, update every round)
+## The ledger (keep it in `<work>/ledger.md`, update every round)
 
 ```
 # self-review ledger — <one-line task>
@@ -145,7 +145,7 @@ Lead with the outcome; the detail is for whoever wants it.
 ```
 Self-review: converged in <r> rounds — <f> fixed, <d> dismissed, <o> open.
 Intent: validated before coding | author-written, unvalidated | validation skipped
-Fixed: <file:line — what> (…one line each, most important first)
+Fixed: <file:line — what> (…one line each, most important first; past five, `…and <n> more — <work>/ledger.md`)
 Open for you: <file:line — the question + your recommendation>
 Checks: <command → real result, e.g. `npm test` 42 passed · `tsc` clean>
 ```

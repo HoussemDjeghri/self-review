@@ -20,7 +20,7 @@ const FINDINGS = path.join(HERE, "findings.mjs");
 process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "round-log-"));
 
 /** A repo with one committed file and a small uncommitted edit to it. */
-const fixture = () => {
+const fixture = ({ workName = "sr" } = {}) => {
   const repo = path.join(mkdtempSync(path.join(tmpdir(), "round-")), "repo");
   mkdirSync(path.join(repo, "src"), { recursive: true });
   writeFileSync(path.join(repo, "src/cli.mjs"), "export const parseArgs = (a) => a;\n");
@@ -32,7 +32,7 @@ const fixture = () => {
   git("commit", "-qm", "base");
   writeFileSync(path.join(repo, "src/cli.mjs"), 'export const parseArgs = (a) => { if (!a) throw new Error("bad"); return a; };\n');
 
-  const work = path.join(mkdtempSync(path.join(tmpdir(), "round-work-")), "sr");
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "round-work-")), workName);
   mkdirSync(work, { recursive: true });
   writeFileSync(path.join(work, "intent.md"), "intent\n");
   return { repo, work };
@@ -634,6 +634,26 @@ test("a red suite under the artifact root is a FAIL, and names where to read it"
     'import { test } from "node:test";\nimport assert from "node:assert/strict";\ntest("red", () => assert.equal(1, 2));\n');
   const r = withArtifactRoot(repo, "ship")(["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
   assert.match(r.stdout, /FAIL artifact-suite/, r.stdout + r.stderr);
+  assert.match(r.stdout, /^pre-flight \(from .*cold run – ü/m, "the failure came from the staged copy");
+  assert.doesNotMatch(r.stdout, /on purpose; a check that fails here/, "the artifact suite ran under the work dir, not the staged copy");
+});
+
+test("a check that fails only in the staged copy carries the path note", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "test.sh"), '#!/bin/sh\ncase "$PWD" in *" "*) echo "space in path" >&2; exit 1;; esac\nexit 0\n');
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const r = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.match(r.stdout, /^pre-flight \(from .*cold run – ü/m, r.stdout + r.stderr);
+  assert.match(r.stdout, /^FAIL /m, r.stdout);
+  assert.match(r.stdout, /this copy's path holds a space, an en dash and ü on purpose/, "so the output says what the path is for");
+});
+
+test("a green pre-flight from the staged copy carries no path note", () => {
+  const { repo, work } = fixture();
+  const r = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /^FAIL /m, r.stdout);
+  assert.doesNotMatch(r.stdout, /on purpose; a check that fails here/);
 });
 
 test("a named root with no node tests is a SKIP, not a failure of the repository under review", () => {
@@ -1203,5 +1223,95 @@ test("R5: a re-plan reuses round 1's cold run — it never runs again, and its s
       assert.deepEqual(graders, [], "the X row stays dropped");
       assert.match(tierOf(work, 1).coldSkipped, /coldrun\.sh failed/, "for the reason round 1 recorded");
     }
+  }
+});
+
+test("after a re-plan, round 2 run from outside the repository still reviews round 1's paths", () => {
+  // A later round replays round 1's scope: nothing on its command line can re-scope it.
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "src/other.mjs"), "export const unrelated = 1;\n");
+  const first = run(repo, ["--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight", "src/cli.mjs"]);
+  assert.equal(first.status, 0, first.stderr);
+  const review = workLine(first);
+  const replan = run(repo, ["--work", review, "--round", "1", "--intent", path.join(review, "intent.md"), "--force", "M", "--reason", "r", "--no-preflight"]);
+  assert.equal(replan.status, 0, replan.stderr);
+  recordRound(repo, review, 1);
+  const two = spawnSync("bash", [ROUND, "--work", review, "--round", "2", "--no-preflight"], { cwd: work, encoding: "utf8" });
+  assert.equal(two.status, 0, two.stderr);
+  const scope = readFileSync(path.join(review, "round-2", "scope.diff"), "utf8");
+  assert.match(scope, /src\/cli\.mjs/);
+  assert.doesNotMatch(scope, /other\.mjs/, "round 1's paths, not the working tree");
+});
+
+test("a path-scoped round 2 also reviews what a fix changed outside round 1's paths, and nothing that predates round 1", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "src/other.mjs"), "export const unrelated = 1;\n"); // dirt from before the review
+  const first = run(repo, ["--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight", "src/cli.mjs"]);
+  assert.equal(first.status, 0, first.stderr);
+  const review = workLine(first);
+  recordRound(repo, review, 1);
+  writeFileSync(path.join(repo, "src/cli.test.mjs"), "// the fix's test, outside round 1's paths\n");
+  const two = run(repo, ["--work", `${review}/`, "--round", "2", "--no-preflight"]); // spelled differently from round 1
+  assert.equal(two.status, 0, two.stderr);
+  assert.match(two.stdout, /^scope \+: .*src\/cli\.test\.mjs \(changed since round 1, outside its paths\)$/m);
+  const scope = readFileSync(path.join(review, "round-2", "scope.diff"), "utf8");
+  assert.match(scope, /cli\.test\.mjs/, "the fix is reviewed");
+  assert.match(scope, /src\/cli\.mjs/, "round 1's paths still are");
+  assert.doesNotMatch(scope, /other\.mjs/, "dirt that predates round 1 cancels out against its snapshot");
+});
+
+test("a path-scoped round 2 with no round-1 snapshot says it was not widened", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "src/other.mjs"), "export const unrelated = 1;\n"); // dirt from before the review
+  const first = run(repo, ["--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight", "src/cli.mjs"]);
+  assert.equal(first.status, 0, first.stderr);
+  const review = workLine(first);
+  recordRound(repo, review, 1);
+  spawnSync("git", ["for-each-ref", "--format=%(refname)", "refs/self-review/"], { cwd: repo, encoding: "utf8" }).stdout.split("\n").filter(Boolean).forEach((r) => spawnSync("git", ["update-ref", "-d", r], { cwd: repo }));
+  writeFileSync(path.join(repo, "src/cli.test.mjs"), "// the fix's test, outside round 1's paths\n");
+  const two = run(repo, ["--work", `${review}/`, "--round", "2", "--no-preflight"]);
+  assert.equal(two.status, 0, two.stderr);
+  assert.match(two.stdout, /^scope \+: not widened in .* — round 1 has no tree snapshot/m);
+});
+
+test("round 2 replays round 1's --base and relative paths from where round 1 ran, whatever its own cwd", () => {
+  const { repo, work } = fixture();
+  const git = (...args) => spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  git("commit", "-qam", "the change, committed"); // visible only through --base
+  writeFileSync(path.join(repo, "src/other.mjs"), "export const unrelated = 1;\n");
+  const first = spawnSync("bash", [ROUND, "--new-review", "--work", work, "--intent", path.join(work, "intent.md"),
+    "--no-preflight", "--base", "HEAD~1", "cli.mjs"], { cwd: path.join(repo, "src"), encoding: "utf8" });
+  assert.equal(first.status, 0, first.stderr);
+  const review = workLine(first);
+  recordRound(repo, review, 1);
+  // No --intent either: from round 2 it is the review's own.
+  const two = spawnSync("bash", [ROUND, "--work", review, "--round", "2", "--no-preflight"], { cwd: work, encoding: "utf8" });
+  assert.equal(two.status, 0, two.stderr);
+  const one = readFileSync(path.join(review, "round-1", "scope.diff"), "utf8");
+  const scope = readFileSync(path.join(review, "round-2", "scope.diff"), "utf8");
+  assert.match(scope, /src\/cli\.mjs/);
+  assert.doesNotMatch(scope, /other\.mjs/);
+  assert.equal(scope.match(/^# repo: .*$/m)?.[0], one.match(/^# repo: .*$/m)?.[0], "the same repository");
+});
+
+test("round 2 refuses paths, --base, and a review with no recorded scope — and creates nothing", () => {
+  const { repo, work } = fixture();
+  const first = run(repo, ["--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight"]);
+  assert.equal(first.status, 0, first.stderr);
+  const review = workLine(first);
+  recordRound(repo, review, 1);
+  for (const extra of [["src/cli.mjs"], ["--base", "HEAD"]]) {
+    const done = run(repo, ["--work", review, "--round", "2", "--no-preflight", ...extra]);
+    assert.equal(done.status, 2, done.stdout);
+    assert.match(done.stderr, /reuses round 1's scope; paths and --base re-scope the change, which is a new review/);
+    assert.ok(!existsSync(path.join(review, "round-2")), "refused before anything is created");
+  }
+  for (const file of ["scope-args", "scope-cwd"]) {
+    spawnSync("mv", [path.join(review, "round-1", file), path.join(review, "round-1", `${file}.gone`)]);
+    const done = run(repo, ["--work", review, "--round", "2", "--no-preflight"]);
+    assert.equal(done.status, 2, done.stdout);
+    assert.match(done.stderr, /no recorded scope for round 1 .* --work is not the work: path --new-review printed.* never falls back to the cwd/);
+    assert.doesNotMatch(done.stderr, /command not found/, "the message is printed, not run");
+    spawnSync("mv", [path.join(review, "round-1", `${file}.gone`), path.join(review, "round-1", file)]);
   }
 });

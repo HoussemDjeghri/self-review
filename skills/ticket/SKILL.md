@@ -39,8 +39,9 @@ second file on purpose: two would drift, and the finders would review against
 whichever one got copied.
 
 `<reviews>` is `<scratchpad>/self-review/` — the session scratchpad from your
-system prompt, else `mktemp -d` — outside the repository, for the loop's own
-reason (§0). Fill the template from
+system prompt, else what `${CLAUDE_PLUGIN_ROOT}/scripts/reviews-dir.sh` prints — the
+same path on every call in the session (with the same `$TMPDIR`) — outside the
+repository, for the loop's own reason (§0). Fill the template from
 `${CLAUDE_PLUGIN_ROOT}/skills/self-review/references/briefs.md`, "The intent
 statement": six to nine lines, the premise a checked fact or marked unchecked,
 the invariant written so a test could fail it. You are writing what the reader
@@ -70,8 +71,7 @@ Then, as the very next call with nothing in between, Bash `timeout` `600000`:
 longer active; `salvage.mjs` then prints its last message, which is the report
 — nothing else carries it (a report sent through SendMessage may never arrive).
 The session id
-is the UUID in your scratchpad path; a `<reviews>` outside the scratchpad needs
-`--session <id>` on `wait.mjs`. The ticket waits in a directory of its own
+is the UUID in your scratchpad path, or `$CLAUDE_CODE_SESSION_ID` without one. The ticket waits in a directory of its own
 because `wait.mjs` keeps its state under `round-<n>/` and numbers from 1, and
 the ticket is not round 1 of anything. Exit 1 means call it again, now; exit 3
 means it went dead — salvage by hand, and re-spawn once under a new suffix only

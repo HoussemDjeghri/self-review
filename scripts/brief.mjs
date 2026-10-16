@@ -535,7 +535,10 @@ export function main(argv, { log = console.log, logDir = LOG_DIR } = {}) {
   const ledgerText = options.ledger ? read(ledgerPath, "the ledger") : "";
   const dismissed = dismissedFrom(ledgerText);
   const fixed = fixedFrom(ledgerText);
-  const dismissedCount = dismissed.length;
+  // Entries, not lines: a ledger the lead did write keeps a placeholder such as
+  // "_No dismissals yet._" under the heading, and that is not a dismissal.
+  const dismissedCount = dismissed.filter((line) => /^\s*[-*] /.test(line)).length;
+  const ledgerWritten = /^#{1,3} +dismissed\b/im.test(ledgerText ?? "");
   const results = writeBriefs({
     plan,
     outDir,
@@ -572,7 +575,7 @@ export function main(argv, { log = console.log, logDir = LOG_DIR } = {}) {
   // forgotten case is silent and every later round re-files what round 1
   // already refuted. It happened across rounds 2-4 of the v0.7.2 review, and
   // the workaround was pasting the list into the agent prompts by hand.
-  log(dismissedCount === 0 && plan.round > 1
+  log(dismissedCount === 0 && plan.round > 1 && !ledgerWritten
     ? "# no dismissed findings carried into this round — if round " +
       `${plan.round - 1} dismissed anything, ${ledgerPath} was never updated (SKILL §2e) and these finders will re-file it`
     : `# ${dismissedCount} dismissed finding${dismissedCount === 1 ? "" : "s"} carried into every brief`);
