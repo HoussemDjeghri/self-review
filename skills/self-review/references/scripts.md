@@ -191,6 +191,7 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/root.mjs` — prints the installed plugin root when `${CLAUDE_PLUGIN_ROOT}` is unexpanded (§0)
 - `scripts/audit.mjs` — what a review cost, per review, from the session transcripts
 - `scripts/converged.sh` — the script form of the marker (§4) + `~/.claude/self-review/log.jsonl`
+- `scripts/branch-debt.mjs` — branch review: `--id` prints the id to opt a repository in under (`repos.<id>.branchDebt` in the user config), no flag prints its branch, baselines and debt; read-only
 - `scripts/salvage.mjs` — read a finder's report from its transcript (§2c); the same path recovers a dead reviewer's work (§2f)
 - `skills/self-review/references/angles.md` — the angle catalogue, per artifact kind
 - `skills/self-review/references/briefs.md` — intent block, finder/verifier briefs, ledger, report
@@ -205,4 +206,4 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `hooks/poll-guard.mjs` — the PreToolUse hook that denies repeated status checks
 - `hooks/tree-guard.mjs` — the PreToolUse hook that contains reviewers, matched on the name an agent runs under
 - `hooks/lib/hook.mjs` — shared fail-open `runHook()` entry point of the hooks
-- `config/defaults.json` — gate exemptions, the hook limits, and the `tier` / `impact` / `brief` / `preflight` rules; override per user in `~/.claude/self-review/config.json`. A repository's own `.self-review.json` is **default closed**: it may only *add* marker words to `tier.riskPaths` and `tier.riskContent`, so a repository can make its own review stricter and nothing else
+- `config/defaults.json` — gate exemptions, the hook limits, and the `tier` / `impact` / `brief` / `preflight` rules; override per user in `~/.claude/self-review/config.json`, and per repository from that same user file (`repos.<id>`: the branch-review opt-in and a tier overlay). A repository's own `.self-review.json` is **default closed**: it may only *add* marker words to `tier.riskPaths` and `tier.riskContent`, so a repository can make its own review stricter and nothing else

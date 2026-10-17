@@ -21,6 +21,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { repoId } from "./repo-id.mjs";
 
 export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const CONVERGED_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "converged.sh");
@@ -65,7 +66,7 @@ export const FALLBACK = {
   tier: {
     s: { maxLines: 15, docsMaxLines: 40 },
     l: { minLines: 300, minFiles: 8, minCallerFiles: 20, graphRisk: 0.7 },
-    riskPaths: { auth: [], payments: [], migration: [], infra: [] },
+    riskPaths: { auth: [], payments: [], migration: [], infra: [], protected: [] },
     riskContent: { destructive: [], security: [], concurrency: [] },
     instructional: [],
     executable: [],
@@ -73,7 +74,20 @@ export const FALLBACK = {
     ignore: [],
     finders: { maxPerRound: 6, callsCode: 40, callsDocs: 25, callsConfig: 25, callsCold: 20, roundsCap: { S: 2, M: 2, L: 6 } },
   },
+  // Per-repository settings, keyed by `repo-id.mjs`'s id. USER config only:
+  // it is not in REPO_ADDITIVE, because `branchDebt` is the most
+  // review-weakening switch the plugin has (tiers-boundary ruling C). Each
+  // entry is checked against REPO_ENTRY, not against this empty object.
+  repos: {},
 };
+
+// One `repos.<id>` entry. `tier` reuses the top-level schema and is laid over
+// it in that repository only — whole-repo thresholds, the per-repo half of
+// ruling C. `branchDebt.maxLines` > 0 opts the repository into branch review
+// (the Stop gate lets branch turns end unreviewed up to that many changed
+// lines); `main` names the integration branch when `origin/HEAD` is not it.
+const REPO_ENTRY = { tier: FALLBACK.tier, branchDebt: { maxLines: 0, main: "" } };
+const REPO_ID_RE = /^[0-9a-f]{64}$/;
 
 // What a checked-in `.self-review.json` may set — **default closed**, and
 // additive only.
@@ -125,7 +139,37 @@ function merge(base, over, trail = "") {
     const expected = kind(base[key]);
     if (kind(value) !== expected) { warn(`config: ignoring ${name} — expected ${expected}, got ${kind(value)}`); continue; }
     if (expected === "array" && !value.every((item) => typeof item === "string")) { warn(`config: ignoring ${name} — expected an array of strings`); continue; }
-    out[key] = expected === "object" ? merge(base[key], value, name + ".") : value;
+    out[key] = name === "repos" ? repoEntries(value) : expected === "object" ? merge(base[key], value, name + ".") : value;
+  }
+  return out;
+}
+
+// The same checks as merge(), keeping only what the layer set: an entry is laid
+// over the user's own values later, so a default filled in here would reset
+// them to the shipped ones in that repository.
+function sparse(base, over, trail) {
+  const out = {};
+  for (const [key, value] of Object.entries(over)) {
+    if (key.startsWith("$")) continue;
+    const name = trail + key;
+    if (!Object.hasOwn(base, key)) { warn(`config: ignoring unknown key ${name}`); continue; }
+    const expected = kind(base[key]);
+    if (kind(value) !== expected) { warn(`config: ignoring ${name} — expected ${expected}, got ${kind(value)}`); continue; }
+    if (expected === "array" && !value.every((item) => typeof item === "string")) { warn(`config: ignoring ${name} — expected an array of strings`); continue; }
+    out[key] = expected === "object" ? sparse(base[key], value, name + ".") : value;
+  }
+  return out;
+}
+
+function repoEntries(repos) {
+  const out = {};
+  for (const [id, entry] of Object.entries(repos)) {
+    if (id.startsWith("$")) continue;
+    // `in` would accept `__proto__` here for the reason merge() spells out, and
+    // a typed name or a path is the likely mistake, so say where the id comes from.
+    if (!REPO_ID_RE.test(id)) { warn(`config: ignoring repos.${id} — not a repository id (print one with scripts/branch-debt.mjs --id)`); continue; }
+    if (kind(entry) !== "object") { warn(`config: ignoring repos.${id} — expected object, got ${kind(entry)}`); continue; }
+    out[id] = sparse(REPO_ENTRY, entry, `repos.${id}.`);
   }
   return out;
 }
@@ -300,7 +344,36 @@ function mergedConfig(repoRoot) {
   }
   if (kind(user) !== "object") { warn(`ignoring ${userPath} (expected an object, got ${kind(user)}); using defaults`); user = {}; }
   const config = merge(defaults, user);
-  return repoRoot ? mergeRepo(config, repoRoot) : config;
+  return repoRoot ? mergeRepo(overlayRepo(config, repoRoot), repoRoot) : config;
+}
+
+// The user's `repos.<id>.tier`, laid over their global `tier` in that
+// repository — before the repository's own additive layer, which still only
+// appends. Entries were validated when the user layer was merged.
+function overlayRepo(config, repoRoot) {
+  if (!Object.keys(config.repos ?? {}).length) return config; // no opt-ins: no git call
+  const tier = config.repos[repoIdOf(repoRoot)]?.tier;
+  return tier ? { ...config, tier: merge(config.tier, tier, "tier.") } : config;
+}
+
+const repoIdOf = (repoRoot) => { try { return repoId(repoRoot); } catch { return ""; } };
+
+/**
+ * Whether the user opted this repository into branch review, and how: the
+ * cap in changed lines and the integration branch (`""` = `origin/HEAD`).
+ * `null` when they did not — the common case, and the one that must behave
+ * exactly as it did before the key existed. Only a positive whole number is
+ * an opt-in; anything else is warned about and treated as none.
+ */
+export function branchDebtFor(repoRoot, config) {
+  const id = repoIdOf(repoRoot);
+  const debt = id ? config.repos?.[id]?.branchDebt : undefined;
+  if (!debt || debt.maxLines === undefined) return null;
+  if (!Number.isInteger(debt.maxLines) || debt.maxLines <= 0) {
+    if (debt.maxLines !== 0) warn(`config: ignoring repos.${id}.branchDebt — maxLines must be a positive whole number, got ${debt.maxLines}`);
+    return null;
+  }
+  return { id, maxLines: debt.maxLines, main: debt.main ?? "" };
 }
 
 // The plugin's own name, or "" when the files run from a plain skill directory.

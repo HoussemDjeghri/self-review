@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentDefinition } from "./lib/frontmatter.mjs";
 import { fieldsFromFlags, validateMarker } from "./lib/marker.mjs";
+import { repoId } from "./lib/repo-id.mjs";
 
 const GATE = path.join(path.dirname(fileURLToPath(import.meta.url)), "self-review-gate.mjs");
 const PLUGIN_ROOT = path.resolve(path.dirname(GATE), "..");
@@ -3581,6 +3582,18 @@ const RULE_CASES = {
   "block:rejected": () => [turn(...write(`${PROJECT}/src/a.ts`), ...writeMarker({ outcome: "converged", rounds: 2 }))],
   "block:remark": () => [[human("go"), ...applier("apLog"), ...bash(...NOT_CONVERGED), notification("apLog"), said("done")]],
   "block:unmarked": () => [turn(...write(`${PROJECT}/src/a.ts`))],
+  "release:branch-deferred": () => { const fx = branchRepo(); return [turn(...write(fx.put("src/a.ts", codeLines(5)))), fx.opts]; },
+  "block:branch-held": () => { const fx = branchRepo({ maxLines: 2 }); return [turn(...write(fx.put("src/a.ts", codeLines(5)))), fx.opts]; },
+  "block:main-held": () => {
+    const fx = branchRepo({ branch: "main" });
+    fx.git("update-ref", "refs/self-review-reviewed/main", "HEAD");
+    fx.put("src/m.ts", codeLines(3)); fx.git("add", "-A"); fx.git("commit", "-qm", "unreviewed");
+    return [turn(...bash("ls", "a")), fx.opts];
+  },
+  "release:held-exhausted": () => {
+    const fx = branchRepo({ maxLines: 2 });
+    return [[human("go"), ...write(fx.put("src/a.ts", codeLines(5))), heldFeedback(), heldFeedback(), ...reviewed(), ...writeMarker(), said("done")], fx.opts];
+  },
 };
 
 for (const [rule, build] of Object.entries(RULE_CASES)) {
@@ -3676,4 +3689,220 @@ test("gate log: a row carries no path inside the project, though the message nam
   const raw = readdirSync(path.join(r.log, "gate")).map((f) => readFileSync(path.join(r.log, "gate", f), "utf8")).join("");
   assert.ok(raw.length > 0);
   assert.ok(!raw.includes("secret-name"), raw);
+});
+
+// ---------------------------------------------------------------------------
+// Branch review (0.9.0): an opted-in repository lets a branch's code ride
+// unreviewed up to its cap. The fixture is a repository with an origin, main
+// published to it, and `feat` checked out; the opt-in lives in a user config
+// outside the repository, keyed by the repository's id.
+const codeLines = (n, tag = "x") => Array.from({ length: n }, (_, i) => `export const ${tag}${i} = ${i};`).join("\n") + "\n";
+function branchRepo({ maxLines = 500, branch = "feat", optIn = true, extra = {} } = {}) {
+  const fx = repoFixture({ "src/base.ts": codeLines(3, "base"), "README.md": "# r\n" });
+  const { repo, git } = fx;
+  git("remote", "add", "origin", `https://example.test/${path.basename(repo)}.git`);
+  git("add", "-A"); git("commit", "-qm", "base"); git("branch", "-M", "main");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+  if (branch !== "main") git("checkout", "-qb", branch);
+  const cfgDir = mkdtempSync(path.join(tmpdir(), "srg-cfg-"));
+  const cfg = path.join(cfgDir, "config.json");
+  const id = repoId(repo);
+  writeFileSync(cfg, JSON.stringify({ ...(optIn ? { repos: { [id]: { branchDebt: { maxLines } } } } : {}), ...extra }));
+  const put = (rel, body) => { mkdirSync(path.join(repo, path.dirname(rel)), { recursive: true }); writeFileSync(path.join(repo, rel), body); return path.join(repo, rel); };
+  const sha = (rev) => git("rev-parse", "-q", "--verify", rev).stdout.trim();
+  const opts = { payload: { cwd: repo }, env: { SELF_REVIEW_CONFIG: cfg } };
+  return { ...fx, id, cfg, put, sha, opts };
+}
+// What treecheck.sh --record leaves: the worktree as a commit on HEAD, with its
+// base and narrowing in trailers, under the review's round ref.
+function snapshotReview(fx, review, { round = 1, base = fx.sha("main"), partial = false } = {}) {
+  const idx = path.join(mkdtempSync(path.join(tmpdir(), "srg-idx-")), "index");
+  const env = { ...process.env, GIT_INDEX_FILE: idx };
+  spawnSync("git", ["-C", fx.repo, "add", "-A"], { env });
+  const tree = spawnSync("git", ["-C", fx.repo, "write-tree"], { env, encoding: "utf8" }).stdout.trim();
+  const commit = fx.git("commit-tree", tree, "-p", "HEAD", "-m", `self-review round ${round} snapshot`,
+    "-m", `Self-Review-Base: ${base}\nSelf-Review-Partial: ${partial ? "yes" : "no"}`).stdout.trim();
+  fx.git("update-ref", `refs/self-review/${review}/round-${round}`, commit);
+  return commit;
+}
+const HELD = "the branch's unreviewed code is past what this repository defers";
+const heldFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(),
+  message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} On branch feat, ${HELD}: 600 unreviewed code lines.` } });
+const reviewedMarker = (review) => writeMarker({ ...CONVERGED_RECORD, review });
+
+test("branch review: code written outside the opted-in repository is not deferred by its debt", () => {
+  const fx = branchRepo();
+  const other = repoFixture({ "src/a.ts": codeLines(5) }); // a repository the user did not opt in
+  const elsewhere = path.join(other.repo, "src", "a.ts");
+  const r = run(turn(...write(elsewhere)), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.systemMessage, /branch review not applied — this turn changed files outside/);
+  const inside = run(turn(...write(fx.put("src/b.ts", codeLines(5)))), fx.opts);
+  assert.ok(!blocks(inside), "the same turn inside the repository defers");
+});
+
+test("branch review: 400 unreviewed lines on an opted-in branch end the turn, and say how much is deferred", () => {
+  const fx = branchRepo();
+  const file = fx.put("src/a.ts", codeLines(400));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(!blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.systemMessage, /review deferred — 400\/500 unreviewed code lines on feat/);
+  assert.match(r.json.systemMessage, /branch review adopted — main at/, "the first Stop grandfathers main");
+  assert.equal(fx.sha("refs/self-review-reviewed/main"), fx.sha("main"));
+});
+
+test("branch review: 501 lines are held, and the hold names the one --base to review from", () => {
+  const fx = branchRepo();
+  const file = fx.put("src/a.ts", codeLines(501));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, new RegExp(`${HELD}: 501 unreviewed code lines in 1 file`));
+  assert.match(r.json.reason, new RegExp(`round\\.sh --new-review --base ${fx.sha("main")} \\(no path list\\)`));
+});
+
+test("branch review: prose a branch changes is not debt", () => {
+  const fx = branchRepo({ maxLines: 10 });
+  fx.put("docs/guide.md", "line\n".repeat(900));
+  const file = fx.put("src/a.ts", codeLines(5));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.match(r.json.systemMessage, /5\/10 unreviewed code lines/);
+});
+
+test("branch review: a one-line edit under a protected root is held at any size", () => {
+  const fx = branchRepo({ extra: { tier: { riskPaths: { protected: ["^src/core/"] } } } });
+  const file = fx.put("src/core/x.ts", codeLines(1));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /touching tier-L path src\/core\/x\.ts/);
+});
+
+test("branch review: a repository without an opt-in is gated per turn, exactly as before", () => {
+  const fx = branchRepo({ optIn: false });
+  const file = fx.put("src/a.ts", codeLines(2));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r));
+  assert.doesNotMatch(r.json.reason, new RegExp(HELD));
+  assert.equal(fx.sha("refs/self-review-reviewed/main"), "", "nothing is written into a repository that did not opt in");
+});
+
+test("branch review: the repository's own .self-review.json cannot opt it in", () => {
+  const fx = branchRepo({ optIn: false });
+  writeFileSync(path.join(fx.repo, ".self-review.json"), JSON.stringify({ repos: { [fx.id]: { branchDebt: { maxLines: 5000 } } } }));
+  const file = fx.put("src/a.ts", codeLines(2));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+});
+
+test("branch review: an opt-in for repository X does not apply in repository Y", () => {
+  const x = branchRepo();
+  const y = branchRepo({ optIn: false });
+  const file = y.put("src/a.ts", codeLines(2));
+  const r = run(turn(...write(file)), { ...y.opts, env: { SELF_REVIEW_CONFIG: x.cfg } });
+  assert.ok(blocks(r), JSON.stringify(r.json));
+});
+
+test("branch review: merged commits on main that no review covers are held, even on a turn that changed nothing", () => {
+  const fx = branchRepo({ branch: "main" });
+  const quiet = run(turn(...bash("ls", "a")), fx.opts);
+  assert.ok(!blocks(quiet), "adoption grandfathers main's history");
+  fx.put("src/merged.ts", codeLines(20));
+  fx.git("add", "-A"); fx.git("commit", "-qm", "merge an unreviewed branch");
+  const r = run(turn(...bash("ls", "a")), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /On main's committed tree, .*20 unreviewed code lines .*main defers nothing/s);
+});
+
+test("branch review: main is covered by a merge of a reviewed branch", () => {
+  const fx = branchRepo();
+  run(turn(...bash("ls", "a")), fx.opts); // adopt main
+  fx.put("src/a.ts", codeLines(30));
+  const snap = snapshotReview(fx, "abcd1234");
+  const r = run(turn(...write(path.join(fx.repo, "src/a.ts")), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  assert.ok(!blocks(r), JSON.stringify(r.json));
+  assert.equal(fx.sha("refs/self-review-reviewed/feat"), snap, "the marker's review moved the branch's ref");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "feature");
+  fx.git("checkout", "-q", "main"); fx.git("merge", "-q", "--no-ff", "-m", "merge feat", "feat");
+  const onMain = run(turn(...bash("ls", "a")), fx.opts);
+  assert.ok(!blocks(onMain), JSON.stringify(onMain.json));
+  assert.equal(fx.sha("refs/self-review-reviewed/main"), fx.sha("main"), "main's ref moves to the covered merge");
+});
+
+test("branch review: a tree that moved after the review counts as debt, not as a refused marker", () => {
+  const fx = branchRepo({ maxLines: 50 });
+  fx.put("src/a.ts", codeLines(30));
+  snapshotReview(fx, "abcd1234");
+  const file = fx.put("src/b.ts", codeLines(10)); // after the last round read the tree
+  const under = run(turn(...write(file), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  assert.ok(!blocks(under), JSON.stringify(under.json));
+  fx.put("src/c.ts", codeLines(60));
+  const over = run(turn(...write(path.join(fx.repo, "src/c.ts")), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  assert.ok(blocks(over), JSON.stringify(over.json));
+  assert.match(over.json.reason, /70 unreviewed code lines .* measured from refs\/self-review-reviewed\/feat/s);
+});
+
+test("branch review: a marker without a review id, or from a narrowed review, leaves the baseline where it was", () => {
+  const fx = branchRepo({ maxLines: 10 });
+  const file = fx.put("src/a.ts", codeLines(30));
+  const bare = run(turn(...write(file), ...reviewed(), ...writeMarker()), fx.opts);
+  assert.ok(blocks(bare), JSON.stringify(bare.json));
+  assert.match(bare.json.reason, /it names no review — add --review <id> to converged\.sh/);
+  snapshotReview(fx, "beef0001", { partial: true });
+  const narrow = run(turn(...write(file), ...reviewed(), ...reviewedMarker("beef0001")), fx.opts);
+  assert.match(narrow.json.reason, /was narrowed to a path list/);
+  snapshotReview(fx, "beef0002", { base: "1".repeat(40) });
+  const elsewhere = run(turn(...write(file), ...reviewed(), ...reviewedMarker("beef0002")), fx.opts);
+  assert.match(elsewhere.json.reason, /which is not a reviewed tree/);
+  assert.equal(fx.sha("refs/self-review-reviewed/feat"), "");
+});
+
+test("branch review: a detached HEAD is gated per turn, and says why", () => {
+  const fx = branchRepo();
+  fx.git("checkout", "-q", "--detach");
+  const file = fx.put("src/a.ts", codeLines(2));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r));
+  assert.match(r.json.systemMessage, /branch review not applied — HEAD is detached/);
+});
+
+test("branch review: the script form of the marker carries the review id too", () => {
+  const fx = branchRepo({ maxLines: 10 });
+  const file = fx.put("src/a.ts", codeLines(30));
+  const snap = snapshotReview(fx, "abcd1234");
+  const r = run(turn(...write(file), ...reviewed(), ...bash(`${MARKER_CMD} --review abcd1234`, `${MARKER_OUT} review=abcd1234`)), fx.opts);
+  assert.ok(!blocks(r), JSON.stringify(r.json));
+  assert.equal(fx.sha("refs/self-review-reviewed/feat"), snap);
+});
+
+test("branch review: a tier-L path that is not code by extension still holds", () => {
+  const fx = branchRepo();
+  fx.put(".github/workflows/ci.yml", "on: push\n");
+  const file = fx.put("src/a.ts", codeLines(1));
+  const r = run(turn(...write(file)), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /1 unreviewed code line in 1 file, touching tier-L path \.github\/workflows\/ci\.yml/);
+});
+
+test("branch review: a GIT_DIR from the session's env cannot point the gate at forged refs", () => {
+  const fx = branchRepo({ maxLines: 10 });
+  const file = fx.put("src/a.ts", codeLines(30));
+  const decoy = branchRepo();
+  decoy.put("src/a.ts", codeLines(30));
+  const forged = snapshotReview(decoy, "abcd1234");
+  decoy.git("update-ref", "refs/self-review-reviewed/feat", forged);
+  const r = run(turn(...write(file)), { ...fx.opts, env: { ...fx.opts.env, GIT_DIR: path.join(decoy.repo, ".git"), GIT_WORK_TREE: decoy.repo } });
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /30 unreviewed code lines/);
+  assert.equal(decoy.sha("refs/self-review-reviewed/feat"), forged, "the decoy is untouched");
+  assert.equal(decoy.sha("refs/self-review-reviewed/main"), "", "nothing adopted into the decoy");
+});
+
+test("branch review: an unreviewed tier-L path committed on main holds even when it is not code", () => {
+  const fx = branchRepo({ branch: "main" });
+  run(turn(...bash("ls", "a")), fx.opts); // adopt
+  fx.put(".github/workflows/ci.yml", "on: push\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "ci");
+  const r = run(turn(...bash("ls", "a")), fx.opts);
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /touching tier-L path \.github\/workflows\/ci\.yml/);
 });

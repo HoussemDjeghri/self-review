@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.8.9" src="https://img.shields.io/badge/version-0.8.9-191919">
+  <img alt="version 0.9.0" src="https://img.shields.io/badge/version-0.9.0-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -112,7 +112,8 @@ To remove it: `/plugin uninstall self-review@houssem-plugins`. That takes the
 hooks with it; your review log (`~/.claude/self-review/log.jsonl`), the gate's
 decision log (`~/.claude/self-review/gate/`, one file a month, pruned after six)
 and any config you wrote (`~/.claude/self-review/config.json`) stay until you
-delete them. `SELF_REVIEW_GATE=off` turns the gate off for a session without
+delete them, as do the `refs/self-review-reviewed/*` refs in any repository you
+opted into branch review. `SELF_REVIEW_GATE=off` turns the gate off for a session without
 uninstalling.
 
 ## How a turn goes
@@ -235,8 +236,10 @@ additive only**: the one thing a repository may contribute is extra *words* for
 the risk markers (`tier.riskPaths`, `tier.riskContent`), appended to the lists
 you already have — its own word for "payments", never a shorter list. Every
 other setting is the reviewer's.
-The Stop gate reads none of it: it loads your config alone, so a repository's
-file shapes the round's tier and never when the gate arms or what releases it.
+The Stop gate loads your config alone, so a repository's file shapes the round's
+tier and never when the gate arms or what releases it. The one exception can
+only add holds: in a repository you opted into branch review (below), its
+`riskPaths` words count toward the tier-L path test that holds a branch.
 
 That is narrower than it started, and the narrowing is the story: a repository
 is reviewed by whoever clones it, so the attacker in this threat model is the
@@ -257,6 +260,43 @@ to gating *every* file: a broken install costs you a review, never skips one.
 `gate.maxReminders` is the escape hatch — after that many blocks in a row the
 gate releases the turn with a notice rather than trapping the session. To turn
 the gate off for a session entirely, set `SELF_REVIEW_GATE=off`.
+
+### Branch review (opt-in, per repository)
+
+By default every code-writing turn has to converge before it ends. On a long
+branch you may prefer to review in larger pieces. Opt a repository in from
+**your** config (a repository's own file cannot):
+
+```json
+{ "repos": { "<id>": { "branchDebt": { "maxLines": 500 }, "tier": { "riskPaths": { "protected": ["^src/core/"] } } } } }
+```
+
+`scripts/branch-debt.mjs --id` prints the id (the repository's hashed `origin`
+URL, so its clones and worktrees share it); `scripts/branch-debt.mjs` prints the
+branch, its reviewed baseline and its debt. In that repository, on a branch, the
+gate lets a code turn end unmarked while the branch's unreviewed code — `git
+diff` from the last reviewed tree to the worktree, prose not counted — stays
+within `maxLines` and touches no tier-L path (`riskPaths`, including the
+`protected` category, which escalates any one-line edit). Past that it holds,
+and names the commit to review from. A converged marker carrying the review's
+`review` id records the tree that review's last round read as reviewed, in
+`refs/self-review-reviewed/<branch>` — refs that clone, fetch and push never
+carry. On main nothing is deferred: a Stop on main whose committed tree no
+review covers — an unreviewed merge, a push from elsewhere — is held.
+Only writes placed inside the repository defer: a turn that also wrote elsewhere, or whose
+subagent or shell writes the gate cannot place, is gated per turn. Untracked files
+your `.gitignore` hides are not in the measure.
+`branchDebt.main` overrides `origin/HEAD` as main. The first Stop after opting in
+records main's tip as reviewed, so history from before the opt-in is not debt.
+
+To opt out, delete the `repos.<id>` entry. To reset a repository's baselines,
+delete its refs — `git for-each-ref --format='%(refname)' refs/self-review-reviewed/ | xargs -n1 git update-ref -d`
+— and the next Stop adopts main's tip again.
+
+Known limit, the same class as `SELF_REVIEW_GATE=off`: a repository's checked-in
+`.claude/settings.json` can set `env`, so it can point `SELF_REVIEW_CONFIG` at a
+file that opts it in. The gate strips `GIT_*` variables from its own git calls
+for the same reason, so that hole is not also a forged-refs hole.
 
 ## What ships today, and what doesn't
 

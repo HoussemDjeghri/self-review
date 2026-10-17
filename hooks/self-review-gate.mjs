@@ -120,7 +120,8 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpat
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
-import { CONVERGED_SCRIPT, LOG_DIR, loadConfig, pluginVersion, skillName } from "./lib/config.mjs";
+import { CONVERGED_SCRIPT, LOG_DIR, branchDebtFor, loadConfig, pluginVersion, skillName } from "./lib/config.mjs";
+import { baselines, branchOf, riskPathTest, setDeadline, commitOf, mainCovered, mainOf, pruneReviewed, reviewSnapshot, reviewedRefs, smallestDebt, topOf, treeOf, worktreeTree, writeReviewed } from "./lib/branch-debt.mjs";
 import { appendMonthly } from "./lib/monthly-log.mjs";
 import { globToRegExp } from "../scripts/lib/paths.mjs";
 import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
@@ -1125,7 +1126,7 @@ function countsFrom(read) {
 // unknown is never gated, because refusing on a value we failed to parse is a
 // block bought with a guess.
 function lastMarker(turn, results, cwd) {
-  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null, counts = null;
+  let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null, counts = null, review = null;
   turn.forEach((entry, index) => {
     for (const use of toolUses(entry)) {
       const text = results.get(use.id) ?? "";
@@ -1133,6 +1134,7 @@ function lastMarker(turn, results, cwd) {
         at = index; fileMarker = null;
         outcome = scriptField(text, "outcome");
         intent = scriptField(text, "intent");
+        review = scriptField(text, "review");
         counts = countsFrom((key) => scriptField(text, key));
         continue;
       }
@@ -1142,10 +1144,11 @@ function lastMarker(turn, results, cwd) {
       at = index; fileMarker = { id: use.id, summary: written.summary };
       outcome = written.record.outcome;
       intent = written.record.intent ?? null;
+      review = written.record.review ?? null;
       counts = countsFrom((key) => written.record[key]);
     }
   });
-  return { at, fileMarker, outcome, intent, counts, rejected: rejectedAt > at ? rejected : null };
+  return { at, fileMarker, outcome, intent, counts, review, rejected: rejectedAt > at ? rejected : null };
 }
 
 // converged.sh logs its own run; the file form is logged here, once per marker:
@@ -1645,6 +1648,10 @@ const countUnverified = reminderCounter(UNVERIFIED_TAG);
 // MAX_REMINDERS, counted per tag as the deciding branches count them, the gate
 // released that marker, the task ended on it, and it is a boundary like an
 // accepted one.
+// The branch hold (HELD_TAG, with branch review below) is deliberately not one
+// of these: a held marker passed every check here, so it still closes its
+// window, and the re-mark after the review the hold asks for needs evidence of
+// its own — the stricter reading.
 const MARKER_REFUSAL_TAGS = [UNREVIEWED_TAG, UNVALIDATED_TAG, UNVERIFIED_TAG];
 function previousAcceptedMarker(entries, results, cwd, before) {
   for (let next = before; next >= 0;) {
@@ -1838,7 +1845,7 @@ function evaluate(entries, cwd, transcriptPath) {
   // prompt later. logFileMarker is safe at window scope because it already
   // dedupes on the marker id anywhere in the log.
   const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
-  const { at: markerAtW, fileMarker, outcome, intent, counts } = lastMarker(entries, results, cwd);
+  const { at: markerAtW, fileMarker, outcome, intent, counts, review } = lastMarker(entries, results, cwd);
   // What the decision log records beside the rule: the outcome of a marker in
   // THIS turn when there is one — an earlier turn's is not this Stop's — and
   // whichever count the deciding branch read.
@@ -2066,7 +2073,9 @@ function evaluate(entries, cwd, transcriptPath) {
       };
     }
     if (fileMarker) logFileMarker(fileMarker, cwd);
-    return { rule: "pass:marker", log: facts() };
+    // What branch review needs to record the tree as reviewed; stripped before
+    // anything is printed, like `rule` and `log`.
+    return { rule: "pass:marker", log: facts(), accepted: { outcome, review } };
   }
 
   const pending = agents.filter((a) => a.pending).length;
@@ -2108,7 +2117,7 @@ function evaluate(entries, cwd, transcriptPath) {
     };
   }
   return {
-    rule: "block:unmarked", log: facts({ reminders }),
+    rule: "block:unmarked", log: facts({ reminders }), changes: described,
     decision: "block",
     reason: blockReason(described, reminders, cwd) + beside,
     systemMessage: `self-review gate: ${describeChanges(described, cwd)} — ${lastChange(described)?.kind === "orchestrator" ? "read its report and re-mark before the turn ends" : "running the review loop before the turn ends"}`,
@@ -2229,6 +2238,187 @@ function rejectionReason(problems) {
   ].join("\n");
 }
 
+// ---------- branch review (a per-repository opt-in in the USER config) ----------
+//
+// In a repository the user listed under `repos.<id>.branchDebt` — and nowhere
+// else — a turn on a non-main branch may end without a marker while the code
+// the branch changed since its last reviewed tree stays under the cap and off
+// every tier-L path; past either, the turn is held exactly as today, with the
+// base to review from. On main, every Stop checks that the committed tree is
+// one a review covered, because `git merge`, `git pull` and `gh pr merge`
+// bring code in without writing any. The git half and its reasons are in
+// lib/branch-debt.mjs; the rulings are questions/debt-state-answer.md and
+// questions/marker-check-answer.md.
+//
+// A repository's own config never releases a hold: the opt-in is read from the
+// user layer only, and the repository's additive layer is read for one thing,
+// the tier-L path test, where it can only add holds. Anything this section
+// cannot measure leaves the decision as today's.
+const HELD_TAG = "the branch's unreviewed code is past what this repository defers";
+const countHeld = reminderCounter(HELD_TAG);
+
+// The gate's code test without its scratch test: the repository itself may sit
+// under a temp dir, and its files are not scratch for being there.
+function countsAsCode(abs) {
+  if (exemptByPath(abs)) return false;
+  const ext = path.extname(abs).toLowerCase();
+  return ext ? !EXEMPT_EXTENSIONS.has(ext) : !EXEMPT_NAMES.has(path.basename(abs).toLowerCase());
+}
+
+function branchContext(cwd) {
+  if (!Object.keys(CONFIG.repos ?? {}).length) return null;
+  const top = topOf(cwd);
+  if (!top) return null;
+  const opt = branchDebtFor(top, CONFIG);
+  if (!opt) return null;
+  const main = mainOf(top, opt.main);
+  const branch = branchOf(top);
+  if (!main) return { unmeasurable: `${opt.main || "origin/HEAD"} does not resolve to a commit, so there is no main to measure against — run \`git remote set-head origin --auto\`, or set repos.<id>.branchDebt.main in your config` };
+  if (!branch) return { unmeasurable: "HEAD is detached" };
+  let refs = reviewedRefs(top);
+  if (refs === null) return { unmeasurable: "git could not list the reviewed refs" };
+  const notes = [];
+  if (refs.length === 0) {
+    // The namespace empty is the first Stop since the opt-in (or a deliberate
+    // reset): grandfather main's committed history, never the worktree.
+    const tip = commitOf(top, `refs/heads/${main.local}`) ?? main.ref;
+    if (writeReviewed(top, main.local, tip)) notes.push(`branch review adopted — ${main.local} at ${tip.slice(0, 12)} recorded as reviewed`);
+    refs = reviewedRefs(top) ?? [];
+  } else {
+    pruneReviewed(top, refs, main.local);
+  }
+  const risky = riskPathTest(loadConfig(top).tier.riskPaths);
+  return {
+    top, opt, main, branch, refs, notes, onMain: branch === main.local,
+    counts: (rel) => countsAsCode(path.join(top, rel)),
+    risky,
+  };
+}
+
+// A converged marker naming its review records the tree that review's last
+// round read — when the review read all of it from a reviewed baseline. Every
+// other marker leaves the baseline where it was, and the debt says the rest.
+function recordMarker(ctx, accepted) {
+  if (!accepted) return { why: null };
+  if (accepted.outcome !== "converged") return { why: `its outcome is ${accepted.outcome ?? "unreadable"}, and only a converged review records a tree as reviewed` };
+  if (!accepted.review) return { why: `it names no review — add --review <id> to converged.sh (or "review": "<id>" to CONVERGED.json), the id round.sh printed as "review:"` };
+  const snap = reviewSnapshot(ctx.top, accepted.review);
+  if (!snap) return { why: `review ${accepted.review} left no snapshot in this repository` };
+  if (snap.partial) return { why: `review ${accepted.review} was narrowed to a path list, so it did not read the whole diff` };
+  const baseTree = snap.base ? treeOf(ctx.top, snap.base) : null;
+  if (!baseTree || !baselines(ctx.top, ctx.refs, ctx.main, ctx).some((b) => b.tree === baseTree)) {
+    return { why: `review ${accepted.review} started from ${snap.base ? snap.base.slice(0, 12) : "an unrecorded base"}, which is not a reviewed tree` };
+  }
+  if (!writeReviewed(ctx.top, ctx.branch, snap.commit)) return { why: "git could not write the reviewed ref" };
+  ctx.refs = reviewedRefs(ctx.top) ?? ctx.refs;
+  ctx.notes.push(`${ctx.branch} recorded as reviewed at review ${accepted.review}'s round ${snap.round}`);
+  return { why: null };
+}
+
+function heldReason(ctx, debt, why) {
+  const where = ctx.onMain ? `${ctx.branch}'s committed tree` : `branch ${ctx.branch}`;
+  const risky = debt.risky.length ? `, touching tier-L path${debt.risky.length === 1 ? "" : "s"} ${debt.risky.slice(0, 5).join(", ")}${debt.risky.length > 5 ? ", …" : ""}` : "";
+  const cap = ctx.onMain ? "main defers nothing" : `this repository defers up to ${ctx.opt.maxLines}`;
+  return [
+    `${GATE_TAG} On ${where}, ${HELD_TAG}: ${debt.lines} unreviewed code line${debt.lines === 1 ? "" : "s"} in ${debt.files} file${debt.files === 1 ? "" : "s"}${risky} (${cap}), measured from ${debt.base.label} at ${debt.base.commit}.`,
+    ...(why ? [`Your marker did not record a reviewed tree: ${why}.`] : []),
+    `Review all of it as ONE review from that commit: round.sh --new-review --base ${debt.base.commit} (no path list), so every round reads the whole diff. Mark it with converged.sh --review <id> (or "review": "<id>" in CONVERGED.json), the id round.sh printed as "review:", so this gate can find the tree the last round read. A marker from another base, a narrowed scope or no review id leaves this hold standing — and so does a scope round.sh truncated: if it says so, re-run it with SELF_REVIEW_SCOPE_MAX_LINES above the diff's size.`,
+    ...(ctx.onMain ? ["This is main, so the commits on it since its last reviewed tree are in the count; converging a branch before merging it is what keeps this from happening."] : []),
+  ].join("\n");
+}
+
+const noted = (decided, notes) => (notes.length
+  ? { ...decided, systemMessage: [decided.systemMessage, ...notes.map((n) => `self-review gate: ${n}`)].filter(Boolean).join("\n") }
+  : decided);
+
+// Held after the turn already marked: its own count, for the reason the other
+// refusals have theirs — a re-mark moves past every earlier reminder.
+function heldAfterMarker(ctx, debt, why, decided, turn) {
+  const refusals = countHeld(turn);
+  if (refusals >= MAX_REMINDERS) {
+    return noted({ rule: "release:held-exhausted", log: { ...decided.log, refusals },
+      systemMessage: `self-review gate: released after ${refusals} holds on ${debt.lines} unreviewed code lines — the branch's review may be incomplete. (SELF_REVIEW_GATE=off disables the gate.)` }, ctx.notes);
+  }
+  return noted({
+    ...(ctx.onMain ? { rule: "block:main-held" } : { rule: "block:branch-held" }), log: { ...decided.log, refusals }, decision: "block",
+    reason: heldReason(ctx, debt, why),
+    systemMessage: `self-review gate: ${debt.lines} unreviewed code lines on ${ctx.branch} since ${debt.base.label} — held for one review from ${debt.base.commit.slice(0, 12)}`,
+  }, ctx.notes);
+}
+
+function mainReview(ctx, decided, turn, accepted) {
+  if (!decided.rule.startsWith("pass:")) return noted(decided, ctx.notes);
+  const { why } = decided.rule === "pass:marker" ? recordMarker(ctx, accepted) : { why: null };
+  const head = commitOf(ctx.top, "HEAD");
+  if (!head) return noted(decided, [...ctx.notes, `branch review: ${ctx.branch} has no commit to measure`]);
+  const reviewedMain = ctx.refs.find((ref) => ref.branch === ctx.main.local);
+  if (reviewedMain?.commit === head || mainCovered(ctx.top, ctx.refs, ctx.main.local, head)) {
+    if (reviewedMain?.commit !== head && !(reviewedMain?.snapshot && reviewedMain.parent === head)) writeReviewed(ctx.top, ctx.main.local, head);
+    return noted(decided, ctx.notes);
+  }
+  const debt = smallestDebt(ctx.top, baselines(ctx.top, ctx.refs, ctx.main, ctx), treeOf(ctx.top, "HEAD"), ctx);
+  if (!debt) return noted(decided, [...ctx.notes, `branch review: could not measure ${ctx.branch} — gated per turn`]);
+  if (debt.lines === 0 && debt.risky.length === 0) {
+    // Only prose differs from a reviewed tree, and prose never arms the gate.
+    writeReviewed(ctx.top, ctx.main.local, head);
+    return noted(decided, ctx.notes);
+  }
+  return heldAfterMarker(ctx, debt, why, decided, turn);
+}
+
+function branchReview(decided, cwd, turn, accepted) {
+  const { rule } = decided;
+  if (rule === "pass:empty" || rule === "pass:interrupted") return decided;
+  const ctx = branchContext(cwd);
+  if (!ctx) return decided;
+  if (ctx.unmeasurable) {
+    return rule === "pass:no-change" ? decided : noted(decided, [`branch review not applied — ${ctx.unmeasurable}; this turn is gated per turn`]);
+  }
+  if (ctx.onMain) return mainReview(ctx, decided, turn, accepted);
+  // On a branch, debt is read only on a turn the gate already treats as code:
+  // anything else is unchanged from today, and main catches what a branch lets by.
+  const deferrable = rule === "block:unmarked" || rule === "release:reminders-exhausted";
+  if (rule !== "pass:marker" && !deferrable) return noted(decided, ctx.notes);
+  // Debt is measured in this repository's worktree only, so a block is
+  // deferred only when every change it names is a file placed inside it. A
+  // write elsewhere — another repository, a linked worktree, a subagent's or a
+  // command's unplaced files — is invisible to the measure and stays gated.
+  if (rule === "block:unmarked" && !changesInside(decided.changes, ctx.top)) {
+    return noted(decided, [...ctx.notes, `branch review not applied — this turn changed files outside ${ctx.top}, or ones the gate could not place; gated per turn`]);
+  }
+  const { why } = rule === "pass:marker" ? recordMarker(ctx, accepted) : { why: null };
+  const tree = worktreeTree(ctx.top);
+  const debt = tree && smallestDebt(ctx.top, baselines(ctx.top, ctx.refs, ctx.main, ctx), tree, ctx);
+  if (!debt) return noted(decided, [...ctx.notes, `branch review: could not measure ${ctx.branch}'s debt — gated per turn`]);
+  if (debt.lines <= ctx.opt.maxLines && debt.risky.length === 0) {
+    if (rule === "pass:marker") return noted(decided, ctx.notes);
+    return noted({
+      rule: "release:branch-deferred", log: decided.log,
+      systemMessage: `self-review gate: review deferred — ${debt.lines}/${ctx.opt.maxLines} unreviewed code lines on ${ctx.branch} since ${debt.base.label} (branch review is on for this repository)`,
+    }, ctx.notes);
+  }
+  if (rule === "release:reminders-exhausted") return noted(decided, ctx.notes);
+  if (rule === "block:unmarked") {
+    return noted({ ...decided, rule: "block:branch-held", reason: `${decided.reason}\n${heldReason(ctx, debt, null)}` }, ctx.notes);
+  }
+  return heldAfterMarker(ctx, debt, why, decided, turn);
+}
+
+// Every change a named file whose repository is `top` itself — not a nested
+// repository, not a worktree elsewhere. An agent's edits and a command whose
+// targets did not resolve have no files to place, so they fail the test.
+function changesInside(changes, top) {
+  if (!Array.isArray(changes) || !changes.length) return false;
+  const root = realish(top);
+  return changes.every((c) => {
+    const files = c.kind === "file" ? [c.file] : c.kind === "bash" && !c.unresolved ? c.files : null;
+    return files?.length > 0 && files.every((f) => {
+      const rel = path.relative(root, realish(f));
+      return !rel.startsWith("..") && !path.isAbsolute(rel) && gitTopOf(f) === root;
+    });
+  });
+}
+
 // The decision log (state-location ruling, section 2): one row per Stop,
 // passes included, in LOG_DIR/gate/YYYY-MM.jsonl. WRITE-ONLY — nothing in this
 // gate reads it back, because the log dir can be redirected by a repo's
@@ -2247,20 +2437,43 @@ function logDecision(payload, rule, { reminders = null, refusals = null, marker 
   }
 }
 
+// Branch review sits on top of today's decision and never under it: a failure
+// anywhere in it hands back the decision it was given, which gates per turn.
+// Well inside the hook's 20 s timeout, and counted from when the hook started as
+// well as from now: a slow evaluate() spends the same budget, so the two together
+// cannot run the hook into its kill. A deadline already past gates per turn.
+const HOOK_STARTED = Date.now();
+const BRANCH_BUDGET_MS = 10_000;
+const HOOK_BUDGET_MS = 15_000;
+function withBranchReview(decided, entries, cwd) {
+  try {
+    setDeadline(Math.min(Date.now() + BRANCH_BUDGET_MS, HOOK_STARTED + HOOK_BUDGET_MS));
+    const humanAt = entries.reduce((last, entry, index) => (isHumanPrompt(entry) ? index : last), -1);
+    return branchReview(decided, cwd, entries.slice(humanAt + 1), decided.accepted ?? null);
+  } catch (err) {
+    process.stderr.write(`self-review-gate: branch review failed (${err.message}); gating per turn\n`);
+    return decided;
+  }
+}
+
 runHook("SELF_REVIEW_GATE", "self-review-gate", (payload) => {
   // Every return site names its rule; the code and its counts are the log's,
   // and are taken off before anything is printed. A throw still leaves its row,
   // then goes on to runHook, which reports it and fails open.
   let decided;
   try {
-    decided = typeof payload.transcript_path === "string"
-      ? evaluate(readMainChain(payload.transcript_path), payload.cwd ?? process.cwd(), payload.transcript_path)
-      : { rule: "pass:no-transcript" };
+    const cwd = payload.cwd ?? process.cwd();
+    if (typeof payload.transcript_path === "string") {
+      const entries = readMainChain(payload.transcript_path);
+      decided = withBranchReview(evaluate(entries, cwd, payload.transcript_path), entries, cwd);
+    } else {
+      decided = { rule: "pass:no-transcript" };
+    }
   } catch (err) {
     logDecision(payload, "error:crash");
     throw err;
   }
-  const { rule, log, ...output } = decided;
+  const { rule, log, accepted, changes, ...output } = decided;
   logDecision(payload, rule, log);
   return Object.keys(output).length ? output : null;
 });

@@ -32,10 +32,10 @@
  */
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LOG_DIR, isMain, loadConfig, realpathOr } from "../hooks/lib/config.mjs";
+import { normaliseRemote, repoId } from "../hooks/lib/repo-id.mjs";
 import { auditEngagement, engagementFile, engagementLine, openEngagement } from "../hooks/lib/engagement.mjs";
 import { parseDiff } from "./lib/diff.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
@@ -298,49 +298,9 @@ export function toRecords(text) {
 }
 
 // --- where a repository's memory lives --------------------------------------
-/**
- * `git@github.com:Owner/Repo.git`, `https://github.com/Owner/Repo` and
- * `ssh://git@github.com/Owner/Repo/` are one project, so they hash to one file:
- * scheme, credentials, the scp colon, `.git` and trailing slashes are noise,
- * and the host is case-insensitive. The path is not — plenty of forges are
- * case-sensitive, and two paths differing only in case are two repositories
- * until one of them proves otherwise.
- */
-export function normaliseRemote(url) {
-  const raw = String(url).trim();
-  const withoutScheme = raw.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-  const withoutUser = withoutScheme.replace(/^[^/@]*@/, "");
-  // `git@host:path` is scp syntax, which git only accepts without a scheme —
-  // so after a scheme a colon is a port, and folding it into the path gave
-  // `ssh://git@host:2222/o/r` a different id from `https://host/o/r`.
-  const scp = withoutScheme === raw ? withoutUser.match(/^([^/:]+):(?!\/)(.*)$/) : null;
-  const rest = scp ? `${scp[1]}/${scp[2]}` : withoutUser.replace(/^([^/]+):\d+(?=\/|$)/, "$1");
-  const slash = rest.indexOf("/");
-  const host = slash === -1 ? rest : rest.slice(0, slash);
-  const tail = slash === -1 ? "" : rest.slice(slash);
-  return `${host.toLowerCase()}${tail}`.replace(/\/+$/, "").replace(/\.git$/i, "").replace(/\/+$/, "");
-}
-
-const originUrl = (repoRoot) => {
-  try {
-    return execFileSync("git", ["-C", repoRoot, "remote", "get-url", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
-  } catch {
-    return null;
-  }
-};
-
-/**
- * The memory key: the hashed origin, so clones and worktrees of one project
- * remember together instead of each starting cold; the hashed realpath when
- * there is no remote, which keeps a scratch repo's findings out of everyone
- * else's file. Hashed either way because it is a stable, filesystem-safe key
- * for a string full of `/` and `:` — not because it hides anything: the records
- * beside it quote the repository's own paths and code.
- */
-export function repoId(repoRoot) {
-  const remote = originUrl(repoRoot);
-  return createHash("sha256").update(remote ? normaliseRemote(remote) : realpathOr(repoRoot)).digest("hex");
-}
+// The identity itself is `hooks/lib/repo-id.mjs`'s, because the Stop gate keys
+// the branch-debt opt-in on the same id and a hook may not import from here.
+export { normaliseRemote, repoId };
 
 export const findingsFile = (repoRoot, { logDir = LOG_DIR } = {}) =>
   path.join(logDir, "findings", `${repoId(repoRoot)}.jsonl`);

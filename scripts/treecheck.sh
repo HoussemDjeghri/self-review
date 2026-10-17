@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # treecheck — did the working tree change while the reviewers ran?
 #
-# Usage: treecheck.sh --work <dir> --round <n> [--root <repo>] [--record | --changed]
+# Usage: treecheck.sh --work <dir> --round <n> [--root <repo>] [--record [--base <sha>] [--partial] | --changed]
 #
 # `--record` writes the snapshot round.sh takes before it prints the briefs;
+# `--base` and `--partial` become its commit's `Self-Review-Base` and
+# `Self-Review-Partial` trailers, which the Stop gate's branch review reads to
+# decide whether the review read the whole diff from a reviewed tree;
 # the default compares the current state against it and names what moved.
 # `--changed` prints, NUL-separated and absolute, the files that differ between
 # round <n>'s snapshot ref and the tree now (deleted files included — scope.sh renders a
@@ -37,13 +40,15 @@ set -euo pipefail
 
 die() { echo "treecheck.sh: $*" >&2; exit 2; }
 
-work=""; round=""; root=""; record=0; changed=0
+work=""; round=""; root=""; record=0; changed=0; base_sha=""; partial=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --work)   [ $# -ge 2 ] || die "--work needs a directory"; work="$2"; shift 2 ;;
     --round)  [ $# -ge 2 ] || die "--round needs a number";   round="$2"; shift 2 ;;
     --root)   [ $# -ge 2 ] || die "--root needs a directory"; root="$2"; shift 2 ;;
     --record) record=1; shift ;;
+    --base)   [ $# -ge 2 ] || die "--base needs a commit"; base_sha="$2"; shift 2 ;;
+    --partial) partial=1; shift ;;
     --changed) changed=1; shift ;;
     -h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -108,8 +113,14 @@ record_snapshot() {
   # An unborn HEAD has no parent to give, and a repository with no commits is
   # still a repository whose untracked work can be destroyed.
   parent="$(git -C "$root" rev-parse --verify -q HEAD || true)"
+  # The trailers say what this round's finders were shown: the diff from
+  # Self-Review-Base to this tree, and whether a path list narrowed it. The Stop
+  # gate reads them in a repository opted into branch review, to decide whether
+  # a converged marker naming this review covered the branch's debt.
   commit="$(git -C "$root" commit-tree "$tree" ${parent:+-p "$parent"} \
-    -m "self-review round $round snapshot")" || { rm -f "$idx"; return 1; }
+    -m "self-review round $round snapshot" \
+    -m "${base_sha:+Self-Review-Base: $base_sha
+}Self-Review-Partial: $([ "$partial" -eq 1 ] && echo yes || echo no)")" || { rm -f "$idx"; return 1; }
   git -C "$root" update-ref "$(snapshot_ref)" "$commit" || { rm -f "$idx"; return 1; }
   rm -f "$idx"
 }

@@ -35,6 +35,11 @@
  *   forced/computed optional, S | M | L, written together when the loop took a
  *                   tier other than the one the rules chose
  *   adapter        optional, open vocabulary — the loop names its scope adapter
+ *   review         optional, the 8-hex review id round.sh prints. In a
+ *                   repository opted into branch review it is how the Stop
+ *                   gate finds the tree the final round read (treecheck.sh's
+ *                   snapshot ref) and records it as reviewed; everywhere else
+ *                   it is only logged (marker-check ruling)
  *   intent    validated | author | skipped                      (always, for
  *             the two counted outcomes) — who read the intent before the code
  *             was written. `validated` means a fresh ticket-validator did, and
@@ -58,13 +63,14 @@ export const TIERS = ["S", "M", "L"];
 // `forced`/`computed` are here because SKILL.md tells the loop to record an
 // override, and audit.mjs reads both; without them the CLI refused the whole
 // marker as an unknown flag and the file form dropped them silently.
-export const LABELS = ["tier", "adapter", "forced", "computed", "intent"];
+export const LABELS = ["tier", "adapter", "forced", "computed", "intent", "review"];
 const TIER_LABELS = new Set(["tier", "forced", "computed"]);
 // Who read the intent before the code existed. `validated` is the only one the
 // Stop gate can check, and it checks ordering — a validator completion before
 // the first edit — never the verdict: grading the ticket would be the stamp
 // this field exists to avoid being.
 export const INTENT_STATES = ["validated", "author", "skipped"];
+export const REVIEW_ID_RE = /^[0-9a-f]{8}$/;
 
 export const isCounted = (outcome) => outcome === "converged" || outcome === "not-converged";
 const list = (values) => values.join(" | ");
@@ -173,6 +179,7 @@ export function validateMarker(fields = {}) {
     // but a tier outside S|M|L opens an audit bucket nothing else writes.
     else if (TIER_LABELS.has(key) && !TIERS.includes(value)) problems.push(`${key}="${value}" is not one of ${list(TIERS)}.`);
     else if (key === "intent" && !INTENT_STATES.includes(value)) problems.push(`intent="${value}" is not one of ${list(INTENT_STATES)}.`);
+    else if (key === "review" && !REVIEW_ID_RE.test(value)) problems.push(`review="${value}" is not a review id — the 8 hex characters round.sh prints as "review:".`);
     else record[key] = value;
   }
 

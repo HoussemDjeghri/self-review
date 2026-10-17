@@ -130,7 +130,7 @@ const EVIDENCE_PER_MARKER = 3;
  * is not a destructive change.
  */
 export function riskMarkers({ files, diff, kinds, config, broken, wire = [] }) {
-  const markers = { auth: [], payments: [], migration: [], infra: [], destructive: [], security: [], concurrency: [], contractBreak: [], wireBreak: [] };
+  const markers = { auth: [], payments: [], migration: [], infra: [], protected: [], destructive: [], security: [], concurrency: [], contractBreak: [], wireBreak: [] };
   for (const [name, patterns] of Object.entries(config.riskPaths)) {
     if (!patterns.length) continue;
     const pattern = anyOf(patterns);
@@ -205,7 +205,7 @@ const PLURAL = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
 // The markers that make a change L on their own. Exported because the round-2+
 // ceiling has to ask whether a marker is NEW this round, and a second copy of
 // this list would let the two answers drift.
-export const ESCALATING = ["auth", "payments", "migration", "destructive", "infra", "contractBreak", "wireBreak"];
+export const ESCALATING = ["auth", "payments", "migration", "destructive", "infra", "protected", "contractBreak", "wireBreak"];
 
 /** Every marker riskMarkers() can fire, escalating or not. */
 export const MARKER_NAMES = [...ESCALATING, "security", "concurrency"];

@@ -14,6 +14,7 @@ field you do not recognise, or when choosing between the two marker forms.
 | `note` | optional; required for `reason=other` | free text — the only free text there is, and it never enters the summary |
 | `tier` `adapter` | always | `tier` is `S`, `M` or `L` from `tier.json`; `adapter` from `impact.json` (`adapter=none` when impact.mjs wrote nothing) |
 | `intent` | `converged` / `not-converged` | `validated`, `author` or `skipped` — who read the intent **before** the code was written. Required, because an absent field and "nobody read it" would otherwise be the same state. `validated` is refused unless a `self-review-ticket-validator` completed before this task's first code change; the gate checks that order and never the verdict |
+| `review` | optional, `converged` / `not-converged` | the 8-hex id `round.sh --new-review` printed as `review:` (recover it with `printf '%s' <work> \| git hash-object --stdin \| cut -c1-8`). Pass it always; the gate reads it only in a repository you opted into branch review, where it finds the tree the review's last round read (its snapshot ref) and records that tree as reviewed |
 | `forced` `computed` | when you overrode the tier | both `S`, `M` or `L` from `tier.json`, and written together — one alone does not say what was overridden |
 
 Anything that does not validate is **refused** — by the script in the same

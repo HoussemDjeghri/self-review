@@ -464,6 +464,15 @@ test("a CI or IaC change is L on its own: infra is an escalating marker", () => 
   assert.match(result.reasons.join(" "), /infra: \.github\/workflows/);
 });
 
+// Protected roots (tiers-boundary ruling C): the neutral category a repository
+// names its own load-bearing paths with, through the additive layer.
+test("a one-line change under a protected root is L on its own", () => {
+  const config = { ...TIER, riskPaths: { ...TIER.riskPaths, protected: ["packages/core/"] } };
+  const result = planFor(["M  packages/core/a.ts"], hunk("packages/core/a.ts", ["x = 1;"]), IMPACT(), { config });
+  assert.equal(result.tier, "L");
+  assert.match(result.reasons.join(" "), /protected: packages\/core\/a\.ts/);
+});
+
 test("merging never crosses kinds and stops as soon as the round fits", () => {
   const rows = [
     { group: "A+B+D", angles: ["A", "B", "D"], kind: "code" },

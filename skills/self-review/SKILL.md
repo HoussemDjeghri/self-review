@@ -85,7 +85,7 @@ config: `references/scripts.md` → **Config**.
 
 **One work dir per review.** `round.sh --new-review` allocates
 `<reviews>/review-<k>/` under `<reviews>` = `<scratchpad>/self-review/` and
-prints `work: <path>` first; **`<work>` is that path from then on** — every
+prints `work: <path>` first, then `review: <id>` (the marker's `review`, §4); **`<work>` is that path from then on** — every
 round (`<work>/round-<n>/`), the ledger, the marker. Without a scratchpad
 (headless), `<reviews>` is what `"${CLAUDE_PLUGIN_ROOT}/scripts/reviews-dir.sh"` prints — the same
 private path on every call in one session (with the same `$TMPDIR`), ticket
@@ -504,14 +504,24 @@ gated.
 
 ```
 Write  <work>/CONVERGED.json          # i.e. <reviews>/review-<k>/CONVERGED.json
-{"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author"}
+{"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author", "review": "<id>"}
 ```
 
 **Or run the script**, which logs itself and works when `<work>` is not scratch:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep --intent author
+"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep --intent author --review <id>
 ```
+
+**Branch review.** In a repository the user opted into branch review, the gate
+may let a code turn end unmarked while the branch's unreviewed code stays under
+their cap, and holds it past the cap or on a tier-L path. A hold names one
+commit: review **all** of it as one review — `round.sh --new-review --base <that
+sha>`, no path list — and mark with its `review` id, which is how the gate finds
+the tree the last round read. A narrowed scope, another base or no `review`
+leaves the hold standing. Lost the id? It is the first 8 hex of
+`printf '%s' <work> | git hash-object --stdin`. `scripts/branch-debt.mjs` prints
+where a repository stands.
 
 Anything invalid is **refused** with every defect named, so fix what it names
 and write again; fields, the `not-applicable` form and where each form counts are

@@ -212,6 +212,9 @@ if [ "$new_review" -eq 1 ]; then
   done
   work="$(abs_path "$review_base/review-$k")"
   echo "work: $work"
+  # The id treecheck.sh keys this review's snapshots by. The marker carries it
+  # (`review`), which is how the Stop gate finds the tree the last round read.
+  echo "review: $(printf '%s' "$work" | git hash-object --stdin | cut -c1-8)"
   # By inode, not by spelling: /var and /private/var are one file on macOS.
   if [ "$intent" -ef "$review_base/intent.md" ]; then consume_base_intent=1; fi
   cp "$intent" "$work/intent.md"
@@ -783,7 +786,16 @@ fi
 # the reports. Detection, not prevention: the prose in the agent files asks
 # reviewers not to write, and one of them ran the writer under review against
 # the real repository and then `git checkout` to undo it.
-[ "$replan" -eq 1 ] || "$here/treecheck.sh" --work "$work" --round "$round" ${repo_root:+--root "$repo_root"} --record
+# The base as a commit, not the spelling given: `HEAD` moves, and the gate reads
+# this back later to ask whether the round started from a reviewed tree.
+base_sha=""
+[ -z "$repo_root" ] || base_sha="$(git -C "$repo_root" rev-parse --verify -q "${base:-HEAD}^{commit}" 2>/dev/null || true)"
+# Partial when a path list narrowed the scope or scope.sh truncated it: either
+# way the finders did not read the whole diff, and the gate must not record it.
+partial=""
+if [ -n "${paths[0]+x}" ] || grep -q '^# TRUNCATED:' "$scope" 2>/dev/null; then partial=1; fi
+[ "$replan" -eq 1 ] || "$here/treecheck.sh" --work "$work" --round "$round" ${repo_root:+--root "$repo_root"} \
+  ${base_sha:+--base "$base_sha"} ${partial:+--partial} --record
 
 "$here/brief.mjs" --round "$round" --plan "$dir/tier.json" --intent "$intent" \
   --scope "$scope" ${impact_md:+--impact "$dir/impact.md"} --prior "$dir/prior.md" --ledger "$ledger" \

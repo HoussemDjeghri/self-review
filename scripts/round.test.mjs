@@ -1315,3 +1315,23 @@ test("round 2 refuses paths, --base, and a review with no recorded scope — and
     spawnSync("mv", [path.join(review, "round-1", `${file}.gone`), path.join(review, "round-1", file)]);
   }
 });
+
+test("--new-review prints the review id, and the snapshot it records says whether the finders saw the whole diff", () => {
+  const trailers = (extra, env = {}) => {
+    const { repo, work } = fixture();
+    const done = spawnSync("bash", [ROUND, "--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight", ...extra],
+      { cwd: repo, encoding: "utf8", env: { ...process.env, ...env } });
+    assert.equal(done.status, 0, done.stderr);
+    const id = /^review: ([0-9a-f]{8})$/m.exec(done.stdout)?.[1];
+    assert.ok(id, `a review: line follows work:\n${done.stdout.split("\n").slice(0, 3).join("\n")}`);
+    const ref = `refs/self-review/${id}/round-1`;
+    const body = spawnSync("git", ["log", "-1", "--format=%B", ref], { cwd: repo, encoding: "utf8" }).stdout;
+    const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+    return { body, head };
+  };
+  const whole = trailers([]);
+  assert.match(whole.body, new RegExp(`^Self-Review-Base: ${whole.head}$`, "m"));
+  assert.match(whole.body, /^Self-Review-Partial: no$/m);
+  assert.match(trailers(["src/cli.mjs"]).body, /^Self-Review-Partial: yes$/m, "a path list narrows it");
+  assert.match(trailers([], { SELF_REVIEW_SCOPE_MAX_LINES: "15" }).body, /^Self-Review-Partial: yes$/m, "so does a truncated scope");
+});

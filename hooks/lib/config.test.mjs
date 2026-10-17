@@ -8,7 +8,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { isMain, loadConfig, PLUGIN_ROOT, REPO_CONFIG_FILE } from "./config.mjs";
+import { branchDebtFor, isMain, loadConfig, PLUGIN_ROOT, REPO_CONFIG_FILE } from "./config.mjs";
+import { repoId } from "./repo-id.mjs";
 
 const repoWith = (contents) => {
   const root = mkdtempSync(path.join(tmpdir(), "self-review-repo-"));
@@ -255,4 +256,69 @@ test("isMain matches a path that URL-encoding would change, and rejects another 
     assert.equal(isMain(pathToFileURL(script).href), true);
     assert.equal(isMain(pathToFileURL(path.join(at, "other.mjs")).href), false);
   } finally { process.argv[1] = argv; }
+});
+
+// Per-repository settings (tiers-boundary ruling C): the user's config keys
+// them by repository id, and nothing a repository ships can reach them.
+const gitRepo = (origin) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-review-repos-"));
+  spawnSync("git", ["init", "-q", root]);
+  if (origin) spawnSync("git", ["-C", root, "remote", "add", "origin", origin]);
+  return root;
+};
+const withUserConfig = (contents) => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "self-review-user-")), "config.json");
+  writeFileSync(file, JSON.stringify(contents));
+  process.env.SELF_REVIEW_CONFIG = file;
+};
+
+test("a branch-debt opt-in for repository X does not apply in repository Y", () => {
+  const x = gitRepo("git@github.com:owner/x.git");
+  const y = gitRepo("git@github.com:owner/y.git");
+  withUserConfig({ repos: { [repoId(x)]: { branchDebt: { maxLines: 500 } } } });
+  const config = loadConfig();
+  assert.deepEqual(branchDebtFor(x, config), { id: repoId(x), maxLines: 500, main: "" });
+  assert.equal(branchDebtFor(y, config), null, "an opt-in is one repository's, never every repository's");
+  // Clones of one project share the id, as findings memory already does.
+  assert.equal(branchDebtFor(gitRepo("https://github.com/owner/x"), config)?.maxLines, 500);
+});
+
+test("a repository's .self-review.json asking for branch deferral is ignored", () => {
+  const root = gitRepo("git@github.com:owner/self-deferring.git");
+  writeFileSync(path.join(root, REPO_CONFIG_FILE), JSON.stringify({
+    repos: { [repoId(root)]: { branchDebt: { maxLines: 100000 } } },
+    branchDebt: { maxLines: 100000 },
+  }));
+  noUserConfig();
+  assert.equal(branchDebtFor(root, loadConfig(root)), null, "deferral weakens the review, so it is the user's to switch on");
+});
+
+test("repos.<id>.tier sets thresholds in that repository only, over the user's own values", () => {
+  const x = gitRepo("git@github.com:owner/tiered.git");
+  const y = gitRepo("git@github.com:owner/untiered.git");
+  withUserConfig({ tier: { l: { minFiles: 12 } }, repos: { [repoId(x)]: { tier: { s: { maxLines: 40 } } } } });
+  assert.equal(loadConfig(x).tier.s.maxLines, 40);
+  assert.equal(loadConfig(x).tier.l.minFiles, 12, "the entry is laid over the user's tier, not over the shipped one");
+  assert.ok(loadConfig(x).tier.riskPaths.auth.length > 0, "and a key it does not name keeps its value");
+  assert.equal(loadConfig(y).tier.s.maxLines, 15);
+  assert.equal(loadConfig().tier.s.maxLines, 15, "a caller with no repository root gets no repository's overlay");
+});
+
+test("an entry that is not a repository id, or a cap that is not a positive whole number, opts nothing in", () => {
+  const root = gitRepo("git@github.com:owner/typo.git");
+  for (const debt of [{ maxLines: 0 }, { maxLines: -5 }, { maxLines: 1.5 }, { maxLines: "500" }, {}]) {
+    withUserConfig({ repos: { [repoId(root)]: { branchDebt: debt } } });
+    assert.equal(branchDebtFor(root, loadConfig()), null, JSON.stringify(debt));
+  }
+  withUserConfig({ repos: { [root]: { branchDebt: { maxLines: 500 } }, __proto__: { branchDebt: { maxLines: 500 } } } });
+  const config = loadConfig();
+  assert.equal(branchDebtFor(root, config), null, "a path is not an id");
+  assert.deepEqual(Object.keys(config.repos), []);
+});
+
+test("the protected path category escalates like the built-in ones and starts empty", () => {
+  noUserConfig();
+  assert.deepEqual(loadConfig().tier.riskPaths.protected, []);
+  const root = repoWith({ tier: { riskPaths: { protected: ["packages/core/"] } } });
+  assert.deepEqual(loadConfig(root).tier.riskPaths.protected, ["packages/core/"]);
 });

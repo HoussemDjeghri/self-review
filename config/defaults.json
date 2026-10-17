@@ -54,7 +54,8 @@
       "auth": ["auth", "login", "session", "token", "oauth", "sso", "passw", "secret", "crypt", "permission", "acl"],
       "payments": ["payment", "billing", "invoice", "stripe", "checkout", "ledger", "wallet"],
       "migration": ["migrat", "schema", "\\.sql$", "seed"],
-      "infra": ["Dockerfile", "\\.github/workflows", "\\.gitlab-ci", "terraform", "\\.tf$", "k8s", "helm", "ansible", "deploy"]
+      "infra": ["Dockerfile", "\\.github/workflows", "\\.gitlab-ci", "terraform", "\\.tf$", "k8s", "helm", "ansible", "deploy"],
+      "protected": []
     },
     "riskContent": {
       "destructive": ["rm -rf", "rmSync", "unlink", "DROP ", "DELETE FROM", "\\bf?truncate(?:Sync)?\\b", "--force", "force-push", "shutil\\.rmtree"],
@@ -95,5 +96,7 @@
       "callsCold": 20,
       "roundsCap": { "S": 2, "M": 2, "L": 6 }
     }
-  }
+  },
+  "$comment.repos": "Per-repository settings, USER config only: a checked-in .self-review.json cannot reach them. Key: the repository id `scripts/branch-debt.mjs --id` prints. An entry may carry `tier` (laid over the top-level tier in that repository) and `branchDebt`: {\"maxLines\": 500} opts the repository into branch review, where the Stop gate lets turns on a non-main branch end unreviewed until the unreviewed diff passes maxLines changed lines or touches a tier-L path; \"main\" names the integration branch when origin/HEAD is not it.",
+  "repos": {}
 }
