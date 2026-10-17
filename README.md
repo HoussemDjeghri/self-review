@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.9.0" src="https://img.shields.io/badge/version-0.9.0-191919">
+  <img alt="version 0.10.0" src="https://img.shields.io/badge/version-0.10.0-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -260,6 +260,16 @@ to gating *every* file: a broken install costs you a review, never skips one.
 `gate.maxReminders` is the escape hatch — after that many blocks in a row the
 gate releases the turn with a notice rather than trapping the session. To turn
 the gate off for a session entirely, set `SELF_REVIEW_GATE=off`.
+
+### Delegating a review
+
+The loop runs in the session that changed the code. A subagent can't run it for
+its lead: the reviewers it launches never appear in the lead's transcript, so
+the lead's gate refuses the marker. To review finished work somewhere else, run
+`claude -p "/self-review <paths>"` in the repository, with the permission flags
+your headless sessions use (a `-p` session cannot answer a prompt, so a tool it
+is not allowed is denied). It is a session of its own, so its reviewers count,
+and its Stop gate checks its marker whenever its fixes change code.
 
 ### Branch review (opt-in, per repository)
 

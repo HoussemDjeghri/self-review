@@ -17,7 +17,7 @@ exactly that way. So when a reviewer dies, goes idle without a report,
 "${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" <session-id> <name>     # its last message (--all-text: every text block)
 ```
 
-The session id is the UUID in your scratchpad path, or `$CLAUDE_CODE_SESSION_ID` without one; the briefs in
+The session id is `$CLAUDE_CODE_SESSION_ID`, or the UUID in your scratchpad path where that is unset (inside a subagent the scratchpad can name another session); the briefs in
 `round-<r>/briefs/` say who was launched. A name launched more than once prints
 its newest launch, and stderr lists the older transcripts' stems — pass one in
 place of the name to print that launch instead. Then:

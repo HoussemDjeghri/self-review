@@ -1755,7 +1755,7 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
         ? `A reviewer did complete, but this landed after it was launched — a reviewer reads the tree it was given, so it never saw: ${latest}. Nothing read it but you.`
         : `A reviewer did complete, but this landed after it finished: ${latest} — read by nobody but you.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`]
-      : [`No reviewer agent ran in this window — a verifier alone does not count, because verifying findings you generated yourself is reviewing your own work.`,
+      : [`No reviewer agent ran in this window — a verifier alone does not count, because verifying findings you generated yourself is reviewing your own work. Reviewers a subagent launched are not in this window either: to delegate a review, run it headless (\`claude -p\` in the repository) instead.`,
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`];
   return [
     // The orchestrator belongs in both lists, and it was missed in both when

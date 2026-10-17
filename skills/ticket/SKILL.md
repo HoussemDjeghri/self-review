@@ -71,7 +71,7 @@ Then, as the very next call with nothing in between, Bash `timeout` `600000`:
 longer active; `salvage.mjs` then prints its last message, which is the report
 — nothing else carries it (a report sent through SendMessage may never arrive).
 The session id
-is the UUID in your scratchpad path, or `$CLAUDE_CODE_SESSION_ID` without one. The ticket waits in a directory of its own
+is `$CLAUDE_CODE_SESSION_ID`, or the UUID in your scratchpad path without it. The ticket waits in a directory of its own
 because `wait.mjs` keeps its state under `round-<n>/` and numbers from 1, and
 the ticket is not round 1 of anything. Exit 1 means call it again, now; exit 3
 means it went dead — salvage by hand, and re-spawn once under a new suffix only

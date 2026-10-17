@@ -393,11 +393,26 @@ test("usage errors are refused rather than guessed at", async () => {
   }
 });
 
-test("the session id comes from the scratchpad path, so the normal call needs no --session", () => {
+test("the fallback session id comes from the scratchpad path", () => {
   assert.equal(sessionIdFrom(`/tmp/x/${SESSION}/scratchpad/self-review`), SESSION);
   assert.equal(sessionIdFrom(`/tmp/x/${SESSION}/scratchpad`), SESSION);
   assert.equal(sessionIdFrom("/tmp/x/not-a-uuid/scratchpad/self-review"), null);
   assert.equal(sessionIdFrom("/tmp/work"), null);
+});
+
+test("CLAUDE_CODE_SESSION_ID outranks the scratchpad path: a subagent is handed a scratchpad naming another session", async () => {
+  const { work, subagents } = layout({ names: ["f-ab"] });
+  spawn({ subagents, name: "f-ab", entries: report() });
+  // The work dir's path names SESSION, which resolves to no transcripts here;
+  // the env names the directory the agents are actually in.
+  const previous = process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    process.env.CLAUDE_CODE_SESSION_ID = subagents;
+    assert.equal((await run(["--work", work, "--round", "1", "f-ab"])).code, 0);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+    else process.env.CLAUDE_CODE_SESSION_ID = previous;
+  }
 });
 
 test("a work dir outside a scratchpad takes the session from CLAUDE_CODE_SESSION_ID, and names both sources when neither has one", async () => {
@@ -411,6 +426,9 @@ test("a work dir outside a scratchpad takes the session from CLAUDE_CODE_SESSION
     process.env.CLAUDE_CODE_SESSION_ID = subagents;
     assert.equal((await run(["--work", work, "--round", "1", "f-ab"])).code, 0);
     delete process.env.CLAUDE_CODE_SESSION_ID;
+    await assert.rejects(run(["--work", work, "--round", "1", "f-ab"]), /--work or CLAUDE_CODE_SESSION_ID; pass --session/);
+    // An empty variable is unset, not a session id of "".
+    process.env.CLAUDE_CODE_SESSION_ID = "";
     await assert.rejects(run(["--work", work, "--round", "1", "f-ab"]), /--work or CLAUDE_CODE_SESSION_ID; pass --session/);
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;

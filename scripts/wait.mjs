@@ -110,10 +110,11 @@ const stateLinesIn = (file) => {
   }, 0);
 };
 
-// The session id is in the work dir's own path — the scratchpad Claude Code
-// hands a session is `<project>/<session-id>/scratchpad/…` — so the normal call
-// needs no --session. Derived rather than asked for, because a lead that has to
-// look its own session id up will get it wrong or skip the wait.
+// The fallback session id is in the work dir's own path — the scratchpad Claude
+// Code hands a session is `<project>/<session-id>/scratchpad/…` — so a shell
+// without CLAUDE_CODE_SESSION_ID still needs no --session. It is the fallback,
+// not the first choice, because the path can name another session's scratchpad
+// while the variable always names the session holding the reviewers.
 export const sessionIdFrom = (workDir) =>
   /[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\]scratchpad([/\\]|$)/i.exec(workDir)?.[1] ?? null;
 
@@ -352,11 +353,14 @@ export async function main(argv, {
       : []);
   if (names.length === 0) throw usage(`no names given and no briefs under ${briefsDir}`);
 
-  // A session with no scratchpad (headless `claude -p`) puts <work> under
-  // mktemp, so the path names no session; Claude Code exports the id to every
-  // Bash call, and that is the session whose subagents/ directory holds the
-  // reviewers.
-  const sessionId = options.session ?? sessionIdFrom(workDir) ?? (process.env.CLAUDE_CODE_SESSION_ID || null);
+  // Claude Code exports the running session's id to every Bash call, and that
+  // session's subagents/ directory is where the reviewers are — also when the
+  // caller is itself a subagent (nested agents land flat in the lead's
+  // directory) or a `claude -p` child (it gets its own id). The scratchpad path
+  // is only the fallback: a subagent or child is handed a scratchpad that can
+  // name another session, which is how a subagent's loop once found no
+  // transcripts (measured on 2.1.301, docs/design-notes/subagent-mode-plan.md).
+  const sessionId = options.session ?? (process.env.CLAUDE_CODE_SESSION_ID || null) ?? sessionIdFrom(workDir);
   if (!sessionId) throw usage("could not read a session id from --work or CLAUDE_CODE_SESSION_ID; pass --session <id>");
   const dir = resolveSubagentsDir(sessionId);
   if (!existsSync(dir)) {

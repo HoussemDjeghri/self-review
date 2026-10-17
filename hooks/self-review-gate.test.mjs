@@ -797,6 +797,7 @@ test("converged with no reviewer at all is refused, and the reason says what to 
   assert.match(r.json.reason, /No reviewer agent ran in this window/);
   assert.match(r.json.reason, /self-review-finder/);
   assert.match(r.json.systemMessage, /no reviewer completion after the last change/);
+  assert.match(r.json.reason, /run it headless \(`claude -p` in the repository\)/, "a lead whose subagent ran the review is told where delegation works");
 });
 
 test("a verifier alone does not satisfy converged — it presupposes findings the author generated", () => {

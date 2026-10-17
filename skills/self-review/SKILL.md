@@ -237,6 +237,17 @@ change to the lead (message it the scope) and ends with
 reviews it in one honest single pass (below) and ends `--not-converged` with
 its real counts — never `converged`, which the gate refuses without reviewers.
 
+A **subagent** cannot run the loop for its lead either. Its reviewers never
+appear in the lead's transcript, so the lead's gate refuses the marker. To
+delegate a review of finished work, run it headless instead —
+`claude -p "/self-review <paths>"` from the repository, with the permission
+flags your headless sessions use (a `-p` child cannot answer a prompt, so a
+tool it is not allowed is denied) — and read the marker
+and report it ends with: the child is a session of its own, so its reviewers are
+in its own transcript, and its Stop gate checks the marker whenever the child's
+fixes changed code. A subagent that changed code hands the change back to the
+lead, as a teammate does.
+
 If a *reviewer* type is missing, use `general-purpose` with that agent file
 (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) pasted at the top of the brief, under
 the printed `self-review-…` name: no guard recognises its registered type, so
@@ -245,8 +256,8 @@ the Stop gate arms on that exact type, so a substitute is invisible to it and
 carries `Bash`; without the applier type, apply fixes yourself (§2e) and say so.
 
 Finders run in the background (`run_in_background: true` where exposed); their
-notifications are not the signal, `wait.mjs` is — also when you are yourself a
-subagent. While they read, do not edit, commit or rebase files in scope: a
+notifications are not the signal, `wait.mjs` is — also in a headless
+`claude -p` session. While they read, do not edit, commit or rebase files in scope: a
 finder on a moved tree returns line numbers that point nowhere. Never use a fork
 for a reviewer and never review inline: a fork inherits the context that made
 the mistake, and inline review is what this skill replaces. Without the Agent
@@ -261,8 +272,8 @@ fails, report its angle as uncovered rather than waiting.
 `wait.mjs`'s table says who finished, died or stalled; the last two go to §2f
 first. A report is the finder's last message, which a wake-up does not carry.
 In one call, read every finished report —
-`scripts/salvage.mjs <session-id> <name> <name>…` (no names lists the agents; the session id is the UUID in your
-scratchpad path, or `$CLAUDE_CODE_SESSION_ID` without one) — and run `scripts/treecheck.sh --work <work> --round <n>`,
+`scripts/salvage.mjs <session-id> <name> <name>…` (no names lists the agents; the session id is
+`$CLAUDE_CODE_SESSION_ID`, or the UUID in your scratchpad path where that is unset — inside a subagent the scratchpad can name another session) — and run `scripts/treecheck.sh --work <work> --round <n>`,
 which is silent unless the tree moved while reviewers ran; its line goes into
 the report **verbatim**, because a reviewer that wrote into the repository, or
 undid something to clean up, took uncommitted work with it.
