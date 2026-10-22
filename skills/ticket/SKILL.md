@@ -6,14 +6,14 @@ description: Grooms the ticket before the code exists: writes the INTENT block t
 # Ticket
 
 The self-review loop reviews a change faithfully against its INTENT block, and
-every finder is told that the block's "out of scope on purpose" line is
-deliberate and not to be flagged — so the author's own scoping is exempt from
-review by construction, and the premise is questioned only after the author is
+its finders leave alone any "out of scope on purpose" cut that only narrows the
+ask — they flag a cut only when it contradicts the request or a governing
+document — so the author's own scoping is largely exempt from review, and the premise is questioned only after the author is
 invested — and a correct implementation of a wrong ticket survives any number
 of correct review rounds. A team's ticket is independent
 because someone else groomed it. This skill is that someone: one fresh reader,
 before the first edit, who may question exactly that line. It costs one Sonnet
-agent reading a nine-line block and the request — not a diff — and three tool
+agent reading a ten-line block and the request — not a diff — and three tool
 calls here: write the block, spawn the reader, wait.
 
 ## When, and the skip
@@ -22,10 +22,13 @@ Before the first edit of a task that will write code. After the code exists a
 validator is reading a ticket the code has already answered, and the Stop gate
 counts that as no validation at all (§4).
 
-Skipping is your call, never refused, and always written down: every counted
-convergence marker must say `--intent validated`, `author` or `skipped`, so
+The gate never refuses a skip, and a skip is always written down: every
+counted convergence marker must say `--intent validated`, `author` or `skipped`, so
 there is no silent default. Skip when the request is its own ticket — a fix
-whose premise you have checked rather than assumed. Two things audit the call
+whose premise you have checked rather than assumed. Work that implements an
+approved plan, spec or ruling is never its own ticket: the plan is what was
+asked, the chat only points at it, and a block written from memory of the plan
+is the one that drifts from it — do not skip. Two things audit the call
 afterwards: the record says `skipped`, and the loop's round 1 computes a tier —
 a skipped ticket that tiers M or L is a mismatch you name in the final report,
 the same way a forced tier is named. A skip you cannot state there in one
@@ -43,7 +46,8 @@ system prompt, else what `${CLAUDE_PLUGIN_ROOT}/scripts/reviews-dir.sh` prints �
 same path on every call in the session (with the same `$TMPDIR`) — outside the
 repository, for the loop's own reason (§0). Fill the template from
 `${CLAUDE_PLUGIN_ROOT}/skills/self-review/references/briefs.md`, "The intent
-statement": six to nine lines, the premise a checked fact or marked unchecked,
+statement": seven to ten lines, the governing documents cited as line ranges (or
+`none:` with what you checked), the premise a checked fact or marked unchecked,
 the invariant written so a test could fail it. You are writing what the reader
 will attack, not a summary of what you are about to do.
 

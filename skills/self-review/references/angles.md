@@ -90,7 +90,19 @@ that was asked — every acceptance criterion, every state the request implies
 (loading, empty, error, permission-denied, concurrent edit)? Does it do anything
 that was *not* asked — speculative options, refactors of untouched code, a
 behaviour change smuggled in? Was a hard part quietly narrowed ("TODO later",
-a stub, a happy-path-only implementation)? Then attack the brief's *premise*
+a stub, a happy-path-only implementation)? Read the line ranges the brief's
+*governing documents* line cites — those lines only, with `sed -n` or a
+ranged read, never more than was cited (a short file cited whole is read whole); if a range's lines do not match the heading
+cited beside it, find that heading with `grep -n`, read that section, and file
+the stale citation; then check the change, and each "out of scope on purpose" cut and deliberate choice in the
+brief, against them and against the quoted request. A cut may narrow the ask;
+one that contradicts the request or a governing document is a finding however
+the INTENT labels it — the INTENT is not where the owner approves a departure,
+unless its governing documents line cites that approval as a committed range.
+Its remedy is "conform, or get the owner's ruling", never a fix for the applier
+to write — file it with suggested_fix "owner ruling"; the verifier rules it
+fix_risk design. A "none" in that line that names no check, or a plan the change
+plainly implements but the line omits, is a finding too. Then attack the brief's *premise*
 line: does this change need to exist at all — does the framework, the
 platform, or existing code already do the job it claims to do? Check, don't
 assume: read the thing the premise names, run it when cheap. A change that
@@ -194,7 +206,10 @@ Name the intended reader and what they need to do after reading. Can they do it
 without asking a question? Check for missing prerequisites, missing failure
 modes ("what if X isn't installed"), missing "how to undo", missing the one
 example that makes it concrete, and for anything the user's request asked to
-cover that is absent. Then check shape: the outcome or answer comes first,
+cover that is absent. When the brief's governing documents line cites ranges,
+read those lines only and check the text against them: a doc that contradicts
+the plan it implements is filed as angle E files it, with suggested_fix "owner
+ruling". Then check shape: the outcome or answer comes first,
 sections earn their place, no filler or boilerplate, length matches the need
 (the writing rules in `~/.claude/CLAUDE.md`, when there are any). Flag a section a reader
 would skip and a question a reader would still have.
@@ -228,7 +243,9 @@ meaning, not just syntax: matchers and globs match what they are meant to,
 merge and precedence rules produce the intended effective config (a later file
 overriding an earlier one, arrays replaced vs merged), defaults that changed
 when a key was added or removed, quoting and escaping inside strings that will
-be re-parsed by a shell or template engine. Quote the key and the effect.
+be re-parsed by a shell or template engine. Quote the key and the effect. When
+the brief cites governing documents, check the config against those lines as
+P2 does.
 
 ### K2 · Security, blast radius, reversibility
 Least privilege (permissions, tokens, network, mounts) no broader than the
@@ -292,7 +309,11 @@ change actually has surface: whether the change needs to exist (does something
 already do this — check the brief's premise line); correctness of each changed
 line in its enclosing context; anything removed that enforced a behaviour; callers and references of
 anything renamed or re-typed; whether the change does exactly what was asked,
-no less and no more; what proves it works (run the relevant check if one
+no less and no more — read the line ranges the brief's governing-documents line
+cites (only those lines), and flag any deliberate cut or choice that contradicts them or the
+request, whatever the INTENT calls it, unless that line cites the owner's
+approval of it as a committed range (a cut narrows, never contradicts; the remedy is the owner's
+ruling, not an edit); what proves it works (run the relevant check if one
 exists); for prose, whether every claim is true and the reader can act on it;
 for config, whether it parses and means what was intended. If the change
 touches something a user runs, your brief carries a COLD RUN section with the

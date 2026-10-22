@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,5 +173,61 @@ test("--help anywhere in the arguments prints the usage and exits 0", () => {
     assert.match(result.stdout, /^usage: converged\.sh --converged /m);
     assert.doesNotMatch(result.stdout, /SELF-REVIEW CONVERGED/, "help is not a marker");
     assert.equal(existsSync(path.join(logDir, "log.jsonl")), false, "and it logs nothing");
+  }
+});
+
+test("--work writes the record to <work>/CONVERGED.json, with the review id round.sh would print", () => {
+  const logDir = freshLogDir();
+  const work = mkdtempSync(path.join(tmpdir(), "converged-work-"));
+  const result = run([...CONVERGED_ARGS, "--work", work], logDir);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^SELF-REVIEW CONVERGED — outcome=converged/m);
+  const id = spawnSync("git", ["hash-object", "--stdin"], { input: realpathSync(work), encoding: "utf8" }).stdout.slice(0, 8);
+  const record = JSON.parse(readFileSync(path.join(work, "CONVERGED.json"), "utf8"));
+  assert.equal(record.outcome, "converged");
+  assert.equal(record.review, id);
+});
+
+test("a --review that names another review than --work is refused for every outcome, and nothing is written", () => {
+  for (const args of [CONVERGED_ARGS, ["--not-applicable", "scratch-only"]]) {
+    const logDir = freshLogDir();
+    const work = mkdtempSync(path.join(tmpdir(), "converged-work-"));
+    const result = run([...args, "--work", work, "--review", "00000000"], logDir);
+    assert.equal(result.status, 2, args[0]);
+    assert.match(result.stderr, /--review 00000000 is not the review in --work/);
+    assert.doesNotMatch(result.stdout, /SELF-REVIEW CONVERGED/);
+    assert.equal(existsSync(path.join(work, "CONVERGED.json")), false);
+  }
+});
+
+test("a --work the record cannot be written to prints no token", () => {
+  const logDir = freshLogDir();
+  const work = mkdtempSync(path.join(tmpdir(), "converged-work-"));
+  // A directory where the record goes makes the rename fail for any user, root included.
+  mkdirSync(path.join(work, "CONVERGED.json"));
+  const result = run([...CONVERGED_ARGS, "--work", work], logDir);
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stdout, /SELF-REVIEW CONVERGED/);
+  assert.match(result.stderr, /no marker was made/);
+  assert.equal(existsSync(path.join(work, "CONVERGED.json.tmp")), false, "the half-written record is cleaned up");
+});
+
+test("--work writes the record for the other two outcomes too, and an escape hatch carries no review id", () => {
+  for (const args of [["--not-converged", "--rounds", "2", "--fixed", "1", "--dismissed", "0", "--open", "1", "--intent", "author"], ["--not-applicable", "scratch-only"]]) {
+    const work = mkdtempSync(path.join(tmpdir(), "converged-work-"));
+    const result = run([...args, "--work", work], freshLogDir());
+    assert.equal(result.status, 0, result.stderr);
+    const record = JSON.parse(readFileSync(path.join(work, "CONVERGED.json"), "utf8"));
+    assert.equal(record.outcome, args[0].slice(2));
+    assert.equal("review" in record, args[0] !== "--not-applicable");
+  }
+});
+
+test("a --work that is missing or names no directory is refused, and prints no token", () => {
+  for (const tail of [["--work"], ["--work", path.join(tmpdir(), "no-such-review-dir-xyz")]]) {
+    const result = run([...CONVERGED_ARGS, ...tail], freshLogDir());
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /--work/);
+    assert.doesNotMatch(result.stdout, /SELF-REVIEW CONVERGED/);
   }
 });

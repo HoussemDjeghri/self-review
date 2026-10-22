@@ -1335,3 +1335,46 @@ test("--new-review prints the review id, and the snapshot it records says whethe
   assert.match(trailers(["src/cli.mjs"]).body, /^Self-Review-Partial: yes$/m, "a path list narrows it");
   assert.match(trailers([], { SELF_REVIEW_SCOPE_MAX_LINES: "15" }).body, /^Self-Review-Partial: yes$/m, "so does a truncated scope");
 });
+
+test("round 1 publishes its scope as scope.json: the base as the commit it resolved to, paths as given", () => {
+  const { repo, work } = fixture();
+  const git = (...args) => spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  git("add", "-A");
+  git("commit", "-qm", "the change under review");
+  const base = git("rev-parse", "HEAD~1").stdout.trim();
+
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight", "--base", "HEAD~1", "src/cli.mjs"]);
+  assert.equal(done.status, 0, done.stderr);
+  const scope = JSON.parse(readFileSync(path.join(work, "scope.json"), "utf8"));
+  assert.deepEqual(scope, { v: 1, base, paths: ["src/cli.mjs"], cwd: scope.cwd });
+  assert.equal(realpathSync(scope.cwd), realpathSync(repo));
+});
+
+test("scope.json's base is null without --base", () => {
+  const { repo, work } = fixture();
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight"]);
+  assert.equal(done.status, 0, done.stderr);
+  const scope = JSON.parse(readFileSync(path.join(work, "scope.json"), "utf8"));
+  assert.equal(scope.base, null);
+  assert.deepEqual(scope.paths, []);
+});
+
+test("a round 1 that refuses publishes no scope.json", () => {
+  const { repo, work } = fixture();
+  // An unresolvable base scopes nothing, and round 1 refuses an empty scope.
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight", "--base", "no-such-ref"]);
+  assert.match(done.stderr, /the scope is empty/);
+  assert.equal(existsSync(path.join(work, "scope.json")), false);
+});
+
+test("a later round leaves scope.json as round 1 wrote it", () => {
+  const { repo, work } = fixture();
+  const intent = path.join(work, "intent.md");
+  assert.equal(run(repo, ["--work", work, "--round", "1", "--intent", intent, "--no-preflight", "src/cli.mjs"]).status, 0);
+  const before = readFileSync(path.join(work, "scope.json"), "utf8");
+  recordRound(repo, work, 1, [{ verdict: "fixed", severity: "minor", class: "correctness", file: "src/cli.mjs", summary: "x" }]);
+  writeFileSync(path.join(repo, "src/other.mjs"), "export const y = 1;\n");
+  const done = run(repo, ["--work", work, "--round", "2", "--intent", intent, "--no-preflight"]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(readFileSync(path.join(work, "scope.json"), "utf8"), before);
+});

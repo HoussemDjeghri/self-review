@@ -10,13 +10,14 @@ cannot inherit your blind spots), so anything it needs must be in the brief.
 INTENT
 User asked (quote the load-bearing phrases): "<…>"
 Constraints / conventions that apply: <CLAUDE.md rules, framework, perf/security constraints, "no new deps", …>
+Governing documents: <every approved plan, spec or ruling this work implements, each cited as path:from-to plus its heading, e.g. "PLAN.md:40-58 (## M5.A), PLAN.md:12-20 (## Rules)" — the task's section and any general section whose rules it must keep; a file under ~20 lines may be cited whole; a plan that is not a repo file is quoted inline with where it came from — or "none: <what you checked>", e.g. "none: no PLAN.md, no spec under docs/, the ask is the chat">
 Invariant: <the property that must hold when this is done, stated so it can be falsified — "a reviewed repository cannot make its own review weaker", not "the config is validated">
 Done means: <the observable outcome — what works, what the reader can do>
 Premise: <why this has to exist — what already does this job (framework, platform, existing code) and why it is not enough; "checked X, it does not cover Y">
 Out of scope on purpose: <anything deliberately not done, with the reason>
 ```
 
-Keep it to 6–9 lines. **Write the invariant before the code, not after** — it is
+Keep it to 7–10 lines. **Write the invariant before the code, not after** — it is
 the one line that turns a review from "is this wrong?" into "can this be right?".
 A change built to suppress a symptom rather than to hold a property has no
 invariant to write, and that is the finding: this plugin spent six review rounds
@@ -28,7 +29,20 @@ so in that line; angle S is told to start there.
 
  It is the reviewer's only defence against reviewing the
 wrong thing; the "out of scope" line is what stops intent-fidelity reviewers
-from flagging a cut you made on purpose. The "premise" line is the one the
+from flagging a cut you made on purpose. **A cut may narrow the ask; it may
+never contradict it.** A "deliberate choice" that goes against the user's quoted
+words or a governing document is not a cut but a departure, and only the owner
+can approve one — writing it into the INTENT is not that approval, whoever
+wrote or validated the block. Once the owner approves it, record the approval where
+the decision lands — amend the plan, or commit the ruling — and cite that
+range on the line: a reader can check a committed file, never a quote of a chat
+only the author saw. Angle E checks every cut against both. The
+"Governing documents" line is filled whether or not the `ticket` skill ran,
+because a validated ticket can drift from the plan as easily as an author's
+block, and a finder can only compare the change against a plan it is shown. It
+cites line ranges rather than long files: every finder pays for what it
+opens, so each reader loads the lines that govern and not the whole plan.
+The "premise" line is the one the
 intent-fidelity finder (angle E, or the compact brief) is told to attack: the
 2026-08-22 allowlist-guard review ran six rounds hardening a hook against
 bypasses the platform already blocked, because every reviewer took the change's

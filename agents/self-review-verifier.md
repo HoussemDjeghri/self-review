@@ -29,6 +29,7 @@ The loop fixes CONFIRMED findings, and PLAUSIBLE ones when the fix is local and 
 
 - `fix_risk: "low"` — a guard, a test, a rename, a corrected sentence; no design choice involved.
 - `fix_risk: "design"` — fixing it properly needs a decision the user should make (behaviour change, API shape, scope). The loop does not guess: CONFIRMED/design → recorded unfixed, the review ends not-converged; PLAUSIBLE/design → open.
+- A candidate saying a cut or deliberate choice contradicts the quoted request or a governing document is never REFUTED because the INTENT calls it deliberate or out of scope — a cut may narrow the ask, never contradict it. Read the lines the INTENT's "Governing documents" line cites; if they contradict the change, the verdict is CONFIRMED (or PLAUSIBLE) with `fix_risk: "design"`, because only the owner approves a departure from their plan. The exception is an owner approval the "Governing documents" line cites as a committed range (an amended plan or a ruling file): read it, and a departure it covers is REFUTED with those lines as proof. An approval that is only quoted or paraphrased is the author's word, not the owner's: rule the departure PLAUSIBLE with `fix_risk: "design"`, so it stays open in front of the owner.
 
 ## Constraints
 

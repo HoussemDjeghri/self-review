@@ -3847,7 +3847,7 @@ test("branch review: a marker without a review id, or from a narrowed review, le
   const file = fx.put("src/a.ts", codeLines(30));
   const bare = run(turn(...write(file), ...reviewed(), ...writeMarker()), fx.opts);
   assert.ok(blocks(bare), JSON.stringify(bare.json));
-  assert.match(bare.json.reason, /it names no review — add --review <id> to converged\.sh/);
+  assert.match(bare.json.reason, /it names no review — add --work <work> to converged\.sh/);
   snapshotReview(fx, "beef0001", { partial: true });
   const narrow = run(turn(...write(file), ...reviewed(), ...reviewedMarker("beef0001")), fx.opts);
   assert.match(narrow.json.reason, /was narrowed to a path list/);

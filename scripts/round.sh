@@ -245,6 +245,10 @@ if [ "$replan" -eq 0 ]; then
     # NUL-separated, so a path may hold any byte but NUL and the replay never evaluates it.
     for a in ${base:+--base "$base"} ${paths[@]+"${paths[@]}"}; do printf '%s\0' "$a"; done > "$dir/scope-args"
     printf '%s\n' "$scope_cwd" > "$dir/scope-cwd"
+    # Resolved now, published once the round passes its refusals (below).
+    scope_base=""
+    [ -z "$base" ] || scope_base="$(git -C "$scope_cwd" rev-parse --verify -q "$base^{commit}" 2>/dev/null || true)"
+    scope_real="$(cd "$scope_cwd" && pwd -P)"
   else
     scope_cwd="$(cat "$work/round-1/scope-cwd")"
     replay=(); while IFS= read -r -d '' a; do replay+=("$a"); done < "$work/round-1/scope-args"
@@ -684,6 +688,15 @@ if [ "$reviewable" != "yes" ]; then
     *)     echo "round.sh: the only changes in $where are files this loop never reviews ($reviewable — assets are listed, tier.ignore covers lockfiles and generated output), so there is no round to run" >&2 ;;
   esac
   exit 4
+fi
+# The published copy of round 1's scope (references/marker.md, "What a review
+# leaves behind"); scope-args stays internal to the replay. Written only past
+# every refusal, so a scope.json always has a round behind it. The base is the
+# commit it resolved to, null when none was given or it resolves to nothing,
+# so a reader compares shas rather than spellings.
+if [ "$round" -eq 1 ] && [ "$replan" -eq 0 ]; then
+  node -e 'const [b, cwd, ...paths] = process.argv.slice(1); process.stdout.write(JSON.stringify({ v: 1, base: b || null, paths, cwd }) + "\n");' \
+    -- "$scope_base" "$scope_real" ${paths[@]+"${paths[@]}"} > "$work/scope.json"
 fi
 # The verdict this round was allowed on, above the plan: CLEAN and ESCALATE
 # are the lead's to weigh, and the plan is what they would spend.

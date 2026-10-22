@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.10.0" src="https://img.shields.io/badge/version-0.10.0-191919">
+  <img alt="version 0.10.1" src="https://img.shields.io/badge/version-0.10.1-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -72,10 +72,11 @@ enforcing:
   wrong), or the round backstop stops it and hands the state to you. It never
   reports "clean" because it ran out of rounds.
 - **Convergence is a claim about the code against the stated intent, and never
-  a claim that the intent was right.** Every reviewer is told the intent's "out
-  of scope on purpose" line is deliberate, so the author's own scoping is exempt
-  from review by construction — which is why a correct implementation of a wrong
-  ticket converges. The `intent` field on the marker records who read the ticket
+  a claim that the intent was right.** Reviewers leave alone an "out of scope on
+  purpose" cut that only narrows the ask — they flag one that contradicts the
+  request or a governing document the intent cites — so the author's own
+  scoping is otherwise exempt from review, which is why a correct implementation
+  of a wrong ticket converges. The `intent` field on the marker records who read the ticket
   *before* the code existed: `validated` (a `ticket` skill validator did, and the
   gate checked the ordering), `author` (you wrote it and nobody else read it), or
   `skipped`. All three are honest; only `validated` is checked.

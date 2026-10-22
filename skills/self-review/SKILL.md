@@ -102,17 +102,27 @@ substitute: unsubstituted, `<` and `>` are redirections.
 Write the **INTENT block** (template: `references/briefs.md`) to
 `<reviews>/intent.md`; `--new-review` moves it, and the ticket's `ticket/`, into
 the review dir so the next review cannot brief against this one's ticket. It
-holds the user's ask in their words, the constraints, the **invariant** (the
+holds the user's ask in their words, the constraints, the **governing
+documents** (the line ranges of every approved plan, spec or ruling the work
+implements — a whole file only under ~20 lines, so finders load only the
+lines that govern — or
+`none:` with what you checked — filled whether or not `ticket` ran, and when
+it did, re-read the ticket against them now: a validated ticket can drift from
+the plan too, and a cut that contradicts them goes to the owner before you
+build, never into the block as a deliberate choice), the **invariant** (the
 property that must hold when done, falsifiable, written *before* the code — a
 change built to suppress a symptom has none, and that absence is the finding),
 what "done" means, the premise (why the change must exist — what already does
-the job, checked), and what was cut on purpose. Every brief carries it, so
-reviewers neither review the wrong thing nor flag deliberate cuts.
+the job, checked), and what was cut on purpose — a cut narrows the ask, never contradicts it or a
+governing document (`references/briefs.md`). Every brief carries it, so
+reviewers neither review the wrong thing nor flag a cut that only narrows the
+ask.
 
 `--intent` turns on **who read the intent**, not which skill ran: `validated` —
 a validator read it before the code existed (the `ticket` skill; `intent.md` is
 then already there: use it as it stands, do not write a second); `author` —
-only you read it, the normal case without `ticket`, so write it now; `skipped` —
+only you read it, the normal case without `ticket` (plan-backed work should
+have had one — the ticket skill says why), so write it now; `skipped` —
 nothing was written before the code, and the block is written now purely to
 brief reviewers. All three are honest; only `validated` is checked, for order.
 Then set the round up in **one call**:
@@ -245,7 +255,9 @@ flags your headless sessions use (a `-p` child cannot answer a prompt, so a
 tool it is not allowed is denied) — and read the marker
 and report it ends with: the child is a session of its own, so its reviewers are
 in its own transcript, and its Stop gate checks the marker whenever the child's
-fixes changed code. A subagent that changed code hands the change back to the
+fixes changed code. Ask it to end with `converged.sh … --work <work>` and to
+report its `work:` line; `<work>/CONVERGED.json` and `<work>/scope.json` are
+then the record (`references/marker.md` → **What a review leaves behind**). A subagent that changed code hands the change back to the
 lead, as a teammate does.
 
 If a *reviewer* type is missing, use `general-purpose` with that agent file
@@ -518,10 +530,11 @@ Write  <work>/CONVERGED.json          # i.e. <reviews>/review-<k>/CONVERGED.json
 {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "adapter": "grep", "intent": "author", "review": "<id>"}
 ```
 
-**Or run the script**, which logs itself and works when `<work>` is not scratch:
+**Or run the script**, which logs itself, works when `<work>` is not scratch,
+and with `--work` writes the same file and derives `review` from the path:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep --intent author --review <id>
+"${CLAUDE_PLUGIN_ROOT}/scripts/converged.sh" --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --adapter grep --intent author --work <work>
 ```
 
 **Branch review.** In a repository the user opted into branch review, the gate
@@ -530,8 +543,8 @@ their cap, and holds it past the cap or on a tier-L path. A hold names one
 commit: review **all** of it as one review — `round.sh --new-review --base <that
 sha>`, no path list — and mark with its `review` id, which is how the gate finds
 the tree the last round read. A narrowed scope, another base or no `review`
-leaves the hold standing. Lost the id? It is the first 8 hex of
-`printf '%s' <work> | git hash-object --stdin`. `scripts/branch-debt.mjs` prints
+leaves the hold standing. Lost the id? `converged.sh --work <work>` derives
+it; by hand it is the first 8 hex of `printf '%s' <work> | git hash-object --stdin`. `scripts/branch-debt.mjs` prints
 where a repository stands.
 
 Anything invalid is **refused** with every defect named, so fix what it names

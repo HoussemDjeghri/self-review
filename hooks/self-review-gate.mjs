@@ -2301,7 +2301,7 @@ function branchContext(cwd) {
 function recordMarker(ctx, accepted) {
   if (!accepted) return { why: null };
   if (accepted.outcome !== "converged") return { why: `its outcome is ${accepted.outcome ?? "unreadable"}, and only a converged review records a tree as reviewed` };
-  if (!accepted.review) return { why: `it names no review — add --review <id> to converged.sh (or "review": "<id>" to CONVERGED.json), the id round.sh printed as "review:"` };
+  if (!accepted.review) return { why: `it names no review — add --work <work> to converged.sh, which derives the id (or --review <id>, or "review": "<id>" in CONVERGED.json, the id round.sh printed as "review:")` };
   const snap = reviewSnapshot(ctx.top, accepted.review);
   if (!snap) return { why: `review ${accepted.review} left no snapshot in this repository` };
   if (snap.partial) return { why: `review ${accepted.review} was narrowed to a path list, so it did not read the whole diff` };
@@ -2322,7 +2322,7 @@ function heldReason(ctx, debt, why) {
   return [
     `${GATE_TAG} On ${where}, ${HELD_TAG}: ${debt.lines} unreviewed code line${debt.lines === 1 ? "" : "s"} in ${debt.files} file${debt.files === 1 ? "" : "s"}${risky} (${cap}), measured from ${debt.base.label} at ${debt.base.commit}.`,
     ...(why ? [`Your marker did not record a reviewed tree: ${why}.`] : []),
-    `Review all of it as ONE review from that commit: round.sh --new-review --base ${debt.base.commit} (no path list), so every round reads the whole diff. Mark it with converged.sh --review <id> (or "review": "<id>" in CONVERGED.json), the id round.sh printed as "review:", so this gate can find the tree the last round read. A marker from another base, a narrowed scope or no review id leaves this hold standing — and so does a scope round.sh truncated: if it says so, re-run it with SELF_REVIEW_SCOPE_MAX_LINES above the diff's size.`,
+    `Review all of it as ONE review from that commit: round.sh --new-review --base ${debt.base.commit} (no path list), so every round reads the whole diff. Mark it with converged.sh --work <work>, which derives the review id (or --review <id>, or "review": "<id>" in CONVERGED.json, the id round.sh printed as "review:"), so this gate can find the tree the last round read. A marker from another base, a narrowed scope or no review id leaves this hold standing — and so does a scope round.sh truncated: if it says so, re-run it with SELF_REVIEW_SCOPE_MAX_LINES above the diff's size.`,
     ...(ctx.onMain ? ["This is main, so the commits on it since its last reviewed tree are in the count; converging a branch before merging it is what keeps this from happening."] : []),
   ].join("\n");
 }
