@@ -1,7 +1,6 @@
 // Proof that tree-guard engaged.
 //
-// Ruling 1 (docs/design-notes/questions/review-process-misses-answer.md) named
-// the shape every defect this repo has shipped shares: a mechanism whose
+// Every defect this repo has shipped shares one shape: a mechanism whose
 // working and inert behaviours are identical. `evaluate()` in tree-guard.mjs
 // returns null whether it matched a reviewer or was watching nothing — the deny
 // path carries a systemMessage, and the allow path and the inert path are the
@@ -10,8 +9,8 @@
 // round reading the file and correctly finding it correct.
 //
 // So the guard records whether it matched, and convergence reads the record.
-// The ruling's words: "a mechanism that can be silently inert must prove it
-// engaged". This is not a registry — nothing reads it to decide anything, only
+// The rule: a mechanism that can be silently inert must prove it
+// engaged. This is not a registry — nothing reads it to decide anything, only
 // to audit afterwards.
 //
 // Scoped to a repository with a review in progress: `round.sh` opens the log
@@ -108,7 +107,7 @@ export function noteEngagement(repoRoot, agentType, matched, { session = null, l
 // terms of the thing it checks passes whenever that thing is consistent with
 // itself, which is exactly the failure being audited. Every name here is one
 // tree-guard is meant to cover — since 0.8.2 that includes the applier — so an
-// unmatched row under it can only mean the guard's regex has gone inert (F10h).
+// unmatched row under it can only mean the guard's regex has gone inert.
 // `engagement.test.mjs` asserts tree-guard's decision really does deny one
 // canonical spelling of each, so the two cannot drift apart in silence.
 export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|applier|ticket-validator)\b/;
@@ -118,11 +117,11 @@ export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|ap
  * What the log says about the round that just ran.
  *
  * Two findings, and they are different failures. `unmatched` is a name this
- * plugin generated that the guard did not recognise — the F10h defect, where a
+ * plugin generated that the guard did not recognise — the defect where a
  * regex stopped matching the names the harness actually sends. `blind` is a
  * round in which reviewers ran shell commands and the guard matched none of
  * them, which is the same defect seen from the other side and the only one
- * that would have caught F10h before ninety finders had run.
+ * that would have caught that before ninety finders had run.
  *
  * No rows at all is not a finding: a round whose reviewers ran no Bash — a
  * cold-grader has no shell — exercised nothing to prove.
@@ -182,25 +181,25 @@ export function auditEngagement(text, { round = null } = {}) {
 export function engagementLine(audit) {
   if (audit.opened === false) {
     return "# tree-guard: no engagement log was opened for this round — the guard proved nothing, " +
-      "and this line is the absence, not a pass (ruling 1, item 2)";
+      "and this line is the absence, not a pass";
   }
   if (audit.unmatched.length) {
     return `# tree-guard did NOT match ${audit.unmatched.length} name this plugin generated (${audit.unmatched.join(", ")}) — ` +
-      "its reviewer regex has gone inert against what the harness now sends, and every shell those agents ran was unguarded (ruling 1, item 2)";
+      "its reviewer regex has gone inert against what the harness now sends, and every shell those agents ran was unguarded";
   }
   if (audit.blind) {
     return `# tree-guard matched none of the ${audit.calls} subagent shell call${audit.calls === 1 ? "" : "s"} this round — ` +
-      "either no reviewer ran a shell under a name it knows, or it is watching nothing (ruling 1, item 2)";
+      "either no reviewer ran a shell under a name it knows, or it is watching nothing";
   }
   // Every reviewer type has now been observed running a shell, so an open log
   // the guard was never asked about is anomalous rather than ordinary.
   if (!audit.calls) {
     if (audit.unattributed) {
       return `# tree-guard recorded ${audit.unattributed} shell call${audit.unattributed === 1 ? "" : "s"} this round and none carried a session id — ` +
-        "the harness payload changed shape, or something ran the hook by hand. The guard proved nothing (ruling 1, item 2)";
+        "the harness payload changed shape, or something ran the hook by hand. The guard proved nothing";
     }
     return "# tree-guard was asked about no subagent shell call this round — the log was open and nothing reached it, " +
-      "which every reviewer type running a shell makes unlikely (ruling 1, item 2)";
+      "which every reviewer type running a shell makes unlikely";
   }
   return `# tree-guard engaged: ${audit.matched}/${audit.calls} subagent shell calls matched a reviewer` +
     (audit.unattributed ? ` · ${audit.unattributed} by hand, not counted` : "");

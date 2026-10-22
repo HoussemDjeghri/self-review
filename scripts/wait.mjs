@@ -359,7 +359,7 @@ export async function main(argv, {
   // directory) or a `claude -p` child (it gets its own id). The scratchpad path
   // is only the fallback: a subagent or child is handed a scratchpad that can
   // name another session, which is how a subagent's loop once found no
-  // transcripts (measured on 2.1.301, docs/design-notes/subagent-mode-plan.md).
+  // transcripts (measured on 2.1.301).
   const sessionId = options.session ?? (process.env.CLAUDE_CODE_SESSION_ID || null) ?? sessionIdFrom(workDir);
   if (!sessionId) throw usage("could not read a session id from --work or CLAUDE_CODE_SESSION_ID; pass --session <id>");
   const dir = resolveSubagentsDir(sessionId);

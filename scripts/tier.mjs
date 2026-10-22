@@ -12,7 +12,7 @@
 // prints at most eight lines — the tier with its reasons, one line per finder,
 // and the footer brief.mjs needs.
 //
-// What stays the model's (DESIGN §4.5): *raising* the tier when it reads a
+// What stays the model's: *raising* the tier when it reads a
 // contract change that line counts cannot see; the INTENT block; where to
 // split a scope this script only flags as too big; the verifier trigger and
 // the convergence calls. Overriding the verdict in either direction needs
@@ -108,8 +108,8 @@ export function declaresItselfRunnable(file, root) {
 // --- step 3: risk markers --------------------------------------------------
 // Everything is matched case-insensitively, paths and content alike.
 //
-// Case was tried as a discriminator in 0.3.0 and reverted the same day (DESIGN
-// §7.6). The prose false positive is real — a comment reading "truncate the
+// Case was tried as a discriminator in 0.3.0 and reverted the same day. The
+// prose false positive is real — a comment reading "truncate the
 // summary" or "we drop the field" fires the destructive marker (`truncate` is
 // anchored as a word, so an identifier like `scopeTruncated` no longer does) —
 // but case does not separate the two
@@ -201,7 +201,7 @@ export function measure({ scope, files, diff, kinds, impact }) {
 
 const PLURAL = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
 
-/** The first rule that matches wins (DESIGN §4.5 step 4). */
+/** The first rule that matches wins. */
 // The markers that make a change L on their own. Exported because the round-2+
 // ceiling has to ask whether a marker is NEW this round, and a second copy of
 // this list would let the two answers drift.
@@ -429,7 +429,7 @@ export function buildFinders({ tier, round, kinds, markers, config, impactConfig
     // `tree-guard` matches this string and never the registered type. While
     // these rows were named `r1-ab`, the guard was inert for every finder it
     // ever produced — roughly ninety shells in the author's working tree, and
-    // every review round read the guard and correctly found it correct. F10h.
+    // every review round read the guard and correctly found it correct.
     name: `${agent}-r${round}-${row.angles.join("").toLowerCase()}`,
     kind: row.kind,
     angles: row.angles,
@@ -440,7 +440,7 @@ export function buildFinders({ tier, round, kinds, markers, config, impactConfig
     // it does not need to do.
     calls: isColdGrader(row) ? config.finders.callsCold : callsFor[row.kind],
     // Tracing angles get the whole blast radius; prose angles get the sections
-    // they can act on; the rest get two lines and a path (DESIGN §4.3).
+    // they can act on; the rest get two lines and a path.
     impact: row.angles.some((angle) => full.has(angle)) ? "full" : row.angles.some((angle) => docsDepth.has(angle)) ? "docs" : "summary",
     weightFixLines: true,
     };
@@ -483,8 +483,8 @@ export function wireEvidence(impact) {
 // --- the dominance note ----------------------------------------------------
 /**
  * One line when a single top-level directory holds most of the change, else
- * null. The generic, guessing half of F2: `round.sh` refuses a scope whose
- * paperwork signature is unmistakable, and this only says out loud what the
+ * null. The generic, guessing counterpart to `round.sh`'s refusal of a scope whose
+ * paperwork signature is unmistakable: this only says out loud what the
  * scope is mostly made of, because a vendored tree or a generated bundle has
  * no signature to match and a false refusal would drop a real change.
  *

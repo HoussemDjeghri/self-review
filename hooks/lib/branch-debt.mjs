@@ -1,7 +1,5 @@
 /**
- * Branch review debt — the git half of the Stop gate's opt-in branch review
- * (docs/design-notes/project-tiers-plan.md, amendments of 2026-10-16; rulings
- * questions/debt-state-answer.md and questions/marker-check-answer.md).
+ * Branch review debt — the git half of the Stop gate's opt-in branch review.
  *
  * Every question here is answered by git, never by the transcript: the debt is
  * `git diff` between a reviewed tree and a snapshot of the worktree, not a sum

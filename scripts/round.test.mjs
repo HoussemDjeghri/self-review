@@ -1367,6 +1367,15 @@ test("a round 1 that refuses publishes no scope.json", () => {
   assert.equal(existsSync(path.join(work, "scope.json")), false);
 });
 
+test("scope.json's base is null when --base resolves to nothing but untracked files keep the scope non-empty", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, "src", "extra.mjs"), "export const x = 1;\n");
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight", "--base", "no-such-ref"]);
+  assert.equal(done.status, 0, done.stderr);
+  const scope = JSON.parse(readFileSync(path.join(work, "scope.json"), "utf8"));
+  assert.equal(scope.base, null);
+});
+
 test("a later round leaves scope.json as round 1 wrote it", () => {
   const { repo, work } = fixture();
   const intent = path.join(work, "intent.md");

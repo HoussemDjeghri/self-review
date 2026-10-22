@@ -76,16 +76,16 @@ export const FALLBACK = {
   },
   // Per-repository settings, keyed by `repo-id.mjs`'s id. USER config only:
   // it is not in REPO_ADDITIVE, because `branchDebt` is the most
-  // review-weakening switch the plugin has (tiers-boundary ruling C). Each
+  // review-weakening switch the plugin has. Each
   // entry is checked against REPO_ENTRY, not against this empty object.
   repos: {},
 };
 
 // One `repos.<id>` entry. `tier` reuses the top-level schema and is laid over
-// it in that repository only — whole-repo thresholds, the per-repo half of
-// ruling C. `branchDebt.maxLines` > 0 opts the repository into branch review
-// (the Stop gate lets branch turns end unreviewed up to that many changed
-// lines); `main` names the integration branch when `origin/HEAD` is not it.
+// it in that repository only — whole-repo thresholds. `branchDebt.maxLines` > 0
+// opts the repository into branch review (the Stop gate lets branch turns end
+// unreviewed up to that many changed lines); `main` names the integration
+// branch when `origin/HEAD` is not it.
 const REPO_ENTRY = { tier: FALLBACK.tier, branchDebt: { maxLines: 0, main: "" } };
 const REPO_ID_RE = /^[0-9a-f]{64}$/;
 
@@ -240,7 +240,7 @@ const canonical = (file) => pathToFileURL(realpathOr(file)).href;
 export const isMain = (metaUrl) =>
   Boolean(process.argv[1]) && canonical(fileURLToPath(metaUrl)) === canonical(process.argv[1]);
 
-// The repo layer (DESIGN §3), applied last and default-closed: see
+// The repo layer, applied last and default-closed: see
 // REPO_ADDITIVE. Missing file: the common case, silent.
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -300,7 +300,7 @@ function mergeRepo(config, repoRoot) {
 // every TSX file in every repository, and a relative one would exempt
 // `app/proto/**` in every checkout the user ever opens, untrusted ones
 // included. An absolute glob is what scopes a rule to one checkout. Anything
-// else is dropped per entry, with a warning (exempt-paths ruling). It is not in
+// else is dropped per entry, with a warning. It is not in
 // REPO_ADDITIVE, so a repository never reaches it. Each dropped entry is warned
 // about once per process, however often the config is loaded.
 const warnedPaths = new Set();

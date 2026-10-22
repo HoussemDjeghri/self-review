@@ -18,8 +18,8 @@
  * `outcome=` field right behind it. One token keeps the gate, the skill and
  * every existing permission rule on one string.
  */
-import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
 import { INTENT_STATES, NA_REASONS, fieldsFromFlags, formatSummary, validateMarker } from "../hooks/lib/marker.mjs";
@@ -65,12 +65,31 @@ if (workAt !== -1) {
 }
 
 const { fields, problems: argProblems } = fieldsFromFlags(argv);
-// The id round.sh printed is `git hash-object` of the resolved work path; derived
-// here so the flag and the directory cannot name two different reviews.
+let scope = null;
 if (work) {
-  const id = createHash("sha1").update(`blob ${Buffer.byteLength(work)}\0${work}`).digest("hex").slice(0, 8);
-  if (fields.review !== undefined && fields.review !== id) workProblems.push(`--review ${fields.review} is not the review in --work ${work} (${id}).`);
-  if (fields.outcome !== "not-applicable") fields.review = id;
+  let parsed = false;
+  try { scope = JSON.parse(readFileSync(path.join(work, "scope.json"), "utf8")); parsed = true; } catch {
+    workProblems.push(`--work ${work} is not a review dir: it has no scope.json, which round 1 writes once it passes its refusals — pass the work: path round.sh printed.`);
+  }
+  if (parsed && (!scope || typeof scope !== "object" || typeof scope.cwd !== "string")) {
+    workProblems.push(`--work ${work} is not a review dir: it has no valid scope.json, which round 1 writes once it passes its refusals — pass the work: path round.sh printed.`);
+    scope = null;
+  }
+}
+// The id round.sh printed is `git hash-object` of the resolved work path, run in
+// round 1's directory so it follows that repository's object format; derived
+// here so the flag and the directory cannot name two different reviews.
+if (work && scope) {
+  const hashed = spawnSync("git", ["hash-object", "--stdin"], { cwd: scope.cwd, input: work, encoding: "utf8" });
+  const out = (hashed.stdout ?? "").trim();
+  if (hashed.error || hashed.status !== 0 || !/^[0-9a-f]{8,}$/.test(out)) {
+    const why = hashed.error ? hashed.error.message : (hashed.stderr ?? "").trim() || `git hash-object exited ${hashed.status}`;
+    workProblems.push(`could not derive the review id for ${work}: ${why}`);
+  } else {
+    const id = out.slice(0, 8);
+    if (fields.review !== undefined && fields.review !== id) workProblems.push(`--review ${fields.review} is not the review in --work ${work} (${id}).`);
+    if (fields.outcome !== "not-applicable") fields.review = id;
+  }
 }
 const { record, problems } = validateMarker(fields);
 const all = [...workProblems, ...argProblems, ...problems];

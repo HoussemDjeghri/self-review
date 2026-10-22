@@ -1,6 +1,6 @@
 // An append-only log split into one segment per UTC month, `YYYY-MM.jsonl`.
 //
-// Built for the gate's decision log (state-location ruling, section 2) and
+// Built for the gate's decision log and
 // meant to be reused by `log.jsonl` when that one is rotated: a single growing
 // file is what the gate reads in full at every file marker, and a month per file
 // bounds both the read and the retention.

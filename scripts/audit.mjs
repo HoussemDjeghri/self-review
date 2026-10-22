@@ -103,7 +103,7 @@ export function parseSummary(summary = "") {
 }
 
 // Usage per API call, deduped by message id: a streamed reply spans several lines.
-// Exported for evals/run.mjs, which prices a whole session with the same count.
+// Exported so a whole session can be priced with the same count.
 export function usageOf(entries) {
   const calls = new Map();
   for (const entry of entries) {
@@ -183,7 +183,7 @@ function roundOf(entries, name) {
   // arm is reached only by a transcript whose first message carries neither a
   // `round-N/` path nor the words "round N", which a generated brief always
   // does, and the cost of being wrong here is a `round ?` in a retrospective
-  // report rather than a lost working tree. Ruled 2026-09-03.
+  // report rather than a lost working tree.
   const fromName = /(?:^|-)r(\d+)(?:-|$)/.exec(name);
   const digits = fromPath?.[1] ?? fromName?.[1];
   return digits === undefined ? null : Number(digits);
@@ -354,8 +354,7 @@ export function reflagRows(byReview, reviews) {
  * The re-flag rate: of the findings a round FIXED, how many did the next round
  * file again? A fix that has to be re-found is a fix that did not hold, and
  * that is the one number that says whether handing application to an agent
- * costs quality. F10c named it; nothing computed it, which is why F10g's hold
- * on the orchestrator waited on a measurement nobody was set up to take.
+ * costs quality.
  *
  * The source is the findings file, not the transcripts: a `fixed` record is the
  * lead's own verdict, and it is the only place a fix is written down. Two

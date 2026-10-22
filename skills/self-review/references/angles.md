@@ -325,7 +325,7 @@ safe, and you are not in it. Report only what you can evidence.
 
 ## Angle groups per tier
 
-Moved out of SKILL.md 2026-09-08: `tier.mjs` computes the plan and `round.sh`
+`tier.mjs` computes the plan and `round.sh`
 prints it, so the lead reads `tier.json`'s `finders[]`, not this. Read this when
 you are overriding the plan or explaining a `merged[]` row.
 

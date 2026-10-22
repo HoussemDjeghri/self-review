@@ -141,7 +141,7 @@ const SKILL_NAME = skillName();
 // portable. A write there that does not validate is refused, not ignored.
 const MARKER_TOKEN_RE = /^SELF-REVIEW CONVERGED\b/m;
 // One optional `review-<k>/` segment: a lead running several reviews in one
-// session keeps each in its own work dir (review-identity ruling D1). Only that
+// session keeps each in its own work dir. Only that
 // shape — any other directory between would let an arbitrary file count.
 const MARKER_FILE_RE = /(^|\/)self-review\/(?:review-\d+\/)?CONVERGED\.json$/;
 const MARKER_COMMAND = CONVERGED_SCRIPT;
@@ -159,7 +159,7 @@ const MARKER_INVOCATION = /[^\w.\-/]/.test(MARKER_COMMAND)
 // name@session-x"). Anchored so a result that merely quotes the phrase is not a launch.
 const LAUNCHED_RE = /^\s*(?:Async agent launched successfully|Spawned successfully)[\s\S]*?agent(?:Id|_id):\s*([^\s(]+)/;
 const TASK_REF_RE = /<(?:task-id|tool-use-id)>([^<]+)<\//g;
-// The reviewer types that satisfy `converged` (F10a′ ruling 2). A plugin
+// The reviewer types that satisfy `converged`. A plugin
 // agent's type carries a `plugin:` prefix, hence the optional leading segment —
 // the same shape tree-guard.mjs matches. The VERIFIER is deliberately absent: a
 // verifier presupposes findings, so if the main session generated them it
@@ -364,12 +364,11 @@ const ARG_WRITE_PATTERNS = [
 ];
 // An archive names what it reads, not what it writes: the files it extracts are
 // in its content, into `-C` or the current directory. Like a patch, the write is
-// unknown and the witness decides (witness-list ruling, test 1). This covers tar
-// by its extract flag, and unzip and ditto by name alone: unzip's read-only
-// `-l`/`-t` costs one witness stat, and ditto's operands cannot tell the
-// destination from the archive. bsdtar, 7z, cpio and `python3 -m zipfile -e`
-// are deliberately not recognised (witness-extractors ruling: zero uses in
-// 192,770 local commands, and each has a flag grammar).
+// unknown and the witness decides. This covers tar by its extract flag, and
+// unzip and ditto by name alone: unzip's read-only `-l`/`-t` costs one witness
+// stat, and ditto's operands cannot tell the destination from the archive.
+// bsdtar, 7z, cpio and `python3 -m zipfile -e` are deliberately not recognised
+// (zero uses in 192,770 local commands, and each has a flag grammar).
 const extractsArchive = (ws) => {
   const at = afterPrefixes(ws);
   if (ws[at] === "unzip" || ws[at] === "ditto") return true;
@@ -438,7 +437,7 @@ function expandLocalAssignments(cmd) {
 // special parameter after expansion is not a path: the value comes from
 // somewhere this command does not say, so the write is unknown. Missing `$(` and
 // the backtick let `cd "$(echo /x)"` resolve to a directory inside the cwd that
-// does not exist (review round 4).
+// does not exist.
 const UNEXPANDED = /\$[{(A-Za-z_0-9@#?*!]|`/;
 
 // The session's own tree: the cwd's repository, or the cwd itself outside git.
@@ -712,10 +711,9 @@ function changedFiles(cwd) {
 
 // A file inside a directory moved whole keeps both of its clocks; only the
 // moved directory's ctime and its new parent's advance, and the moved
-// directory's mtime stays put (witness-list ruling §3, dir-window ruling;
-// measured on APFS, ext4, overlayfs and tmpfs). So each file carries, for every
-// ancestor A strictly below the repository top, A's two clocks and its parent's
-// ctime — `wroteIn` reads a move from them.
+// directory's mtime stays put (measured on APFS, ext4, overlayfs and tmpfs).
+// So each file carries, for every ancestor A strictly below the repository top,
+// A's two clocks and its parent's ctime — `wroteIn` reads a move from them.
 function ancestorMoves(file, top, dirStat) {
   const moves = [];
   for (let dir = path.dirname(file); dir !== top && dir.startsWith(top + path.sep); dir = path.dirname(dir)) {
@@ -773,7 +771,7 @@ function inWindow({ from, to }, ms) {
 // Since the call began, by the transcript's clock: no upper bound.
 const sinceStart = ({ from }, ms) => ms >= from - slackOf(ms);
 
-// Whether a call wrote a file, by either clock (witness-list ruling D). mtime is
+// Whether a call wrote a file, by either clock. mtime is
 // set by `utime()`, so a move or a time-preserving copy keeps it; ctime is set
 // by the kernel on every write, create, link, rename and `utime()`, and no
 // user-level API keeps or backdates it. Reading both is what lets the witness
@@ -793,7 +791,7 @@ const sinceStart = ({ from }, ms) => ms >= from - slackOf(ms);
 //     ordinary edits (Edit is itself an atomic rename, measured). A later write
 //     INSIDE A advances its mtime and still hides the move: a pinned miss.
 // Clause 2 can name an earlier unresolved call for a move a later resolved `mv`
-// made; the turn gates either way, which the ruling accepts.
+// made; the turn gates either way, which is accepted.
 function wroteIn(window, { mtimeMs, ctimeMs, moves = [] }) {
   return inWindow(window, mtimeMs) || inWindow(window, ctimeMs)
     || moves.some((a) => (inWindow(window, a.ctimeMs) && inWindow(window, a.parentCtimeMs))
@@ -876,7 +874,7 @@ function* writeEvents(entries, from, to, cwd) {
 
 // The harness's own words, at the very start of an error result, for a call it
 // never ran: a permission denial, the user declining it, a PreToolUse hook
-// blocking it — measured across local transcripts (unresolved-write ruling).
+// blocking it — measured across local transcripts.
 // Anchored at the start because that is what a command cannot forge: a Bash
 // that ran and failed always starts `Exit code N`, so nothing it printed can
 // pose as a denial. If the harness rewords these, a denied call counts as a
@@ -942,7 +940,7 @@ function collectChanges(turn, cwd, since) {
   // repository's git status (above) and a stat of each file the command names,
   // held to the call's own window, are complete for every place it named. A `cd`
   // or a directory literal anywhere else blocks, as does anything the gate could
-  // not resolve (r1-shape ruling, 2026-10-14). It replaced a walk of foreign `cd`
+  // not resolve. It replaced a walk of foreign `cd`
   // targets, which was a witness widened one replayed miss at a time and still
   // missed writes that keep their mtime (`tar x`, `cp -p`, `rsync -a`). git runs
   // only in the session's own repository, because a repository's config can make
@@ -981,8 +979,7 @@ function collectChanges(turn, cwd, since) {
   // included, wherever in the turn it landed — cannot clear an unresolved
   // write. Crediting it did exactly that: a heredoc rewrote a hook outside the
   // repo, git saw only the two `.md` files a Write and a redirect had made, and
-  // the all-exempt rule below read that as "the artifact was prose"
-  // (unresolved-write ruling §1).
+  // the all-exempt rule below read that as "the artifact was prose".
   const succeeded = succeededToolUses(turn);
   const explained = new Set(events.filter((e) => e.explains && succeeded.has(e.id))
     .flatMap((e) => e.explains.map((p) => path.resolve(p))));
@@ -998,10 +995,9 @@ function collectChanges(turn, cwd, since) {
   // the same stem (`gen.mjs.tmp` → `gen.mjs`). Replayed over 352 turns the gate
   // passes today that hold such a write: no true hit is observable, while 8
   // could arm falsely — another session's edit in the same window, or a `git
-  // reset --hard` / `stash pop` rewriting tracked code. The ruling
-  // (resolved-write-shape-answer.md) makes that the case for narrowing before
-  // shipping. What stays invisible: a mis-parse whose real target is outside
-  // the repo, ignored, or unrelated to anything it named.
+  // reset --hard` / `stash pop` rewriting tracked code. That is the case for
+  // narrowing before shipping. What stays invisible: a mis-parse whose real
+  // target is outside the repo, ignored, or unrelated to anything it named.
   const vetoExempt = (event) => {
     const written = witnessed(event);
     if (!Array.isArray(written)) return;
@@ -1224,8 +1220,8 @@ const countReminders = (turn, since) =>
 const PENDING_INTERJECTION_LIMIT = 2;
 
 // One scan, two questions. `pending` answers "is something still running", and
-// `doneAt` + `type` answer "did an independent reader of this state exist"
-// (F10a′ ruling 2) — two filters over one array rather than two scans, so the
+// `doneAt` + `type` answer "did an independent reader of this state exist" —
+// two filters over one array rather than two scans, so the
 // interjection seam below is documented in one place and cannot drift.
 //
 function scanAgents(entries, results) {
@@ -1316,8 +1312,7 @@ function scanAgents(entries, results) {
 // notice — is read; if it ends in a report timestamped before the marker, the
 // completion moves to the first lead entry at or after that time, and the
 // ordering rules (fresh, vouches, the verifier window) judge it exactly as they
-// judge a notice. Ruled C by a Fable subagent on 2026-09-19, after the draft
-// existed (ask.sh was refused): docs/design-notes/questions/late-notice-answer.md.
+// judge a notice.
 //
 // KNOWN LIMIT: the transcript proves the report existed before the marker, not
 // that the lead read it — which is also all a delivered notice ever proved.
@@ -1404,7 +1399,7 @@ function reportFinishedMs(agent, dir, launchMs) {
 const stillRunningFor = (a, prevMarkerAt) =>
   a.pending && (a.launchedAt > prevMarkerAt || a.interjections === 0);
 
-// F10a′ ruling 2, as scoped on 2026-09-02: `converged` claims a review ran, so
+// `converged` claims a review ran, so
 // refuse it when no plugin reviewer COMPLETED after the last change and before
 // the marker. Three transcript indices; the report is never opened. Grading
 // would read what the reviewer said — this asks only whether the sequence of
@@ -1438,7 +1433,7 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
   const reviewers = [...finders, ...orchestrators];
   // A finder's scope is frozen when it is LAUNCHED, not when it reports: one
   // launched before a change and completing after it read the tree the change
-  // replaced (unresolved-write ruling, second half). Background finders notify
+  // replaced. Background finders notify
   // one at a time, so fixing what one found while another still reads is the
   // ordinary shape of a round, not a corner. A SendMessage resume does not
   // refresh this — the skill's premise is a reader who has not seen the code.
@@ -1469,8 +1464,8 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
   // because `externalChangeAt` excludes every orchestrator rather than only the
   // one being judged — and o1's edits are a fixed set at ITS completion, which
   // o2 had already stopped reading before. The baseline is therefore per-agent:
-  // everything THIS orchestrator did not do, siblings included. That is the
-  // ruling's own wording — "launched after every change it did not make".
+  // everything THIS orchestrator did not do, siblings included. That is
+  // the rule: launched after every change it did not make.
   const vouches = (o) => o.launchedAt > Math.max(externalChangeAt,
     ...orchestrators.filter((x) => x !== o).map(editorAnchor));
   if (orchestrators.some((o) => o.doneAt !== -1 && o.doneAt < markerAt && vouches(o))) return "ok";
@@ -1496,7 +1491,7 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
 
 // ---------- did an outsider rule on the verdicts? ----------
 
-// Field report 2026-09-07, measured over 8 loops / 24 rounds / 76 candidates:
+// Seen in a field run, measured over 8 loops / 24 rounds / 76 candidates:
 // THREE verifier agents ran in total. The loop was delivering "fresh readers
 // file claims and the author decides" — most of the value, but not the claim on
 // the tin, because the author's DISMISSALS went unchecked, and that is exactly
@@ -1509,9 +1504,7 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
 // in one round was also near-unreachable, so the one clause that could have
 // fired was written above the ceiling of the rounds it governed.
 //
-// Ruled 2026-09-07 (fresh Fable session at xhigh; question and answer in
-// docs/design-notes/), owner-approved with the cost: a verifier is REQUIRED
-// when either
+// A verifier is REQUIRED when either
 //
 //   dismissals >= 1                      — the threshold is one, not three,
 //     because a wrong FIX is visible in the diff and a wrong DISMISSAL is
@@ -1520,18 +1513,17 @@ function reviewerState(agents, externalChangeAt, changeAt, markerAt, prevMarkerA
 //     so one wrong dismissal suppresses rediscovery in this loop AND in every
 //     future loop over those files.
 //
-//   fixed + dismissed + open > 4         — kept against this file's author's
-//     own lean, for the reason that decided it: a dismissal trigger has a COST
-//     GRADIENT and a candidate trigger has none. If dismissing costs a verifier
-//     spawn and fixing costs nothing, a cost-disciplined lead fixes phantoms.
-//     The candidate count is fixed before any verdict is chosen, so nothing the
-//     lead decides can move it.
+//   fixed + dismissed + open > 4         — kept, for the reason that decided it:
+//     a dismissal trigger has a COST GRADIENT and a candidate trigger has
+//     none. If dismissing costs a verifier spawn and fixing costs nothing, a
+//     cost-disciplined lead fixes phantoms. The candidate count is fixed
+//     before any verdict is chosen, so nothing the lead decides can move it.
 //
 // The counts are the marker's own, which is what makes this need no filesystem:
 // every one of them is required for `outcome=converged`, they are on the same
 // line the outcome is read from, and their sum is this loop's candidate total.
-// It is a LOOP total, not the per-round count §2d speaks of — a wider net than
-// the ruling's, in the direction the owner paid for.
+// It is a LOOP total, not the per-round count §2d speaks of — a wider net,
+// in the direction that costs a verifier rather than a missed review.
 const CANDIDATE_TRIGGER = 4;
 function verifierNeed(counts) {
   if (!counts) return null;
@@ -1559,7 +1551,7 @@ function verifierState(agents, prevMarkerAt, markerAt) {
   return "none";
 }
 
-// ---------- the applier arms the gate (F10b) ----------
+// ---------- the applier arms the gate ----------
 //
 // An async Agent result is spawn metadata: `toolUseResult.toolStats`, the only
 // edit evidence the transcript carries for an agent, is on SYNCHRONOUS results
@@ -1759,14 +1751,14 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
         `Converged is a claim about the final state of the files. So: ${spawn} and re-mark only after a completion with no edits behind it, in a message of its own:`];
   return [
     // The orchestrator belongs in both lists, and it was missed in both when
-    // F10c folded it into `reviewers`: it can reach "late", "stale" and "none"
+    // it was folded into `reviewers`: it can reach "late", "stale" and "none"
     // like any reader, and its completion is a change source like an applier's.
     // A model whose only reviewer WAS an orchestrator would otherwise read a
     // refusal flatly denying any reviewer ran, and start again from zero — which
     // spends in the main session exactly what delegating the loop saves.
     //
-    // But it is named only when one is actually HERE. F10i ruled the
-    // orchestrator does not ship, so an unconditional mention sends every real
+    // But it is named only when one is actually HERE. The
+    // orchestrator agent does not ship, so an unconditional mention sends every real
     // install looking for an agent type that is not in `plugin/agents/`, and a
     // refusal must only ever name a way forward that exists. Both halves of the
     // original finding survive this: the session whose only reviewer was an
@@ -1775,7 +1767,7 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
     // Ahead of the spawn advice: a lead that marked `converged` after STOP was
     // otherwise told to launch a finder before it read the honest end, and a
     // review run to turn a capped one into `converged` is the cost the cap
-    // exists to bound (after-STOP ruling).
+    // exists to bound.
     "If converge said STOP, the budget is spent and the honest marker is `--not-converged` with your counts — not another finder.",
     middle,
     `${action} ${MARKER_BODY}`,
@@ -2128,7 +2120,7 @@ function evaluate(entries, cwd, transcriptPath) {
 // place after the last change — and when everything after it is an editor that
 // was ALREADY running when it was written, finishing is the only thing that
 // moved. The generic text then sent a lead who had just obeyed ESCALATE back
-// into a round (review-identity ruling D2). An editor launched or resumed after
+// into a round. An editor launched or resumed after
 // the marker is new work, and a main-chain change after it is the lead's own:
 // both keep the generic block.
 function remarkOnly(outcome, markerAtW, inFrame, editors) {
@@ -2247,8 +2239,7 @@ function rejectionReason(problems) {
 // base to review from. On main, every Stop checks that the committed tree is
 // one a review covered, because `git merge`, `git pull` and `gh pr merge`
 // bring code in without writing any. The git half and its reasons are in
-// lib/branch-debt.mjs; the rulings are questions/debt-state-answer.md and
-// questions/marker-check-answer.md.
+// lib/branch-debt.mjs.
 //
 // A repository's own config never releases a hold: the opt-in is read from the
 // user layer only, and the repository's additive layer is read for one thing,
@@ -2419,7 +2410,7 @@ function changesInside(changes, top) {
   });
 }
 
-// The decision log (state-location ruling, section 2): one row per Stop,
+// The decision log: one row per Stop,
 // passes included, in LOG_DIR/gate/YYYY-MM.jsonl. WRITE-ONLY — nothing in this
 // gate reads it back, because the log dir can be redirected by a repo's
 // settings `env` and a log that fed a decision would be state that repo

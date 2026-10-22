@@ -36,7 +36,9 @@ can approve one — writing it into the INTENT is not that approval, whoever
 wrote or validated the block. Once the owner approves it, record the approval where
 the decision lands — amend the plan, or commit the ruling — and cite that
 range on the line: a reader can check a committed file, never a quote of a chat
-only the author saw. Angle E checks every cut against both. The
+only the author saw. Amending a plan moves the line numbers of every other range
+cited from it, so re-check each range on the Governing documents line against
+the heading cited beside it. Angle E checks every cut against both. The
 "Governing documents" line is filled whether or not the `ticket` skill ran,
 because a validated ticket can drift from the plan as easily as an author's
 block, and a finder can only compare the change against a plan it is shown. It

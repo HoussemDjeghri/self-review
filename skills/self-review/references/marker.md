@@ -14,7 +14,7 @@ field you do not recognise, or when choosing between the two marker forms.
 | `note` | optional; required for `reason=other` | free text — the only free text there is, and it never enters the summary |
 | `tier` `adapter` | always | `tier` is `S`, `M` or `L` from `tier.json`; `adapter` from `impact.json` (`adapter=none` when impact.mjs wrote nothing) |
 | `intent` | `converged` / `not-converged` | `validated`, `author` or `skipped` — who read the intent **before** the code was written. Required, because an absent field and "nobody read it" would otherwise be the same state. `validated` is refused unless a `self-review-ticket-validator` completed before this task's first code change; the gate checks that order and never the verdict |
-| `review` | optional, `converged` / `not-converged` | the 8-hex id `round.sh --new-review` printed as `review:` (`converged.sh --work <work>` derives it; by hand, recover it with `printf '%s' <work> \| git hash-object --stdin \| cut -c1-8`). Pass it always; the gate reads it only in a repository you opted into branch review, where it finds the tree the review's last round read (its snapshot ref) and records that tree as reviewed |
+| `review` | optional, `converged` / `not-converged` | the 8-hex id `round.sh --new-review` printed as `review:` (`converged.sh --work <work>` derives it; by hand, recover it with `printf '%s' <work> \| git hash-object --stdin \| cut -c1-8`, run in the directory round 1 ran in — scope.json's `cwd` — because the id follows that repository's object format). Pass it always; the gate reads it only in a repository you opted into branch review, where it finds the tree the review's last round read (its snapshot ref) and records that tree as reviewed |
 | `forced` `computed` | when you overrode the tier | both `S`, `M` or `L` from `tier.json`, and written together — one alone does not say what was overridden |
 
 Anything that does not validate is **refused** — by the script in the same
@@ -61,13 +61,18 @@ without notice — the ledger and every `round-<n>/` dir, including the
 - `CONVERGED.json` — the record above. It is there for the file form, and for
   the script form when `converged.sh` is given `--work <work>`; that form writes
   it before printing the token, and prints no token when the write fails.
+  `--work` must name a review dir — one round 1 wrote `scope.json` into — or
+  the marker is refused, whatever the outcome; a round 1 that refused left no
+  review dir, so its marker is written without `--work`.
 - `scope.json` — written by `round.sh` once round 1 passes its refusals, never
   by the author:
   `{"v": 1, "base": "<full commit sha>" | null, "paths": ["…"], "cwd": "/abs/dir"}`.
   `base` is the commit `--base` resolved to in `cwd`'s repository. `null` means
   no `--base` was given — the review covered changes against `HEAD`, staged,
   unstaged and untracked — or it resolved to nothing, when only untracked files
-  were in scope. `cwd` is the directory round 1 ran in, symlinks resolved.
+  were in scope. `base` is resolved in `cwd`'s repository only, so it is also
+  `null` when `cwd` is outside any repository while the paths are inside one:
+  `null` never proves that no `--base` was asked for. `cwd` is the directory round 1 ran in, symlinks resolved.
   `paths` are round 1's path arguments verbatim — a relative one resolves
   against `cwd`, an absolute one stays absolute; empty means no narrowing: every
   file the base comparison found.

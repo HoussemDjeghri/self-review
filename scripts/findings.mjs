@@ -45,7 +45,7 @@ import { workRepo } from "./lib/repo.mjs";
 const fail = (message, exitCode = 3) => Object.assign(new Error(message), { exitCode });
 const usage = (message) => fail(message, 2);
 
-// --- the record schema (DESIGN §4.4) ---------------------------------------
+// --- the record schema -----------------------------------------------------
 // `unfixed` is CONFIRMED and not fixed: the applier's `blocked` survived the
 // lead's retry, or a design-risk fix the user did not rule on. `open` stays a
 // question for the user. Only `unfixed` keeps a review from converging.
@@ -130,8 +130,8 @@ export const reviewId = (value) => clean(value ?? "", LIMITS.review);
  * The review's identity, derived from the directory the round already lives in
  * rather than retyped: `self-review/review-<k>` for the loop's work dir (one
  * per review, allocated by `round.sh --new-review`), the last two path
- * components for anything else. DESIGN §4.4 always said the
- * id is "the marker id or the scratch dir name" — this makes the second one
+ * components for anything else. The id was always "the marker id or the
+ * scratch dir name" — this makes the second one
  * structural, so passing the wrong `--work` is visible (the briefs and the
  * scope would be somewhere else too) instead of silently excluding nothing.
  */
@@ -146,7 +146,7 @@ export function reviewFromWork(dir) {
   return reviewId(`${parts.slice(-2).join("/")}@${digest}`);
 }
 
-// --- F3: one pass, every problem ------------------------------------------
+// --- one pass, every problem ------------------------------------------
 // A wrong payload used to cost one turn per field: toRecord threw on the first
 // problem, and the caller is a loop at ~200k of context that fixes its JSON and
 // calls again. Measured 2026-08-30: three rejections, ~600k tokens, for one
@@ -438,11 +438,11 @@ export const priorId = (row) =>
   createHash("sha256").update(`${row.file} ${row.line ?? ""} ${row.class ?? ""} ${row.summary}`).digest("hex").slice(0, 8);
 
 /**
- * One line each: `[id] file:line · class · summary · verdict` (DESIGN §4.4).
+ * One line each: `[id] file:line · class · summary · verdict`.
  *
  * The summary is what gives way when the line is over budget, never the tail:
  * `clean` truncates from the end, the verdict is last, and the verdict is the
- * one field §4.4 scores the memory on — a line ending `· dismiss…` still reads
+ * one field the memory is scored on — a line ending `· dismiss…` still reads
  * plausibly, which is how that loss would go unnoticed. The `[id] ` prefix ate
  * 11 of the 12 characters of headroom the longest real line had.
  */
@@ -468,7 +468,7 @@ const angleTokens = (angle) => angle.split("+").map((token) => token.trim()).fil
  * arriving mid-loop brings findings the previous round had no chance to file —
  * angle S enters at round 3 and files every non-`sound` verdict as a blocker by
  * construction, which read as an increase and stopped this tool's own review
- * while it was converging (DESIGN §7.7). An angle counts as having run if it
+ * while it was converging. An angle counts as having run if it
  * filed anything, fixed or not.
  *
  * Angles are compared as the *sets* a finder covered, not as the string it was
@@ -690,7 +690,7 @@ const FLAGS = {
   record: ["work", "round", "in", "log-dir"],
   prior: ["scope", "out", "max", "work", "log-dir"],
   converge: ["work", "round", "budget", "log-dir"],
-  // Ruling 1's item 2: tree-guard proves it engaged, and this opens the log it
+  // tree-guard proves it engaged, and this opens the log it
   // proves it into. `round.sh` runs it before any reviewer starts; `converge`
   // reads it back.
   engagement: ["work", "round", "log-dir"],
@@ -883,7 +883,7 @@ export function main(argv, { log = console.log, stdin } = {}) {
     }
     // An empty batch over filed candidates is a forgotten round, not a clean
     // one: refused before anything is written, so no receipt and converge says
-    // UNRECORDED (questions/empty-record-answer.md).
+    // UNRECORDED.
     if (entries.length === 0) {
       const filed = filedCandidates(options.work, round);
       if (filed.length) {

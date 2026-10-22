@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="t">
+  <title id="t">self-review logo: a terminal window circled by a review loop, with a check mark where the loop closes</title>
+  <defs>
+    <style>
+      .ink   { fill: none; stroke: #F5EFE4; stroke-width: 40; stroke-linecap: round; stroke-linejoin: round; }
+      .coral { fill: none; stroke: #D97757; stroke-width: 40; stroke-linecap: round; stroke-linejoin: round; }
+      .tan   { fill: none; stroke: #D4A27F; stroke-width: 32; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="#191919"/>
+  <!-- the review loop: two arcs that chase each other around the window -->
+  <path class="coral" d="M 202 404 A 330 330 0 0 1 745 284"/>
+  <path class="coral" d="M 745 284 l -12 -69 M 745 284 l -69 -12"/>
+  <path class="tan" d="M 798 682 A 330 330 0 0 1 259 729"/>
+  <path class="tan" d="M 259 729 l 6 64 M 259 729 l 62 17"/>
+  <!-- the terminal window under review -->
+  <rect class="ink" x="322" y="372" width="380" height="290" rx="36"/>
+  <path class="ink" d="M 322 438 H 702" stroke-width="28"/>
+  <circle cx="364" cy="405" r="12" fill="#D97757"/>
+  <circle cx="402" cy="405" r="12" fill="#D4A27F"/>
+  <circle cx="440" cy="405" r="12" fill="#F5EFE4"/>
+  <path class="coral" d="M 384 500 L 436 544 L 384 588"/>
+  <path class="ink" d="M 470 596 H 560"/>
+  <!-- convergence: the check where the loop closes -->
+  <circle cx="724" cy="664" r="104" fill="#D97757"/>
+  <path d="M 674 666 L 710 702 L 778 628" fill="none" stroke="#191919" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

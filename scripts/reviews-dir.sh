@@ -7,8 +7,8 @@
 #
 # `mktemp -d` once and remembering the path was the rule before, and a model
 # loses what it is told to remember across a compaction — the ticket's intent
-# then sits under one base and the review under another
-# (headless-reviews-dir-answer.md). The id is stable for a session's life,
+# then sits under one base and the review under another.
+# The id is stable for a session's life,
 # `--resume` included (measured 2026-10-15); the base is `$TMPDIR`, so the
 # guarantee also assumes `$TMPDIR` does not change between the session's shell
 # calls — a call with another TMPDIR gets another base. There is deliberately no fallback:

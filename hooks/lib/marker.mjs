@@ -39,7 +39,7 @@
  *                   repository opted into branch review it is how the Stop
  *                   gate finds the tree the final round read (treecheck.sh's
  *                   snapshot ref) and records it as reviewed; everywhere else
- *                   it is only logged (marker-check ruling)
+ *                   it is only logged
  *   intent    validated | author | skipped                      (always, for
  *             the two counted outcomes) — who read the intent before the code
  *             was written. `validated` means a fresh ticket-validator did, and
@@ -120,7 +120,7 @@ export function fieldsFromFlags(argv) {
  * Validate a field bag into a record. Returns `{ record, problems }`; `record`
  * is null when `problems` is non-empty. Every problem is a whole sentence
  * naming the field and what it should be — the caller prints them all at once,
- * because three sequential single-defect rejections is the cost F3 measured.
+ * because three sequential single-defect rejections is the cost that was measured.
  */
 export function validateMarker(fields = {}) {
   const problems = [];

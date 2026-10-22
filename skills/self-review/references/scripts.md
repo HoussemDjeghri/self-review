@@ -190,7 +190,7 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/reviews-dir.sh` — the headless `<reviews>`: one private dir per `$CLAUDE_CODE_SESSION_ID`, refused rather than replaced (§0)
 - `scripts/root.mjs` — prints the installed plugin root when `${CLAUDE_PLUGIN_ROOT}` is unexpanded (§0)
 - `scripts/audit.mjs` — what a review cost, per review, from the session transcripts
-- `scripts/converged.sh` — the script form of the marker (§4) + `~/.claude/self-review/log.jsonl`; `--work` also writes `<work>/CONVERGED.json`. What other tools may read from a work dir: `references/marker.md` → **What a review leaves behind**
+- `scripts/converged.sh` — the script form of the marker (§4) + `~/.claude/self-review/log.jsonl`; `--work` also writes `<work>/CONVERGED.json`, and must name a review dir — one round 1 wrote `scope.json` into — or the marker is refused, whatever the outcome — a round 1 that refused left no review dir, so mark it without `--work`. What other tools may read from a work dir: `references/marker.md` → **What a review leaves behind**
 - `scripts/branch-debt.mjs` — branch review: `--id` prints the id to opt a repository in under (`repos.<id>.branchDebt` in the user config), no flag prints its branch, baselines and debt; read-only
 - `scripts/salvage.mjs` — read a finder's report from its transcript (§2c); the same path recovers a dead reviewer's work (§2f)
 - `skills/self-review/references/angles.md` — the angle catalogue, per artifact kind

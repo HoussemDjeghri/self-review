@@ -1,15 +1,15 @@
 /**
  * The one walk the graders share, in place of the directory lists they kept.
  *
- * Four lists said which directories this repository checks — `test.sh`'s
- * globs, no-network's `RUNTIME_DIRS`, docs-claims' `TEST_DIRS` and `DOC_DIRS`
- * — and every one of them was a single level deep, so a file in a new
+ * Four lists said which directories the checks walk — the suite runner's
+ * globs, no-network's `RUNTIME_DIRS`, the doc-claims check's `TEST_DIRS` and
+ * `DOC_DIRS` — and every one of them was a single level deep, so a file in a new
  * subdirectory was not checked, and not checking it was silent. Two had
  * already gone stale on `scripts/lib`: five shipped files that no network scan
  * had ever read. Both were repaired by adding one literal, which repairs the
- * instance; DESIGN §0.1 says the second arrival of a class makes the mechanism
- * the fix. Walking is that mechanism — a directory added tomorrow is covered
- * because nobody has to remember it.
+ * instance; the second arrival of a class makes the mechanism the fix. Walking
+ * is that mechanism — a directory added tomorrow is covered because nobody has
+ * to remember it.
  *
  * The prune list stays a literal, deliberately: its failure direction is the
  * loud one. Forget an entry here and fixture tests run in the gate and the

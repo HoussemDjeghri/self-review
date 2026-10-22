@@ -132,9 +132,8 @@ export function feederLead(line) {
   return line.slice(Math.max(...FEEDER_BOUNDARIES.map((c) => bounds.lastIndexOf(c))) + 1);
 }
 
-// ── Segmenting a command: moved verbatim from self-review-gate.mjs so the gate
-// and audit.mjs read a command the same way (ruling: docs/design-notes/
-// questions/shared-segmenter-answer.md). The gate's call sites are unchanged.
+// ── Segmenting a command: shared so the gate and audit.mjs read a command the
+// same way.
 
 // Matched against the command word alone: `cat > scope.sh <<EOF` must not read as `sh`.
 export const INTERPRETER_RE = /^(python[\d.]*|node|deno|bun|ruby|perl|php|bash|sh|zsh|osascript)$/;
@@ -151,7 +150,7 @@ const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\
 // word: `X=$(python3 - <<EOF` and `cd dir; python3 - <<EOF` both feed python3.
 // Reading the line's first word read the second as `cd`, dropped the body as
 // data, and a heredoc that rewrote a hook outside the repo never reached the
-// gate (field report 2026-09-18, item 4 — every such command began `cd …;`).
+// gate (seen in a field run: every such command began `cd …;`).
 export function separateHeredocs(cmd) {
   const scripts = [];
   const text = cmd.replace(/\r\n?/g, "\n"); // a CRLF heredoc terminates all the same

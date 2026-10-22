@@ -4,7 +4,7 @@
  * `exempt.paths`.
  *
  * The gate's exempt lists (config `exempt.extensions`, `exempt.names`) answer
- * one question — "does this file need a review?" — and both phase-3 scripts
+ * one question — "does this file need a review?" — and the three scripts above
  * need the next one: which *kind* of non-code it is, because a docs finder and
  * a config finder read different angles. The lists are therefore split here
  * rather than re-typed: docs and asset extensions are named, everything else
@@ -67,7 +67,7 @@ export function matchesExclude(patterns, filePath) {
 }
 
 // Test files are recognised by path, not by content: tier.mjs must not depend
-// on preflight.sh having run (DESIGN §4.2), and impact.mjs ranks a hit in a
+// on preflight.sh having run, and impact.mjs ranks a hit in a
 // test file above one in a caller because it tells the finder what to run.
 const TEST_PATH = /(^|\/)(tests?|spec|__tests__)\/|[._-](test|spec)\.|_test\.go$/;
 export const isTestPath = (filePath) => TEST_PATH.test(filePath);
@@ -95,7 +95,7 @@ export function classifyPath(filePath, exempt = { extensions: [], names: [] }) {
 
 /**
  * Is this directory a self-review work dir? Matched on CONTENTS, never on name:
- * the work dir that cost the 2026-08-30 reporter ~3M tokens was called
+ * the work dir that cost one field run ~3M tokens (2026-08-30) was called
  * `scratchpad/self-review/`, and the next one will be called something else.
  *
  * Two signatures, both needing two halves present together:

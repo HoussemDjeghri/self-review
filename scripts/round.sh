@@ -16,7 +16,7 @@
 # tier ceiling and its round budget from leaking between reviews of a session:
 # measured before it, one session's dir held round-1 … round-25 across six
 # reviews, and review 3 opened at "round 7" with a stranger's ceiling and a
-# converge that said STOP from its first look (review-identity-answer.md).
+# converge that said STOP from its first look.
 #
 # It captures the scope, runs pre-flight (round 1 only), computes the blast
 # radius and the plan, pulls the prior findings for these files, and writes the
@@ -236,7 +236,7 @@ scope="$dir/scope.diff"
 # it re-scoped silently — `round.sh --round 2` with no paths reads the cwd's
 # whole working tree, so a review begun with `--base` or a path list, or run
 # from another directory, reviewed a different change from round 2 on and
-# nothing said so (handoff-same-scope-answer.md). Round 1 records its arguments
+# nothing said so. Round 1 records its arguments
 # and the directory they are relative to; a later round runs scope.sh there,
 # and refuses rather than guessing when the record is missing.
 if [ "$replan" -eq 0 ]; then
@@ -257,7 +257,7 @@ if [ "$replan" -eq 0 ]; then
     # A fix can land outside round 1's paths (a test beside the module, say),
     # and a pure replay would never review it again. So a path-scoped round
     # adds every file changed since round 1's snapshot that its paths do not
-    # already cover (replay-widen-answer.md). Unscoped and --base-only reviews
+    # already cover. Unscoped and --base-only reviews
     # already see those files.
     r1_roots=(); while IFS= read -r r; do [ -n "$r" ] && r1_roots+=("$r"); done < <(LC_ALL=C sed -n '/^# self-review scope (not a git repo/q; s/^# repo: //p' "$work/round-1/scope.diff" 2>/dev/null | awk '!seen[$0]++')
     if [ -n "${paths[0]+set}" ] && [ -n "${r1_roots[0]+set}" ]; then
@@ -391,7 +391,7 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # real repository's `storeDir` to a temp directory this script then deletes, so
   # the developer's next `pnpm install` offers to wipe their node_modules. Where
   # it did not write it aborted instead: eight of eight round-1 pre-flights in one
-  # three-day field report reported `FAIL types` and `FAIL test`, all eight
+  # three-day field run reported `FAIL types` and `FAIL test`, all eight
   # carrying `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`, and the operator
   # learned by the third loop to ignore preflight.txt entirely. A signal that is
   # wrong every time is worse than no signal.
@@ -404,7 +404,7 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # The property that empty HOME was reaching for belongs to the contained cold
   # run, where writes are confined and the network is denied. This stage is
   # uncontained by construction (`--stage-only` stops before the tiers), and an
-  # empty HOME is only safe where a write cannot escape. Ruled 2026-09-07.
+  # empty HOME is only safe where a write cannot escape.
   #
   # A staging failure is reported, not fatal: pre-flight from the checkout is
   # what every release until now did, and it is worth more than no pre-flight.
@@ -445,7 +445,7 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # modules directory and, with no TTY, aborts — `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`,
   # exit 1, a FAIL on code nobody broke. Off for pre-flight wherever it runs: a
   # review has no business installing anything. The `pnpm_config_` spelling is
-  # the one pnpm reads; `npm_config_…` is ignored (field report 2026-09-18).
+  # the one pnpm reads; `npm_config_…` is ignored (seen in a field run).
   if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
     echo "round.sh: preflight.sh failed (${dir}/preflight.err) — the project's own checks did not run; say so in the report" >&2
   fi
@@ -545,14 +545,14 @@ INFRA staging  no check could start in the install copy, and they do from the ch
   # one line here that is about the REVIEW rather than about the code.
   pf="$pf$tripped"
 
-  # Ruling 1, item 3: the shipped suite, run in the shape it SHIPS in.
+  # The shipped suite, run in the shape it SHIPS in.
   #
   # The staged copy above is the repository at a foreign path, which is a
   # different property: the tests there still walk up to a repository root that
   # is present. In an install this project's `plugin/` contents ARE the root, so
   # a test that walks upward reaches the plugin cache and a test that names a
-  # repo-root path finds nothing. Ten tests were in that state when release.sh
-  # gained the same check; four failed and the rest passed over a tree that was
+  # repo-root path finds nothing. Ten tests were in that state when the release
+  # audit gained the same check; four failed and the rest passed over a tree that was
   # not the tree they meant, which is the worse half. That check runs at release
   # time, which is the last moment to learn it — this one runs in round 1.
   #
@@ -567,7 +567,7 @@ INFRA staging  no check could start in the install copy, and they do from the ch
   # project reviewed afterwards. Hence the SKIP below rather than a FAIL, and
   # hence SKILL.md §1 documenting the key beside `preflight.skip`.
   #
-  # Same three failure modes as release.sh's, for the same reasons: an empty
+  # Same three failure modes as the release audit's, for the same reasons: an empty
   # walk is a failure, a non-zero exit is a failure, and a ZERO exit is believed
   # only when the runner's own TAP plan says a suite ran and none of it failed —
   # `node --test` writes no TAP at all when NODE_TEST_CONTEXT is set, and exits
@@ -711,7 +711,7 @@ if [ "$replan" -eq 0 ]; then
   "$here/findings.mjs" prior --scope "$scope" --out "$dir/prior.md" --work "$work" >/dev/null
 fi
 
-# Ruling 1, item 2. tree-guard's allow path and its inert path are the same
+# Proof of engagement. tree-guard's allow path and its inert path are the same
 # silence, which is how it went unnoticed that a named agent's `agent_type` is
 # its NAME and the guard had therefore matched none of roughly ninety finders.
 # Opening the log here is what scopes the guard's writes to a repository with a
@@ -828,7 +828,7 @@ fi
 [ -z "$pf" ] || { echo "pre-flight (from ${pf_from}):"; echo "$pf"; }
 # The staged copy's path is a trap this script sets on purpose (`cold run – ü`),
 # and a failure there reads correctly only to someone who knows that, so the
-# output says so (cl-c-preflight-urlpath-answer.md). It reads preflight.txt, not
+# output says so. It reads preflight.txt, not
 # $pf: the artifact-suite verdict is appended to $pf but runs under the work
 # dir, so its FAIL says nothing about the staged path.
 if [ -n "$pf_from" ] && [ -n "${repo_root:-}" ] && [ "$pf_from" != "$repo_root" ] && grep -q '^FAIL ' "$dir/preflight.txt" 2>/dev/null; then

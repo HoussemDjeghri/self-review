@@ -133,7 +133,7 @@ export function parseScope(text) {
 }
 
 // --- changed symbols -------------------------------------------------------
-// Definition patterns per language (DESIGN §4.3 step 1). Each entry's `kind`
+// Definition patterns per language. Each entry's `kind`
 // is either a fixed string or the index of the capture group naming it — the
 // finder reads "removed (function)" differently from "removed (const)".
 const LANGUAGES = [
@@ -176,9 +176,9 @@ const LANGUAGES = [
     ext: /\.(rb|java|kt|kts|cs|php|scala|swift)$/,
     defs: [
       { re: /^\s*(?:def|class|module|interface|enum|fun|func)\s+(\w+)/, name: 1, kind: "def" },
-      // At least one real modifier: with `\s` as an alternative (DESIGN §4.3's
-      // illustrative form) `return helper(x);` also reads as a declaration, and
-      // a package-private method is rarer than a return statement.
+      // At least one real modifier: with `\s` as an alternative,
+      // `return helper(x);` also reads as a declaration, and a package-private
+      // method is rarer than a return statement.
       { re: /^\s*(?:(?:public|private|protected|internal|static|final|override|abstract|synchronized|suspend)\s+)+[\w<>[\],\s?]+\s+(\w+)\s*\(/, name: 1, kind: "method" },
     ],
   },

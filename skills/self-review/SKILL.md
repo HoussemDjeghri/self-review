@@ -70,7 +70,7 @@ verifier is a stronger model
 than the finders because ruling on the author's dismissals is where judgment
 beats price. Haiku is not used yet: at about a twentieth of Sonnet's price per
 token it would cut a finder's cost, but its recall on the finder corpus is
-unmeasured (`evals/run.mjs --level finders --model …`). Do
+unmeasured. Do
 not pass `model: "fable"`; a session that must force one model sets
 `CLAUDE_CODE_SUBAGENT_MODEL` with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` (the
 variable alone loses to the pins), and `CLAUDE_CODE_EFFORT_LEVEL` outranks every
@@ -544,7 +544,9 @@ commit: review **all** of it as one review — `round.sh --new-review --base <th
 sha>`, no path list — and mark with its `review` id, which is how the gate finds
 the tree the last round read. A narrowed scope, another base or no `review`
 leaves the hold standing. Lost the id? `converged.sh --work <work>` derives
-it; by hand it is the first 8 hex of `printf '%s' <work> | git hash-object --stdin`. `scripts/branch-debt.mjs` prints
+it; by hand it is the first 8 hex of `printf '%s' <work> | git hash-object --stdin`,
+run in the directory round 1 ran in (scope.json's `cwd`), because the id follows
+that repository's object format. `scripts/branch-debt.mjs` prints
 where a repository stands.
 
 Anything invalid is **refused** with every defect named, so fix what it names

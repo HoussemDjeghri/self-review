@@ -218,7 +218,7 @@ home="$out/home";  mkdir -p "$home"
 # `node_modules` is linked wherever it sits, not only at the root: a pnpm
 # workspace keeps one per package, and with only the root's linked every
 # package's own imports failed to resolve — a false FAIL on every monorepo
-# (docs/FIELD_REPORT-2026-09-18.md, "Diagnosed afterwards"). A package whose
+# (found in a field run). A package whose
 # directory the copy did not create is not staged, so its tree is not linked.
 if [ "$stage_only" -eq 1 ]; then
   for dep in .venv venv vendor .bundle; do
@@ -560,8 +560,8 @@ run_contained() {
 # the directory name finds a library and misses a Makefile.
 #
 # Scoped to the change when a scope bundle is given. Unscoped, the first run of
-# this on its own repository listed 34 entry points, 19 of them under evals/
-# and 14 of those corpus fixtures — a wall of candidates the reviewer has to
+# this on its own repository listed 34 entry points, 19 of them under a
+# fixtures directory and 14 of those corpus fixtures — a wall of candidates the reviewer has to
 # triage before doing any reviewing, which is how a tool meant to remove an
 # excuse becomes one.
 wanted=""

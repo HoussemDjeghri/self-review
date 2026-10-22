@@ -76,7 +76,7 @@ export function angleSections(markdown) {
 }
 
 // --- the fallback plan -----------------------------------------------------
-// DESIGN §4.5's round-1 groups for code, plus its round-2/3 merges. Without
+// `references/angles.md`'s round-1 groups for code, plus its round-2/3 merges. Without
 // tier.json there are no kinds and no risk markers, so this builds the code
 // plan and keeps L's conditional G/H rows: at tier L, missing a security or
 // concurrency finder costs more than spending one.
@@ -118,7 +118,7 @@ export function buildPlan(tier, round, config = {}) {
       // the registered type. `tier.mjs` does the same for the same reason —
       // these are two generators feeding one guard, and this one is the
       // fallback the skill reaches for when the other is broken, which is
-      // exactly when an unguarded reviewer would go unnoticed. F10h.
+      // exactly when an unguarded reviewer would go unnoticed.
       const agent = "self-review-finder";
       return {
         name: `${agent}-r${round}-${row.angles.join("").toLowerCase()}`,
@@ -200,7 +200,7 @@ export const dismissedFrom = (ledgerText) => ledgerSection(ledgerText, /^#{1,3} 
 export const fixedFrom = (ledgerText) => ledgerSection(ledgerText, /^#{1,3} +fixed\b/i);
 
 // Impact at the depth the row asked for. `summary` is the file's own two-line
-// header (§4.3 writes the counts there); `docs` keeps the sections a prose
+// header (impact.mjs writes the counts there); `docs` keeps the sections a prose
 // reviewer can act on; `full` is the file, capped.
 export const IMPACT_DEPTHS = new Set(["full", "docs", "summary"]);
 
@@ -383,7 +383,7 @@ export function renderBrief(args) {
   }
   // The prior lines this brief actually carries, after the trim: what a finder
   // was shown is a fact only the render knows, and the eval's `badCite` metric
-  // is a guess without it (DESIGN §4.4).
+  // is a guess without it.
   return { text, tokens, trimmedImpact, trimmedPrior, priorShown: [...prior] };
 }
 

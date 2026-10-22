@@ -1,7 +1,7 @@
 /**
  * Agent-definition frontmatter, read the way the harness reads it.
  *
- * Three copies of this reader existed — `evals/run.mjs`, and the two seam
+ * Three copies of this reader existed — in an eval runner and the two seam
  * suites that check `agents/*.md` against the gate's and tree-guard's
  * hardcoded type lists — and one defect was live in two of them at once, which
  * is the rule of three arriving with its evidence attached.

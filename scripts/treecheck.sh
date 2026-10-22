@@ -24,7 +24,7 @@
 # `--record` also commits the dirty tree to an object nobody's working tree can
 # see (`refs/self-review/<review>/round-<n>`), so a silent loss becomes a named
 # one AND a reversible one: the message below carries the restore command. That
-# ordering is the design decision recorded as F9 — no command parser can decide
+# ordering is the design decision — no command parser can decide
 # what mutates a tree, but one git call makes the mutation recoverable however
 # it was spelled.
 #
@@ -139,8 +139,8 @@ prune_snapshots() {
 
 # What a fix changed since round <n>, measured against its snapshot rather than
 # HEAD: the snapshot holds the dirty tree as it was, so work that predates the
-# round cancels out and only edits made during the review remain
-# (replay-widen-answer.md). Same temp-index move as record_snapshot.
+# round cancels out and only edits made during the review remain.
+# Same temp-index move as record_snapshot.
 if [ "$changed" -eq 1 ]; then
   [ "$record" -eq 0 ] || die "--record and --changed are separate calls"
   git -C "$root" rev-parse --verify -q "$(snapshot_ref)^{commit}" >/dev/null 2>&1 || { echo "treecheck.sh: no snapshot for round $round of this review" >&2; exit 3; }

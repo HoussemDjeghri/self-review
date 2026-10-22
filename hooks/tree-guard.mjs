@@ -38,7 +38,7 @@
  * however it was spelled — and by `treecheck.sh`'s comparison afterwards, which
  * names what moved and prints the restore. Isolation — reviewers working in a
  * checkout of that snapshot rather than in the author's tree — is the layer
- * above, and is F9 in `docs/design-notes/orchestration-cost.md`. Do not read a
+ * above. Do not read a
  * passing command here as a safe one.
  *
  * THE `rm` HALF IS GONE, and its removal is the freeze note above finally being
@@ -57,7 +57,7 @@
  * already outside this hook's threat model. The git half stays: it is an
  * allowlist of reading verbs, closed by construction, and unlike rm it has a
  * real field record — `git stash` and `git tag` denials, the exact tidying-up
- * class it was built for. Ruled by a headless Fable session, 2026-09-04.
+ * class it was built for.
  *
  * Fails open (silent exit 0) on anything unexpected; TREE_GUARD=off disables.
  */
@@ -77,13 +77,12 @@ const GUARD_TAG = "[tree-guard]";
 // the two the lead happened to send. A name that does not start with the
 // agent's own type is NOT guarded, by design: the plugin generates every name
 // it is responsible for, and an unrecognised one is treated as not a reviewer,
-// the same accepted fail-open as an unlisted `rm` spelling. F10h.
+// the same accepted fail-open as an unlisted `rm` spelling.
 const REVIEWER = /(^|:)self-review-(finder|verifier|ticket-validator)(-|$)/;
 // The two agents declared with no Bash at all: the applier (its edits must be
 // the ones the Stop gate can see) and the cold grader (angle X executes
 // nothing). A named launch does not honour a declared tool list — 78 of 99
-// named launches ran Bash (field report 2026-09-18) — so the guard enforces it.
-// Decided unadvised (docs/design-notes/questions/no-bash-reviewers-answer.md).
+// named launches ran Bash (seen in a field run) — so the guard enforces it.
 const SHELL_LESS = /(^|:)self-review-(applier|cold-grader)(-|$)/;
 
 /**
@@ -223,7 +222,7 @@ export function evaluate(payload) {
   const shellLess = SHELL_LESS.test(agentType);
   const matched = shellLess || REVIEWER.test(agentType);
   // The audit line, before the decision. This is not a bypass patch — the file
-  // is still frozen against those — it is ruling 1's item 2: the guard's allow
+  // is still frozen against those — it is proof of engagement: the guard's allow
   // path and its inert path are the same silence, and that is how it came to be
   // inert for roughly ninety named finders while every review round read it and
   // correctly found it correct. Writing only into an open log keeps a project
