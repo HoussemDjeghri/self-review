@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { agentNameOf, agentStatus, findAgentFiles, isOwnTranscript, readAgent } from "./agents.mjs";
+import { agentNameOf, agentStatus, findAgentFiles, isOwnTranscript, readAgent, reportCandidates } from "./agents.mjs";
 
 const CONFIG = { settleSeconds: 60, staleSeconds: 660 };
 let seq = 0;
@@ -248,4 +248,41 @@ test("a named agent the harness filed as bare hex is found by the name in its si
   assert.equal(readAgent(own).name, "finder-r1-ab", "readAgent carries the resolved name for salvage");
   assert.equal(agentNameOf(path.join(home, "agent-afinder-r1-ab-0123abcd.jsonl")), "finder-r1-ab",
     "a name in the file name wins without reading anything");
+});
+
+test("reportCandidates counts the objects of the report's last top-level array", () => {
+  assert.equal(reportCandidates("```json\n[]\n```"), 0);
+  assert.equal(reportCandidates('```json\n[\n  {"file": "a.mjs", "summary": "a ] in a string"},\n  {"file": "b.mjs"}\n]\n```'), 2);
+  // A nested array is part of the report, not a second one.
+  assert.equal(reportCandidates('[\n  {"evidence": [\n    {"line": 1}\n  ]}\n]'), 1);
+  // The last array wins: a report restated after a draft.
+  assert.equal(reportCandidates('draft:\n[{"a": 1}, {"b": 2}]\nfinal:\n[{"a": 1}]'), 1);
+});
+
+test("a prose caveat after the array is an honest report, and a bracketed word is not an array", () => {
+  assert.equal(reportCandidates('[r1-3] is the one to read first.\n[{"file": "a.mjs"}]\nOne caveat: I did not run the tests.'), 1);
+});
+
+test("a report with no array that parses is null, not zero", () => {
+  assert.equal(reportCandidates("Sent 3 candidates to team-lead by SendMessage."), null);
+  assert.equal(reportCandidates('[\n  {"file": "a.mjs"},'), null, "a torn array");
+  assert.equal(reportCandidates('[\n {"a": 1},\n]\n[] none else'), null, "a malformed report beside a trailing []");
+  assert.equal(reportCandidates('[r1-3] is the one to read.\n[]'), 0, "a bracketed word is not a malformed report");
+  assert.equal(reportCandidates(undefined), null);
+});
+
+test("a later array with no candidate in it never lowers the count", () => {
+  assert.equal(reportCandidates('[{"file": "a", "line": 1}]\n\n[1] see above'), 1);
+  assert.equal(reportCandidates('```json\n[{"file": "a"}, {"file": "b"}]\n```\n[]'), 2);
+  assert.equal(reportCandidates("[1] see above"), null, "only non-object arrays: not an honest zero");
+  assert.equal(reportCandidates("[]\n"), 0);
+});
+
+test("a report full of unclosed brackets is read in bounded time", () => {
+  const started = Date.now();
+  assert.equal(reportCandidates('[ "\n'.repeat(20_000) + '[{"file": "a"}]'), null);
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started}ms`);
+  const nested = Date.now();
+  reportCandidates("[\n".repeat(20_000) + "x\n" + "]\n".repeat(20_000));
+  assert.ok(Date.now() - nested < 1000, `closed but unparseable: took ${Date.now() - nested}ms`);
 });

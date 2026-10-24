@@ -6,6 +6,9 @@
 //
 // Names default to the stems of `round-N/briefs/*.md`; the verifier and applier
 // waits pass their own name. Run it with the Bash tool's `timeout` at 600000.
+// Each exit that prints the table also writes `round-N/reports/<name>.json`, the
+// candidate count of every finished finder and cold-grader, which `findings.mjs
+// record` reads before it accepts `[]` (see writeReports).
 //
 // Why a script rather than ending the turn. The lead used to wait by ending its
 // turn and letting each reviewer's completion notification wake it. On
@@ -34,7 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { LOG_DIR, isMain, loadConfig } from "../hooks/lib/config.mjs";
-import { agentNameOf, agentStatus, findAgentFiles, readAgent, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
+import { agentNameOf, agentStatus, findAgentFiles, readAgent, reportCandidates, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
 import { reviewName, reviewNumber } from "./brief.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
 import { gitRoot } from "./lib/repo.mjs";
@@ -165,6 +168,7 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
     }
     return {
       name, stateLines, calls: agent.calls, lastAt: agent.lastAt, matched: agent.name,
+      transcript: agent.file, report: agent.texts.at(-1),
       status: agentStatus(agent, quietNow(agent.mtimeMs), config),
       // The row carries the error itself, because which KIND it is decides the
       // remedy and only the transcript knows: a nudge resumes a dropped
@@ -173,6 +177,25 @@ export function poll({ names, dir, since, roundDir, now, config, waitStartMs, re
       note: "",
     };
   });
+}
+
+// Each finished finder's and cold-grader's candidate count, where `findings.mjs
+// record` can see it: `round-N/reports/<name>.json`, `candidates` null when the
+// report does not parse. The state files are crash insurance a finder may never
+// write — 24 of 97 rounds with findings, measured 2026-10-24, had none, and the
+// incident of 2026-10-23 was one — so without this the `[]` guard was blind in a
+// quarter of the rounds it exists for. Written at every exit that prints the
+// table, because the lead may record after any of them; rewritten each time, so
+// a finder nudged into restating its report replaces the count it had.
+export function writeReports(roundDir, rows) {
+  const reviewers = rows.filter((r) => r.status === "finished" && (roleOf(r.name) === "finder" || roleOf(r.name) === "cold-grader"));
+  if (reviewers.length === 0) return;
+  const dir = path.join(roundDir, "reports");
+  mkdirSync(dir, { recursive: true });
+  for (const r of reviewers) {
+    const record = { name: r.name, transcript: r.transcript, candidates: reportCandidates(r.report) };
+    writeFileSync(path.join(dir, `${path.basename(r.name)}.json`), `${JSON.stringify(record)}\n`);
+  }
 }
 
 export function render(rows, verdict, extra = [], sessionId = undefined) {
@@ -430,6 +453,7 @@ export async function main(argv, {
   // The table is worth printing even when the tool timeout, not this script,
   // ends the call — otherwise a wait that ran too long tells the lead nothing.
   const onSignal = () => {
+    try { writeReports(roundDir, rows); } catch { /* the table still prints; record then sees only the state files */ }
     log(render(rows, `# interrupted — ${count(rows, "finished")} finished, ${count(rows, "stalled")} stalled, ${count(rows, "dead")} dead, ${count(rows, "active")} active`, [...sleptNote(), ...orphans()], sessionId));
     process.exit(1);
   };
@@ -494,6 +518,11 @@ export async function main(argv, {
       3: `# budget spent after ${config.budgetMinutes}m — treat the ${active} still active as dead (§2f).`,
     }[exitCode];
     log(render(rows, verdict, [...sleptNote(), ...orphans()], sessionId));
+    try {
+      writeReports(roundDir, rows);
+    } catch (error) {
+      log(`# could not write ${path.join(roundDir, "reports")} (${error.message}) — record will see only the state files`);
+    }
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);

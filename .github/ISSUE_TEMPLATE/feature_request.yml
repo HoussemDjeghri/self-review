@@ -1,0 +1,28 @@
+name: ✨ Feature request
+description: Something self-review should do that it doesn't
+labels: ["feature request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not sure it's a feature yet? Start a thread in [Discussions](https://github.com/HoussemDjeghri/self-review/discussions) instead.
+
+        **This repository is public.** Describe the situation by its shape ("a monorepo with Python and Go services"), not by pasting code that isn't yours to publish.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were doing and where self-review got in the way or fell short.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you've tried
+      description: Config options, `/self-review <path>`, `SELF_REVIEW_GATE=off`, a workaround.

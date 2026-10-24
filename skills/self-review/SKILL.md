@@ -244,8 +244,9 @@ The loop runs from a session that can spawn this plugin's agents — in an agent
 team, the lead; a teammate cannot spawn them. A teammate either hands its
 change to the lead (message it the scope) and ends with
 `converged.sh --not-applicable other --note "handed to lead: <scope>"`, or
-reviews it in one honest single pass (below) and ends `--not-converged` with
-its real counts — never `converged`, which the gate refuses without reviewers.
+reviews it in one honest single pass (below) and ends `--not-converged
+--reason single-pass` with its real counts — never `converged`, which the gate
+refuses without reviewers.
 
 A **subagent** cannot run the loop for its lead either. Its reviewers never
 appear in the lead's transcript, so the lead's gate refuses the marker. To
@@ -257,8 +258,19 @@ and report it ends with: the child is a session of its own, so its reviewers are
 in its own transcript, and its Stop gate checks the marker whenever the child's
 fixes changed code. Ask it to end with `converged.sh … --work <work>` and to
 report its `work:` line; `<work>/CONVERGED.json` and `<work>/scope.json` are
-then the record (`references/marker.md` → **What a review leaves behind**). A subagent that changed code hands the change back to the
-lead, as a teammate does.
+then the record (`references/marker.md` → **What a review leaves behind**).
+
+**Wait for the child inside your calls, never by ending the turn.** A subagent
+that ends its turn is not woken by its own background command finishing — the
+completion notice is queued and never drained, which left one idle for eleven
+hours — and `Monitor` reports on that same channel, so it is no substitute; nor
+is one long foreground call, which is moved to the background past `600000`.
+Make a fresh directory (`mktemp -d`), launch the child in the background into it
+(`claude -p … ><dir>/out 2>&1; echo $? ><dir>/exit`), then re-issue a foreground
+`end=$((SECONDS+570)); until [ -s <dir>/exit ] || [ $SECONDS -ge $end ]; do sleep 15; done; cat <dir>/exit 2>/dev/null || echo still-running`
+with the Bash `timeout` at `600000` until it prints the exit code. The
+`idle-guard` hook stops the turn once per background job if you end it anyway. A subagent that
+changed code hands the change back to the lead, as a teammate does.
 
 If a *reviewer* type is missing, use `general-purpose` with that agent file
 (`${CLAUDE_PLUGIN_ROOT}/agents/<name>.md`) pasted at the top of the brief, under
@@ -274,10 +286,12 @@ finder on a moved tree returns line numbers that point nowhere. Never use a fork
 for a reviewer and never review inline: a fork inherits the context that made
 the mistake, and inline review is what this skill replaces. Without the Agent
 tool, or as a teammate that cannot spawn this plugin's agents, work through
-every angle yourself, sequentially, and say so — an honest single pass is fine;
-one described as the loop is not. A finder that returns
+every angle yourself, sequentially, and say so — an honest single pass is fine
+(it ends `--not-converged --reason single-pass`); one described as the loop is
+not. A finder that returns
 `failed` or `stopped` is salvaged (§2f), then re-spawned once at most; if that
-fails, report its angle as uncovered rather than waiting.
+fails, report its angle as uncovered rather than waiting (and if the review ends
+there, `--reason reviewer-failed`).
 
 ### 2c · Collect and deduplicate
 
@@ -297,7 +311,13 @@ are told to pass half-believed candidates through — so read that transcript
 before trusting it. Merge candidates at the same line and mechanism, keeping the
 most concrete failure scenario; drop nothing else — verification decides.
 Every candidate ends as a row: `record` refuses `[]` while the round's
-`state/*.jsonl` files (a verifier's excepted) hold candidate objects.
+`state/*.jsonl` files (a verifier's excepted) hold candidate objects, or while
+a finished finder's or cold-grader's report, as `wait.mjs` counted it into
+`reports/`, holds candidates or does not parse. A report that does not parse and
+truly found nothing: `SendMessage` that reviewer to restate it as the JSON array
+ending its message, and once its reply has landed (`salvage.mjs` prints the
+array) call `wait.mjs` with its name alone, which rewrites the count — the same
+names are refused once the round's wait has spent its budget.
 
 ### 2d · Verify
 
@@ -338,7 +358,7 @@ verifier has an unguarded shell in the author's tree.
 | Verdict | `fix_risk` | Action |
 |---|---|---|
 | CONFIRMED | low | fix now |
-| CONFIRMED | design | ask the user if they are in the session; otherwise **unfixed** — the review ends not-converged |
+| CONFIRMED | design | ask the user if they are in the session; otherwise **unfixed** — the review ends not-converged with `--reason open-blocker` |
 | PLAUSIBLE | low | fix now (a guard, a test, a corrected sentence is cheaper than the argument) |
 | PLAUSIBLE | design | **open** — ask the user, with your recommendation |
 | REFUTED | — | **dismissed** — ledger entry with the refuting proof |
@@ -411,7 +431,7 @@ vocabulary. Copy a candidate's `prior_id` (the eight bracketed characters of the
 reconstruct it, and dropping it is silent. It validates every record before
 writing any, so a rejection costs a retry; `record --help` prints the schema.
 Record **every** round — `[]` when it had nothing to record (§2c: refused over
-filed candidates), or `converge` calls the round `UNRECORDED`. It then prints
+filed or reported candidates; empty input is refused too, so write the `[]`), or `converge` calls the round `UNRECORDED`. It then prints
 the round's verdict and a `next:` line, the exact call that acts on it (§3). Where the memory lives:
 `references/scripts.md` → **Findings memory**.
 
@@ -469,15 +489,16 @@ findings and stops leaves ten fixes unreviewed. Decide from the trend:
 
   **Stop and escalate** — surface the state, do not declare done — on any of:
   - `ESCALATE` — `W` over shared angles did not drop (the fixes are not
-    shrinking the problem, or one spawned another);
+    shrinking the problem, or one spawned another); end `--not-converged --reason stall` unless the user says continue;
   - **oscillation** — a round flags an earlier fix as wrong: do not flip it
-    back; surface both positions;
+    back; surface both positions; if the user does not rule, end `--not-converged
+    --reason oscillation`;
   - the **round budget** — **2 at tiers S and M, 6 at L** — which `converge`
     reads from `tier.json` (`roundsCap`) and answers `STOP` itself (`--budget
     <n>` overrides; you should not need it). A spent budget bounds cost and is
     never health: report that round's fixes as unreviewed, never a `STOP` as
     clean. After a `STOP` act on the `next:` line — `--not-converged` with your
-    counts, not another finder; `round.sh` refuses the next round (exit 5).
+    counts and the reason it prints (`rounds-cap`, or `open-blocker` when a CONFIRMED is left unfixed), not another finder; `round.sh` refuses the next round (exit 5).
     **One extension, any tier:** a round that **fixed a blocker or
     major** buys exactly one more, because such a fix must not ship unread —
     `next:` prints it, with `--force S --reason "extension round: round <N>
@@ -520,7 +541,7 @@ marker** — last fix, a finder completes, marker, nothing edited between. An
 applier's completion counts as your change. A verifier does not count: it
 presupposes findings, and if you generated them you reviewed your own work. One
 finder is the floor, because tier S *is* one finder. `--not-converged` (with
-real counts) and `--not-applicable` (with a reason) need no reader and are never
+real counts and a `--reason`) and `--not-applicable` (with a reason) need no reader and are never
 gated.
 
 **Write the file** — the default; a scratch write needs no permission rule:
@@ -554,12 +575,13 @@ and write again; fields, the `not-applicable` form and where each form counts ar
 in `references/marker.md`. In short: the file lives under a scratch prefix,
 never in the project; the script's *output* is what counts, never a quote or
 `cat` of it; if your permission mode refuses the command, use the file. A loop
-that stopped short (stall, oscillation, backstop) is `--not-converged` with real
-counts and the open state reported — after `STOP` or `ESCALATE`, act on the
+that stopped short is `--not-converged` with real counts, a `--reason` (the
+closed list is in `references/marker.md` — `budget` when the session ran out
+around the loop, `user-stopped` when the user ended it —) and the open state reported — after `STOP` or `ESCALATE`, act on the
 `next:` line, which is that call; a turn the loop does not fit is
 `--not-applicable`, never a review that did not happen. `open` counts the
 questions put to the user in the report; an unfixed CONFIRMED is not open, it
-is recorded `unfixed` and the review ends `--not-converged`.
+is recorded `unfixed` and the review ends `--not-converged --reason open-blocker`.
 
 The marker, not a sentence saying you reviewed, is what the gate looks for.
 Mark only after the final round and edit nothing after it (an edit re-arms the

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   convergence, findingsFile, main, nextAction, normaliseRemote, priorCiteOf, priorId, priorLines, rankPrior, readRecords, recordFindings, recordProblem, repoId, reviewFromWork, toRecords,
 } from "./findings.mjs";
+import { writeReports } from "./wait.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, "findings.mjs");
@@ -999,13 +1000,13 @@ test("nextAction: an earned extension prints the one round it buys, forced to S 
 test("nextAction: STOP prints not-converged with the counts, and says that is the honest end", () => {
   const next = nextFor("STOP").split("\n");
   assert.equal(next[0],
-    "next: /plug/scripts/converged.sh --not-converged --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
+    "next: /plug/scripts/converged.sh --not-converged --reason rounds-cap --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
   assert.match(next.slice(1).join("\n"), /^ {2}round 2's fixes ship unreviewed: list them in the report\. This is the correct end of a capped review; a new review to turn it into converged is not\.$/);
 });
 
 test("nextAction: ESCALATE prints not-converged and the round to run if the user says continue", () => {
   const next = nextFor("ESCALATE");
-  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged --rounds 2 /);
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged --reason stall --rounds 2 /);
   assert.match(next, /\n {2}put the stall to the user; if they say continue, run \/plug\/scripts\/round\.sh --work \/w\/review-1 --round 3 --intent \/w\/review-1\/intent\.md as usual\.$/);
 });
 
@@ -1050,7 +1051,7 @@ test("CLI: record --work prints the verdict on the round it just recorded, and t
   plan(2, "M");
   const capped = record(2, [candidate({ severity: "minor" })]);
   assert.match(capped.stdout, /^STOP — round budget of 2 is spent/m, capped.stdout);
-  assert.match(capped.stdout.replaceAll("'", ""), /converged\.sh --not-converged --rounds 2 --fixed 2 --dismissed 1 --open 0 --tier M /,
+  assert.match(capped.stdout.replaceAll("'", ""), /converged\.sh --not-converged --reason rounds-cap --rounds 2 --fixed 2 --dismissed 1 --open 0 --tier M /,
     "the counts are this review's, summed across its rounds");
   assert.equal(existsSync(path.join(work, "round-2", "recorded.json")), true);
 });
@@ -1110,7 +1111,7 @@ test("unfixed: a round that fixed nothing and left one unfixed escalates, never 
   assert.equal(result.verdict, "ESCALATE", result.reason);
   assert.equal(result.reason, `1 CONFIRMED finding(s) left unfixed: [${priorId(row)}]`);
   const next = nextAction(result, COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS });
-  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged /);
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged --reason open-blocker /);
   assert.match(next, new RegExp(`\\n {2}round 1 leaves 1 CONFIRMED finding\\(s\\) unfixed \\[${priorId(row)}\\]: put each to the user`));
   assert.match(next, /record --work \/w\/review-1 --round 1 with prior_id <id> on the fixed row, and run \/plug\/scripts\/round\.sh --work \/w\/review-1 --round 2 /);
   assert.match(next, /\n {2}A defect they accept as-is is not a convergence: the marker above is the end\.$/);
@@ -1135,7 +1136,7 @@ test("unfixed: a spent budget with one left unfixed is a STOP that names it", ()
   assert.equal(result.verdict, "STOP", result.reason);
   assert.match(result.reason, /1 CONFIRMED finding\(s\) left unfixed/);
   const next = nextAction(result, COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS });
-  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged /);
+  assert.match(next, /^next: \/plug\/scripts\/converged\.sh --not-converged --reason open-blocker /);
   assert.match(next, new RegExp(`\\n {2}round 2 leaves 1 CONFIRMED finding\\(s\\) unfixed \\[${priorId(row)}\\]: list them in the report\\.$`));
 });
 
@@ -1313,13 +1314,76 @@ test("record refuses [] over filed candidates, names the file and its count, and
   const { logDir, run, receipt } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": twoCandidates });
   const out = run(["record", "--round", "1"], "[]");
   assert.equal(out.status, 3, out.stderr);
-  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2\)/);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2 filed\)/);
   assert.equal(receipt(), false);
   assert.deepEqual(readdirSync(logDir), [], "no memory row was written");
 });
 
 test("record with a row over the same filed candidates records and writes the receipt", () => {
   const { run, receipt } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": twoCandidates });
+  const out = run(["record", "--round", "1"], JSON.stringify([candidate()]));
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(receipt(), true);
+});
+
+// Ruling C (2026-10-24): the state files are optional, the report is not, so
+// the guard also reads the counts wait.mjs writes under round-N/reports/.
+const reported = (work, name, record) => {
+  mkdirSync(path.join(work, "round-1", "reports"), { recursive: true });
+  writeFileSync(path.join(work, "round-1", "reports", `${name}.json`), typeof record === "string" ? record : JSON.stringify(record));
+};
+
+test("record refuses [] over candidates that are only in a finder's report, with no state line", () => {
+  const { work, logDir, run, receipt } = emptyRecordWork();
+  reported(work, "self-review-finder-k1-r1-abd", { name: "self-review-finder-k1-r1-abd", transcript: "/s/subagents/agent-a1.jsonl", candidates: 7 });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.json \(7 in its report\)/);
+  assert.equal(receipt(), false);
+  assert.deepEqual(readdirSync(logDir), [], "no memory row was written");
+  assert.match(run(["converge", "--round", "1"]).stdout, /^UNRECORDED/m);
+});
+
+test("record reads the counts wait.mjs writes: a report it counted refuses []", () => {
+  const { work, run, receipt } = emptyRecordWork();
+  writeReports(path.join(work, "round-1"), [{ name: "self-review-finder-k1-r1-abd", status: "finished", transcript: "/s/subagents/agent-a1.jsonl", report: '```json\n[{"file": "a.mjs"}]\n```' }]);
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 3, out.stderr);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.json \(1 in its report\)/);
+  assert.equal(receipt(), false);
+});
+
+for (const [what, record] of [
+  ["a report that did not parse", { name: "self-review-finder-k1-r1-abd", transcript: "/s/subagents/agent-a1.jsonl", candidates: null }],
+  ["a count file that does not parse", "{\"name\": \"self-review-fin"],
+]) {
+  test(`record refuses [] over ${what}, and says how to clear it`, () => {
+    const { work, run, receipt } = emptyRecordWork();
+    reported(work, "self-review-finder-k1-r1-abd", record);
+    const out = run(["record", "--round", "1"], "[]");
+    assert.equal(out.status, 3, out.stderr);
+    assert.match(out.stderr, /report unparsed/);
+    assert.match(out.stderr, /SendMessage that finder to restate its report as the JSON array/);
+    assert.doesNotMatch(out.stderr, /re-spawn/);
+    assert.match(out.stderr, /run wait\.mjs again with that finder's name alone/);
+    if (typeof record === "object") assert.match(out.stderr, /"\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/salvage\.mjs" "\/s\/subagents" self-review-finder-k1-r1-abd/);
+    assert.equal(receipt(), false);
+  });
+}
+
+test("record takes [] when every finished reviewer's report counted zero", () => {
+  const { work, run, receipt } = emptyRecordWork();
+  reported(work, "self-review-finder-k1-r1-abd", { name: "self-review-finder-k1-r1-abd", transcript: "/s/subagents/agent-a1.jsonl", candidates: 0 });
+  reported(work, "self-review-cold-grader-k1-r1-x", { name: "self-review-cold-grader-k1-r1-x", transcript: "/s/subagents/agent-a2.jsonl", candidates: 0 });
+  const out = run(["record", "--round", "1"], "[]");
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^CLEAN — /m);
+  assert.equal(receipt(), true);
+});
+
+test("a non-empty batch is never held to the reports' counts: merges and withdrawals record", () => {
+  const { work, run, receipt } = emptyRecordWork();
+  reported(work, "self-review-finder-k1-r1-abd", { name: "self-review-finder-k1-r1-abd", transcript: "/s/subagents/agent-a1.jsonl", candidates: 5 });
   const out = run(["record", "--round", "1"], JSON.stringify([candidate()]));
   assert.equal(out.status, 0, out.stderr);
   assert.equal(receipt(), true);
@@ -1348,13 +1412,42 @@ test("a round with no state dir records []", () => {
   const { run, receipt } = emptyRecordWork();
   assert.equal(run(["record", "--round", "1"], "[]").status, 0);
   assert.equal(receipt(), true);
+  assert.match(run(["converge", "--round", "1"]).stdout, /^CLEAN — /m);
+});
+
+// 2026-10-23: `record` without --in read the Bash tool's empty stdin as a round
+// with nothing to record, and converge called a round with seven findings CLEAN.
+// No state files, so the guard above had nothing to count.
+for (const [what, input] of [["empty stdin", ""], ["whitespace-only stdin", " \n\t\n"]]) {
+  test(`record refuses ${what} without --in: exit 3, no receipt, converge UNRECORDED`, () => {
+    const { logDir, run, receipt } = emptyRecordWork();
+    const out = run(["record", "--round", "1"], input);
+    assert.equal(out.status, 3, out.stderr);
+    assert.match(out.stderr, /stdin held no input/);
+    assert.ok(out.stderr.includes("--in <file>") && out.stderr.includes("`[]`"), out.stderr);
+    assert.equal(receipt(), false);
+    assert.deepEqual(readdirSync(logDir), [], "no memory row was written");
+    const converge = run(["converge", "--round", "1"]);
+    assert.match(converge.stdout, /^UNRECORDED — /m, converge.stdout);
+    assert.doesNotMatch(converge.stdout, /^CLEAN — /m);
+  });
+}
+
+test("record refuses an empty --in file and names it", () => {
+  const { work, run, receipt } = emptyRecordWork();
+  const file = path.join(work, "round-1", "findings.json");
+  writeFileSync(file, "\n");
+  const out = run(["record", "--round", "1", "--in", file]);
+  assert.equal(out.status, 3, out.stderr);
+  assert.ok(out.stderr.includes(`${file} held no input`), out.stderr);
+  assert.equal(receipt(), false);
 });
 
 test("a misnamed state file counts: waiting on the wrong name is how [] gets recorded", () => {
   const { run, receipt } = emptyRecordWork({ "finder-abd-attempt-1.jsonl": `${JSON.stringify({ summary: "x" })}\n` });
   const out = run(["record", "--round", "1"], "[]");
   assert.equal(out.status, 3, out.stderr);
-  assert.match(out.stderr, /finder-abd-attempt-1\.jsonl \(1\)/);
+  assert.match(out.stderr, /finder-abd-attempt-1\.jsonl \(1 filed\)/);
   assert.equal(receipt(), false);
 });
 
@@ -1368,7 +1461,7 @@ test("a one-line array of objects in a state file counts each object", () => {
   const { run } = emptyRecordWork({ "self-review-finder-k1-r1-abd.jsonl": `${JSON.stringify([{ summary: "x" }, { summary: "y" }, 3])}\n` });
   const out = run(["record", "--round", "1"], "[]");
   assert.equal(out.status, 3, out.stderr);
-  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2\)/);
+  assert.match(out.stderr, /self-review-finder-k1-r1-abd\.jsonl \(2 filed\)/);
 });
 
 test("only the recorded round's state is read: round 1's candidates do not block round 2's []", () => {

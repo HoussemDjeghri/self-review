@@ -20,10 +20,10 @@ stays outstanding until a later row cites it by `prior_id`, and while it does
 the verdict is `ESCALATE`, or `STOP` on a spent budget — never `CLEAN`, never an
 earned round, whatever `W` says. Every verdict is followed by a `next:` line, the
 call that acts on it. In order: `record` for `UNRECORDED`; the marker for
-`CLEAN`; for `unfixed` ESCALATE, `--not-converged` plus the user rulings; the
+`CLEAN`; for `unfixed` (ESCALATE or STOP), `--not-converged --reason open-blocker` plus the user rulings; the
 one extension round (`round.sh … --force S --reason "extension round…"`) when
 the round closed a blocker or major on the last budgeted round; the marker
-(`--not-converged`) for `STOP` and for a plain `ESCALATE`; the next round
+(`--not-converged --reason rounds-cap` for a `STOP` with nothing unfixed, `--reason stall` for a plain `ESCALATE`); the next round
 otherwise. The restriction is what "compare like with like"
 means: angle S arrives by rule at round 3 (§2a) and files every non-`sound`
 verdict as a `blocker` by construction, so an unrestricted `W` reads as an

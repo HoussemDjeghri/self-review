@@ -29,8 +29,8 @@ review. From round 2, a `STOP` or `UNRECORDED` verdict on the previous round
 refuses the round (exit 5, nothing created) and prints the `next:` call. A
 later round also refuses paths and `--base`, a review dir with no recorded
 round-1 scope (`scope-args`, `scope-cwd`: one begun before rounds replayed it),
-and a round-1 cwd that no longer exists. Finish such a review as not-converged,
-or start it again with `--new-review`.
+and a round-1 cwd that no longer exists. Finish such a review as not-converged
+(`--reason other` with a `--note` naming the refusal), or start it again with `--new-review`.
 
 The `>` target is checked on its own as a file write (Claude Code's redirection
 rule), which the session scratchpad passes — hence SKILL.md §0's advice when
@@ -68,7 +68,17 @@ findings.mjs record --work <w> --round N --in <w>/round-N/findings.json
 ```
 
 `record` refuses an empty batch (exit 3, no receipt) while `round-N/state/`
-holds candidate objects in any `*.jsonl` file but a `self-review-verifier-*` one.
+holds candidate objects in any `*.jsonl` file but a `self-review-verifier-*` one,
+or while `round-N/reports/` names a finished finder or cold-grader whose report
+held candidates or did not parse. `wait.mjs` writes those counts, one
+`<name>.json` per finished reviewer, at every exit that prints its table; with
+no `reports/` the state files are all the guard reads. An unparsed report is
+cleared by its finder, never by a bypass: `SendMessage` it to restate the report
+as the JSON array ending its message, and once the reply has landed run
+`wait.mjs` with that reviewer's name alone (the same names are refused once the
+round's wait has spent its budget).
+It refuses empty or whitespace-only input the same way, whatever the round
+holds: a forgotten `--in` reads an empty stdin, and that is no input, not `[]`.
 
 From round 2 on, give `scope.sh` round 1's `--base` and paths again — without
 them it scopes the whole working tree — and give `tier.mjs` `--cap` (round.sh
@@ -78,7 +88,8 @@ escalating marker round 1 already had counts as new and lifts the ceiling). A ha
 `scope-cwd`, which only `round.sh` writes — do not write them by hand.
 `brief.mjs --tier S|M|L` is the last resort for when `tier.mjs` itself cannot
 run; it writes no plan, so that round cannot be recorded with `--work` and the
-review ends not-converged.
+review ends not-converged (`--reason other`, with a note that brief.mjs ran
+without a plan).
 
 ## Plugin root
 
@@ -185,7 +196,7 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `scripts/brief.mjs` — one brief per finder row, held to the token budget, and the `Agent` line for each (§2b); `--verify` does the same for a verifier batch (§2d)
 - `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
 - `scripts/preflight.sh` — the project's own checks for the touched ecosystems (§1)
-- `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1)
+- `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1); writes `round-N/reports/<name>.json`, each finished finder's or cold-grader's candidate count, for `record`'s `[]` guard
 - `scripts/treecheck.sh` — says whether the working tree moved while reviewers ran (§2c); `--changed` lists what moved since a round's snapshot, which `round.sh` adds to a path-scoped later round
 - `scripts/reviews-dir.sh` — the headless `<reviews>`: one private dir per `$CLAUDE_CODE_SESSION_ID`, refused rather than replaced (§0)
 - `scripts/root.mjs` — prints the installed plugin root when `${CLAUDE_PLUGIN_ROOT}` is unexpanded (§0)
@@ -205,5 +216,6 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `hooks/self-review-gate.mjs` — the Stop gate that enforces all of this
 - `hooks/poll-guard.mjs` — the PreToolUse hook that denies repeated status checks
 - `hooks/tree-guard.mjs` — the PreToolUse hook that contains reviewers, matched on the name an agent runs under
+- `hooks/idle-guard.mjs` — the SubagentStop hook that stops a subagent, once per job, from going idle while background work it started is still running, since nothing wakes it when that work finishes
 - `hooks/lib/hook.mjs` — shared fail-open `runHook()` entry point of the hooks
 - `config/defaults.json` — gate exemptions, the hook limits, and the `tier` / `impact` / `brief` / `preflight` rules; override per user in `~/.claude/self-review/config.json`, and per repository from that same user file (`repos.<id>`: the branch-review opt-in and a tier overlay). A repository's own `.self-review.json` is **default closed**: it may only *add* marker words to `tier.riskPaths` and `tier.riskContent`, so a repository can make its own review stricter and nothing else

@@ -11,20 +11,24 @@ import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 
 const TAIL_BYTES = 64 * 1024 * 1024; // a single turn larger than this is implausible
 
-/** Main-chain entries (subagent sidechains dropped) from the tail of a transcript. */
-export function readMainChain(transcriptPath) {
+/** The last TAIL_BYTES of a transcript, starting on a whole line. */
+export function readTail(transcriptPath) {
   const fd = openSync(transcriptPath, "r");
-  let text;
   try {
     const size = fstatSync(fd).size;
     const start = Math.max(0, size - TAIL_BYTES);
     const buf = Buffer.alloc(size - start);
     readSync(fd, buf, 0, buf.length, start);
-    text = buf.toString("utf8");
-    if (start > 0) text = text.slice(text.indexOf("\n") + 1); // drop the partial first line
+    const text = buf.toString("utf8");
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text; // drop the partial first line
   } finally {
     closeSync(fd);
   }
+}
+
+/** Main-chain entries (subagent sidechains dropped) from the tail of a transcript. */
+export function readMainChain(transcriptPath) {
+  const text = readTail(transcriptPath);
   const entries = [];
   for (const line of text.split("\n")) {
     if (!line) continue;

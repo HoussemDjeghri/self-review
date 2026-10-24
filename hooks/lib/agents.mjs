@@ -193,3 +193,69 @@ export function findAgentFiles(dir, name, sinceMs = 0) {
     .sort((a, b) => Number(a[2] !== name) - Number(b[2] !== name) || b[1] - a[1])
     .map(([f]) => f);
 }
+
+// How many candidates a reviewer's report holds: the object elements of the
+// last top-level JSON array in it that holds any, 0 when its only arrays are
+// `[]` and no `[` that failed to parse held a `{`, null otherwise. The report is the
+// agent's last text block, the one salvage.mjs prints.
+//
+// `findings.mjs record` refuses `[]` on this count, so it has to read the
+// reports finders actually write, not the contract. Of 4,009 finished finder
+// and cold-grader reports surveyed 2026-10-24, 95.6% held a parseable array
+// under this rule but only 90.7% under "the array ends the message": the
+// difference is a valid array followed by a prose caveat, which is an honest
+// report. Most of the rest sent their findings by SendMessage and ended in
+// prose — those read null, and the guard treats null as "may hold findings".
+// An array starts at a `[` that opens a line, so a code fence around it is
+// tolerated and a bracketed word in a sentence is not mistaken for one.
+const MAX_MISSES = 64;
+
+export function reportCandidates(text) {
+  if (typeof text !== "string") return null;
+  let objects = null;
+  let empty = false;
+  let misses = 0;
+  let torn = false;
+  const opens = /^[ \t]*\[/gm;
+  for (let match; (match = opens.exec(text)); ) {
+    const at = match.index + match[0].length - 1;
+    const end = closingBracket(text, at);
+    // Each `[` that yields no array rescans up to its close, or to the end of
+    // the text when it never closes; past a few, the report is not one a
+    // finder wrote, and what was found so far stands.
+    let value;
+    try { value = end < 0 ? undefined : JSON.parse(text.slice(at, end + 1)); } catch { /* counted below */ }
+    if (!Array.isArray(value)) {
+      // One that failed with an object in it may be the report itself, so a
+      // later `[]` cannot speak for it.
+      if (text.slice(at, end < 0 ? undefined : end + 1).includes("{")) torn = true;
+      if (++misses > MAX_MISSES) break;
+      continue;
+    }
+    // Top-level: an array nested in the one just parsed is not the report.
+    opens.lastIndex = end + 1;
+    const count = value.filter((e) => e !== null && typeof e === "object" && !Array.isArray(e)).length;
+    if (count > 0) objects = count;
+    else if (value.length === 0) empty = true;
+  }
+  // A later array without a candidate in it — a `[1]` footnote, a trailing
+  // `[]` — never lowers the count: the guard reading it refuses on doubt.
+  return objects ?? (empty && !torn ? 0 : null);
+}
+
+// The index of the bracket that closes the one at `at`, skipping brackets
+// inside JSON strings; -1 when it never closes.
+function closingBracket(text, at) {
+  let depth = 0;
+  let inString = false;
+  for (let i = at; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === "[" || c === "{") depth++;
+    else if ((c === "]" || c === "}") && --depth === 0) return i;
+  }
+  return -1;
+}

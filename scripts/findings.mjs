@@ -625,7 +625,10 @@ export function nextAction(result, counts, { work = null, tier = null, scripts =
   const identity = `--work ${shellWord(dir)}`;
   const script = (name) => shellWord(path.join(scripts, name));
   const nextRound = [script("round.sh"), "--work", shellWord(dir), "--round", round + 1, "--intent", shellWord(path.join(dir, "intent.md"))].join(" ");
-  const marker = (outcome) => [script("converged.sh"), outcome, "--rounds", counts.rounds, "--fixed", counts.fixed,
+  // A not-converged marker must say why (lib/marker.mjs NC_REASONS); the
+  // verdict already knows, so the printed call carries it and the lead never
+  // has to pick one at the two commonest exits.
+  const marker = (outcome, reason) => [script("converged.sh"), outcome, ...(reason ? ["--reason", reason] : []), "--rounds", counts.rounds, "--fixed", counts.fixed,
     "--dismissed", counts.dismissed, "--open", counts.open, "--tier", tier === null || tier === undefined ? "<S|M|L>" : shellWord(tier), "--intent", "<validated|author|skipped>"].join(" ");
   if (verdict === "UNRECORDED") {
     return `next: ${script("findings.mjs")} record ${identity} --round ${round} --in <findings.json>\n`
@@ -635,18 +638,18 @@ export function nextAction(result, counts, { work = null, tier = null, scripts =
   const unfixed = result.unfixed ?? [];
   const leaves = `round ${round} leaves ${unfixed.length} CONFIRMED finding(s) unfixed [${unfixed.join(", ")}]`;
   if (verdict === "ESCALATE" && unfixed.length) {
-    return `next: ${marker("--not-converged")}\n  ${leaves}: put each to the user with your recommendation.\n`
+    return `next: ${marker("--not-converged", "open-blocker")}\n  ${leaves}: put each to the user with your recommendation.\n`
       + `  If they rule on a fix, apply it, then: ${script("findings.mjs")} record ${identity} --round ${round} with prior_id <id> on the fixed row, and run ${nextRound}.\n`
       + "  A defect they accept as-is is not a convergence: the marker above is the end.";
   }
   if (result.earned) return `next: ${nextRound} --force S --reason "extension round: round ${round} fixed a ${result.tail}"`;
   if (verdict === "STOP") {
-    return `next: ${marker("--not-converged")}\n  round ${round}'s fixes ship unreviewed: list them in the report. `
+    return `next: ${marker("--not-converged", unfixed.length ? "open-blocker" : "rounds-cap")}\n  round ${round}'s fixes ship unreviewed: list them in the report. `
       + "This is the correct end of a capped review; a new review to turn it into converged is not."
       + (unfixed.length ? `\n  ${leaves}: list them in the report.` : "");
   }
   if (verdict === "ESCALATE") {
-    return `next: ${marker("--not-converged")}\n  put the stall to the user; if they say continue, run ${nextRound} as usual.`;
+    return `next: ${marker("--not-converged", "stall")}\n  put the stall to the user; if they say continue, run ${nextRound} as usual.`;
   }
   return `next: ${nextRound}`;
 }
@@ -701,7 +704,8 @@ const FLAGS = {
 // this file for the schema it could have printed.
 const USAGE = {
   record: "findings.mjs record --work <dir> [--round N] [--in <file|->] [--log-dir <dir>]\n"
-    + "  this round's verdicts, a JSON array or one object per line, on stdin or --in; `[]` records a round with nothing to record, and is refused (exit 3) while the round's state/*.jsonl files hold candidates;\n"
+    + "  this round's verdicts, a JSON array or one object per line, on stdin or --in; `[]` records a round with nothing to record, and is refused (exit 3) while the round's state/*.jsonl files or its finished reviewers' reports (reports/*.json, written by wait.mjs) hold candidates, or a report does not parse (SendMessage that finder to restate it as the JSON array, then rerun wait.mjs);\n"
+    + "  empty or whitespace-only input (a forgotten --in) is refused (exit 3) — it is no input, not an empty round;\n"
     + "  then prints the round's verdict and `next:`, the call that acts on it",
   prior: "findings.mjs prior --scope <scope.diff> --work <dir> [--out prior.md] [--max N] [--log-dir <dir>]\n"
     + "  the past findings that touch this change, one line each, for brief.mjs --prior",
@@ -758,7 +762,11 @@ function objectLines(text) {
   return count;
 }
 function filedCandidates(work, round) {
-  const dir = path.join(work, `round-${round}`, "state");
+  const roundDir = path.join(work, `round-${round}`);
+  return [...stateCandidates(path.join(roundDir, "state")), ...reportedCandidates(path.join(roundDir, "reports"))];
+}
+
+function stateCandidates(dir) {
   let names;
   try {
     names = readdirSync(dir);
@@ -767,8 +775,35 @@ function filedCandidates(work, round) {
     throw fail(`cannot list the round's state dir ${dir} (${error.message})`);
   }
   return names.filter((name) => name.endsWith(".jsonl") && !name.startsWith("self-review-verifier-"))
-    .map((name) => ({ name, count: objectLines(read(path.join(dir, name), "a reviewer's state file")) }))
-    .filter(({ count }) => count > 0);
+    .map((name) => ({ file: path.join(dir, name), count: objectLines(read(path.join(dir, name), "a reviewer's state file")) }))
+    .filter(({ count }) => count > 0)
+    .map(({ file, count }) => ({ file, says: `${count} filed` }));
+}
+
+// The finished finders' and cold-graders' reports as wait.mjs last counted them
+// (`round-N/reports/<name>.json`): the state files are optional, the report is
+// not, and a quarter of the rounds with findings had filed none. A report that
+// did not parse — or a count file that does not — refuses too: it may hold
+// findings, and there is no bypass, so the way past it is a report that parses.
+// No reports dir means wait.mjs never ran, and the state files are all there is.
+function reportedCandidates(dir) {
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw fail(`cannot list the round's reports dir ${dir} (${error.message})`);
+  }
+  return names.filter((name) => name.endsWith(".json")).flatMap((name) => {
+    const file = path.join(dir, name);
+    let report = null;
+    try { report = JSON.parse(read(file, "a reviewer's report count")); } catch (error) { if (error.exitCode) throw error; }
+    const candidates = report?.candidates;
+    if (Number.isInteger(candidates) && candidates === 0) return [];
+    const salvage = typeof report?.transcript === "string" && typeof report?.name === "string"
+      ? `"\${CLAUDE_PLUGIN_ROOT}/scripts/salvage.mjs" "${path.dirname(report.transcript)}" ${report.name}` : null;
+    return [{ file, says: Number.isInteger(candidates) && candidates > 0 ? `${candidates} in its report` : "report unparsed", salvage }];
+  });
 }
 
 /**
@@ -868,6 +903,13 @@ export function main(argv, { log = console.log, stdin } = {}) {
   if (command === "record") {
     const source = options.in ?? "-";
     const text = source === "-" ? (stdin ?? readFileSync(0, "utf8")) : read(path.resolve(source), "the findings");
+    // No input is not an empty round. A forgotten --in reads the Bash tool's
+    // empty stdin, and recording that wrote the receipt converge calls CLEAN —
+    // over a round with seven findings. Nothing to record is said with `[]`.
+    if (!text.trim()) {
+      throw fail(`refusing to record: ${source === "-" ? "stdin" : source} held no input — pass the round's verdicts on stdin or with --in <file>, `
+        + "or `[]` when the round had nothing to record. This call wrote no receipt.");
+    }
     let entries;
     try {
       entries = toRecords(text);
@@ -887,8 +929,13 @@ export function main(argv, { log = console.log, stdin } = {}) {
     if (entries.length === 0) {
       const filed = filedCandidates(options.work, round);
       if (filed.length) {
-        throw fail(`refusing to record round ${round} as empty: its reviewers filed candidates in ${path.join(options.work, `round-${round}`, "state")} — `
-          + `${filed.map(({ name, count }) => `${name} (${count})`).join(", ")}. Every candidate ends as a row (fixed, dismissed with proof, open or unfixed); a merge still leaves one.`);
+        const unparsed = filed.filter(({ says }) => says === "report unparsed");
+        throw fail(`refusing to record round ${round} as empty: its reviewers found candidates — `
+          + `${filed.map(({ file, says }) => `${file} (${says})`).join(", ")}. Every candidate ends as a row (fixed, dismissed with proof, open or unfixed); a merge still leaves one.`
+          + (unparsed.length
+            ? ` A report that does not parse counts as findings: read it (${unparsed.map(({ salvage, file }) => salvage ?? file).join("; ")}); if it truly found nothing, `
+              + "SendMessage that finder to restate its report as the JSON array ending its message, and once its reply has landed (salvage prints the array) run wait.mjs again with that finder's name alone, which rewrites the count (the same names are refused once the round's wait has spent its budget)."
+            : ""));
       }
     }
     const result = recordFindings(entries, { review, round, rawRound: options.round, repoRoot, logDir });

@@ -124,7 +124,7 @@ import { CONVERGED_SCRIPT, LOG_DIR, branchDebtFor, loadConfig, pluginVersion, sk
 import { baselines, branchOf, riskPathTest, setDeadline, commitOf, mainCovered, mainOf, pruneReviewed, reviewSnapshot, reviewedRefs, smallestDebt, topOf, treeOf, worktreeTree, writeReviewed } from "./lib/branch-debt.mjs";
 import { appendMonthly } from "./lib/monthly-log.mjs";
 import { globToRegExp } from "../scripts/lib/paths.mjs";
-import { NA_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
+import { NA_REASONS, NC_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
 import { agentStatus, findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
@@ -1768,10 +1768,10 @@ function unreviewedReason(state, changes, lastChangeAt, cwd, { hasOrchestrator, 
     // otherwise told to launch a finder before it read the honest end, and a
     // review run to turn a capped one into `converged` is the cost the cap
     // exists to bound.
-    "If converge said STOP, the budget is spent and the honest marker is `--not-converged` with your counts — not another finder.",
+    "If converge said STOP, the budget is spent and the honest marker is `--not-converged` with the reason converge's `next:` line prints (`rounds-cap`, or `open-blocker` when a CONFIRMED is left unfixed) with your counts — not another finder.",
     middle,
     `${action} ${MARKER_BODY}`,
-    `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts. If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
+    `If the review ran but did not finish, that is a different and honest claim: mark it --not-converged with your real counts and --reason (${NC_REASONS.join(", ")}). If the loop genuinely does not apply, name that instead: ${NA_BODY}. Reasons: ${NA_REASONS.join(", ")} (note required for "other").`,
   ].join("\n");
 }
 

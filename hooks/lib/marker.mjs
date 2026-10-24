@@ -28,8 +28,17 @@
  *                                 REFUSED for not-applicable — there were no
  *                                 rounds, and `rounds=0` is what made the
  *                                 hatch invisible in the first place
- *   reason    no-code-changed | user-declined | scratch-only | other
- *                                 required for not-applicable, refused otherwise
+ *   reason    not-applicable: no-code-changed | user-declined | scratch-only | other
+ *             not-converged:  rounds-cap | stall | oscillation | open-blocker |
+ *                             reviewer-failed | budget | user-stopped |
+ *                             single-pass | other
+ *                                 required for both, refused on converged. One
+ *                                 field whose vocabulary depends on the outcome.
+ *                                 Required on not-converged for the reason
+ *                                 `intent` is: 132 not-converged rows were
+ *                                 written before it existed and not one says
+ *                                 why, and an optional field would keep
+ *                                 "forgot" and "nobody knows" the same row
  *   note      free text; the only free text there is, mandatory for `other`
  *   tier           optional, S | M | L
  *   forced/computed optional, S | M | L, written together when the loop took a
@@ -58,6 +67,13 @@
 
 export const OUTCOMES = ["converged", "not-converged", "not-applicable"];
 export const NA_REASONS = ["no-code-changed", "user-declined", "scratch-only", "other"];
+// Why a review stopped short. `rounds-cap` and `budget` split on who stopped
+// the loop — converge's round count, or the session running out around it.
+// `other` is the way out a closed list needs to stay answerable, and its rate
+// is the signal that the list is wrong, which /self-review:retro reports.
+export const NC_REASONS = ["rounds-cap", "stall", "oscillation", "open-blocker", "reviewer-failed", "budget", "user-stopped", "single-pass", "other"];
+/** The reason vocabulary an outcome takes, or null when it takes none. */
+export const reasonsFor = (outcome) => (outcome === "not-applicable" ? NA_REASONS : outcome === "not-converged" ? NC_REASONS : null);
 export const COUNTS = ["rounds", "fixed", "dismissed", "open"];
 export const TIERS = ["S", "M", "L"];
 // `forced`/`computed` are here because SKILL.md tells the loop to record an
@@ -159,13 +175,14 @@ export function validateMarker(fields = {}) {
     problems.push(`rounds=0 is not a review — a turn the loop did not fit is outcome=not-applicable (${list(NA_REASONS)}).`);
   }
 
-  if (outcome === "not-applicable" && !has("reason")) {
-    problems.push(`reason is required for outcome=not-applicable (${list(NA_REASONS)}).`);
+  const reasons = reasonsFor(outcome);
+  if (reasons && !has("reason")) {
+    problems.push(`reason is required for outcome=${outcome} (${list(reasons)}).`);
   }
   if (has("reason")) {
-    if (isCounted(outcome)) problems.push(`reason only applies to outcome=not-applicable.`);
-    else if (!NA_REASONS.includes(fields.reason)) problems.push(`reason "${fields.reason}" is not one of ${list(NA_REASONS)}.`);
-    else record.reason = fields.reason;
+    if (outcome === "converged") problems.push(`reason only applies to outcome=not-converged or not-applicable.`);
+    else if (reasons && !reasons.includes(fields.reason)) problems.push(`reason "${fields.reason}" is not one of ${list(reasons)} (the reasons for outcome=${outcome}).`);
+    else if (reasons) record.reason = fields.reason;
   }
   if (record.reason === "other" && !has("note")) problems.push(`note is required when reason=other — say what the case was.`);
 

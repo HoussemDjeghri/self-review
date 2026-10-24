@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions and ideas
+    url: https://github.com/HoussemDjeghri/self-review/discussions
+    about: How do I…, is this expected, would it make sense to… — ask in Discussions
+  - name: 📖 README
+    url: https://github.com/HoussemDjeghri/self-review#readme
+    about: Install, configuration, and what the gate and the loop do

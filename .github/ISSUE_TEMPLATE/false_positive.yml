@@ -1,0 +1,50 @@
+name: 🎯 False positive
+description: The review blocked, flagged or escalated something it shouldn't have
+labels: ["false positive"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are the most useful ones: they are how the reviewers get sharper.
+
+        **Report the class, not the code.** This repository is public. Don't paste someone else's code, and don't paste a finding against a codebase that isn't yours to disclose — "a reviewer flagged an unchecked return in a shell script that is checked two lines later" says everything needed.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What went wrong
+      options:
+        - A reviewer's finding was wrong
+        - The gate blocked a turn that needed no review
+        - The tier was too high (S/M/L) for the change
+        - The loop kept going after it should have converged
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: finding
+    attributes:
+      label: What it said
+      description: The finding, gate message or tier line, as shown. Redact paths and names you'd rather not publish.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it's wrong
+      description: The evidence a verifier should have found — what the code actually does, or why the change didn't need review.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: The change, described
+      description: Language, size, what kind of edit. Shape, not source.
+      placeholder: A 3-line edit to a 30-line static HTML file
+  - type: input
+    id: plugin_version
+    attributes:
+      label: self-review version
+      placeholder: "x.y.z — shown next to self-review in /plugin"
+    validations:
+      required: true

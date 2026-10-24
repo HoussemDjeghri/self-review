@@ -26,6 +26,12 @@
  * self-review round. A TaskOutput with block=true (the schema's default)
  * is a real single-call wait and is never counted; block=false is a poll.
  *
+ * Never inside a subagent (a payload with agent_id). Measured on Claude Code
+ * 2.1.310, 2026-10-24: a subagent's PreToolUse payload carries the LEAD's
+ * transcript_path, so counting there would charge the lead's checks to it; and
+ * a teammate's ToolSearch found no TaskOutput tool to call (probe 5). What
+ * keeps a subagent from waiting wrongly is idle-guard.mjs.
+ *
  * Fails open (silent exit 0) on anything unexpected; POLL_GUARD=off disables.
  */
 import { runHook } from "./lib/hook.mjs";
@@ -77,5 +83,6 @@ function evaluate(entries, toolName, toolInput) {
 
 runHook("POLL_GUARD", "poll-guard", (payload) => {
   if (typeof payload.transcript_path !== "string" || typeof payload.tool_name !== "string") return null;
+  if (typeof payload.agent_id === "string" && payload.agent_id !== "") return null; // a subagent: see the header
   return evaluate(readMainChain(payload.transcript_path), payload.tool_name, payload.tool_input ?? {});
 });

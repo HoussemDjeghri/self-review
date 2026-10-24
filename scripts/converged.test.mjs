@@ -236,7 +236,7 @@ test("a --work the record cannot be written to prints no token", () => {
 });
 
 test("--work writes the record for the other two outcomes too, and an escape hatch carries no review id", () => {
-  for (const args of [["--not-converged", "--rounds", "2", "--fixed", "1", "--dismissed", "0", "--open", "1", "--intent", "author"], ["--not-applicable", "scratch-only"]]) {
+  for (const args of [["--not-converged", "--reason", "stall", "--rounds", "2", "--fixed", "1", "--dismissed", "0", "--open", "1", "--intent", "author"], ["--not-applicable", "scratch-only"]]) {
     const work = reviewDir();
     const result = run([...args, "--work", work], freshLogDir());
     assert.equal(result.status, 0, result.stderr);

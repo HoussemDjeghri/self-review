@@ -119,3 +119,10 @@ test("a missing config/defaults.json does not crash the guard: the fallback cap 
   const turn = [human("go"), ...listAgents(), ...listAgents(), said("waiting")];
   assert.ok(denied(run(turn, undefined, {}, path.join(root, "hooks/poll-guard.mjs"))));
 });
+
+test("inside a subagent the guard never denies: the payload's transcript is the lead's", () => {
+  // PreToolUse shape captured from a subagent, Claude Code 2.1.310: agent_id, and the lead's transcript_path.
+  const turn = [human("go"), ...listAgents(), ...listAgents()];
+  assert.equal(run(turn, { tool_name: "ListAgents", tool_input: {}, agent_id: "acb5256daf8c03af8", agent_type: "general-purpose" }), null);
+  assert.ok(denied(run(turn)), "the same transcript still denies the main session");
+});

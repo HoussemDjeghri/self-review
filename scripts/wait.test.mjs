@@ -633,3 +633,40 @@ test("an unwritable log dir still settles the wait and still writes wait.json", 
   assert.equal(r.code, 0, r.out);
   assert.equal(JSON.parse(readFileSync(path.join(roundDir, "wait.json"), "utf8")).ended, "settled");
 });
+
+test("every exit writes each finished finder's candidate count where record can see it", async () => {
+  const finder = "self-review-finder-r1-ab", grader = "self-review-cold-grader-r1-x", verifier = "self-review-verifier-r1-b1";
+  const { work, roundDir, subagents } = layout({ names: [finder, grader, verifier] });
+  const found = (baseMs) => [said([text("reading"), uses("Read")], "tool_use", baseMs), said([text('```json\n[{"file": "a.mjs"}, {"file": "b.mjs"}]\n```')], "end_turn", baseMs)];
+  const prose = (baseMs) => [said([text("reading"), uses("Read")], "tool_use", baseMs), said([text("Sent 2 candidates to team-lead.")], "end_turn", baseMs)];
+  const file = spawn({ subagents, name: finder, entries: found(Date.now()) });
+  spawn({ subagents, name: grader, entries: prose(Date.now()) });
+  spawn({ subagents, name: verifier, entries: report(Date.now()) });
+  const { code } = await run(["--work", work, "--round", "1", "--session", subagents, finder, grader, verifier]);
+  assert.equal(code, 0);
+  const counted = (name) => JSON.parse(readFileSync(path.join(roundDir, "reports", `${name}.json`), "utf8"));
+  assert.deepEqual(counted(finder), { name: finder, transcript: file, candidates: 2 });
+  assert.equal(counted(grader).candidates, null, "a report that does not parse is null");
+  assert.equal(existsSync(path.join(roundDir, "reports", `${verifier}.json`)), false, "a verifier's verdicts are not candidates");
+});
+
+test("a finder still working has no count yet, and exit 1 still writes the finished one's", async () => {
+  const done = "self-review-finder-r1-ab", busy = "self-review-finder-r1-cd";
+  const { work, roundDir, subagents } = layout({ names: [done, busy] });
+  spawn({ subagents, name: done, entries: report(Date.now()) });
+  spawn({ subagents, name: busy, entries: working(Date.now()), hash: "fedcba9876543210" });
+  const { code } = await run(["--work", work, "--round", "1", "--session", subagents, done, busy], { config: { callSeconds: 1, staleSeconds: 99999 } });
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(readFileSync(path.join(roundDir, "reports", `${done}.json`), "utf8")).candidates, 0);
+  assert.equal(existsSync(path.join(roundDir, "reports", `${busy}.json`)), false);
+});
+
+test("a reports dir that cannot be written keeps the exit code and says so", async () => {
+  const name = "self-review-finder-r1-ab";
+  const { work, roundDir, subagents } = layout({ names: [name] });
+  writeFileSync(path.join(roundDir, "reports"), "a file where the dir should be\n");
+  spawn({ subagents, name, entries: report(Date.now()) });
+  const { code, out } = await run(["--work", work, "--round", "1", "--session", subagents, name]);
+  assert.equal(code, 0);
+  assert.match(out, /could not write .*reports .*record will see only the state files/);
+});

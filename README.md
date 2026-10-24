@@ -4,40 +4,50 @@
 
 <h1>self-review</h1>
 
-<p><em>Claude finished the change and said "done". Nobody read it.</em></p>
-<p><strong>A Stop hook that won't let the turn end until fresh reviewers have read the diff, their findings are checked, and the loop converges — or honestly says it didn't.</strong></p>
+<p>A Claude Code plugin that won't let Claude end a turn until fresh subagents have reviewed the code it changed.</p>
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.10.2" src="https://img.shields.io/badge/version-0.10.2-191919">
+  <img alt="version 0.11.1" src="https://img.shields.io/badge/version-0.11.1-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
 
 <p>
   <a href="#install">Install</a> ·
-  <a href="#what-you-see">What you see</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#why-you-can-trust-the-result">Why trust it</a> ·
+  <a href="#what-it-looks-like">What it looks like</a> ·
+  <a href="#how-a-review-runs">How a review runs</a> ·
+  <a href="#design-choices">Design choices</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#reference">Reference</a>
 </p>
+
+<img src="https://github.com/HoussemDjeghri/self-review/releases/download/v0.10.2/self-review-demo.gif" alt="Animated loop: Claude says Done, self-review answers &quot;not so fast.&quot;, four reviewers check correctness, security, intent and docs, the loop runs until clean, and only then is it Done">
 
 </div>
 
 ---
 
-"Review your own work before you stop" is exactly the instruction a model under
-momentum skips — and re-reading a diff with the context that produced it
-re-derives the same conclusions. So self-review does what teams do: it hands the
-change to reviewers who were not there, and makes that non-optional.
+Asking Claude to review its own work before it finishes doesn't work well. When
+it's focused on wrapping up a task it often skips the step, and when it does
+re-read the diff, it reads it with the same assumptions that produced the code.
 
-| | what stops unread code from shipping |
+This plugin adds a `Stop` hook. If a turn changed code and no review has
+finished since the last edit, the hook stops the turn from ending and tells
+Claude to run the review skill. The skill hands the diff to several new
+subagents that didn't write it, checks what they report against the files,
+fixes what holds up, and then reviews the fixes. The turn can end once a round
+comes back clean, or once the loop stops making progress and reports what is
+still open.
+
+Compared with the usual ways of getting a review:
+
+| approach | if Claude doesn't review |
 |---|---|
-| A skill you remember to run | nothing — it runs when the model chooses to |
-| A "please review" line in CLAUDE.md | nothing — same instruction, same momentum |
-| A linter or CI | catches what machines catch, after the turn |
-| **self-review** | a `Stop` hook reads the transcript: code changed and no convergence marker after the last edit ⇒ **the turn is blocked** |
+| a review skill | nothing happens; the skill runs only when the model decides to |
+| "review your work" in CLAUDE.md | nothing happens; it's the same instruction |
+| linters and CI | they catch mechanical problems, after the turn is over |
+| **self-review** | the Stop hook sees changed code with no review recorded and blocks the turn |
 
 ## Install
 
@@ -46,21 +56,29 @@ change to reviewers who were not there, and makes that non-optional.
 /plugin install self-review@houssem-plugins
 ```
 
-Restart your sessions so the hooks register. That's it — the next turn that
-changes code is reviewed.
+Restart your Claude Code sessions so the hooks load. The next turn that changes
+code will be reviewed.
 
-**Requires** Claude Code 2.1.292 or later (the reviewer calls pass a per-call
-`effort`), Node ≥ 18 (CI runs 20 on Linux and macOS) and bash. No daemon, no
-service: the hooks and scripts read your transcript, your files and `git`, and
-nothing else. A shipped test (`hooks/no-network.test.mjs`) fails the build if a
-hook or script ever calls `fetch`, imports a network module, or shells out to
-`curl`. The reviewers are ordinary Claude Code subagents, so they reach the
-network exactly as your session does — `WebFetch` and `WebSearch` are in their
-tool grants for the angles that check a cited URL or a documented API.
+Turn on auto-update as well. Claude Code leaves it off for third-party
+marketplaces, so without it you won't get fixes. In `/plugin`, open the
+**Marketplaces** tab, select `houssem-plugins` and choose **Enable
+auto-update**. Updates then install in the background at startup, and Claude
+Code shows `Plugin updated: self-review · Run /reload-plugins to apply`.
 
-## What you see
+You need Claude Code 2.1.292 or later (reviewer calls set a per-call `effort`),
+Node 18 or later (CI tests Node 20 on Linux and macOS), and bash.
 
-A turn that changed code and tries to stop without a review is sent back:
+There is no daemon or service. The hooks and scripts read your transcript, your
+files and `git`, and make no network calls: `hooks/no-network.test.mjs` fails
+the build if one of them calls `fetch`, imports a network module or shells out
+to `curl`. The reviewers are ordinary Claude Code subagents with the same
+network access as your session, and some of them get `WebFetch` and
+`WebSearch` so they can check URLs and API docs that a change relies on.
+
+## What it looks like
+
+When a turn that changed code tries to stop without a review, Claude gets this
+back:
 
 ```
 [self-review-gate] Files changed this turn but the self-review loop has not
@@ -70,7 +88,7 @@ Changed: src/queue.ts, src/queue.test.ts
 Now: invoke the Skill tool with skill "self-review:self-review" …
 ```
 
-The loop runs, and the turn ends with a report like this:
+It runs the review, and the turn ends with a summary like this one:
 
 ```
 Self-review: converged in 2 rounds — 3 fixed, 1 dismissed, 1 open.
@@ -81,22 +99,23 @@ Open for you: src/queue.ts:60 — backoff cap is 30s; the API docs say 60s. Rais
 Checks: `npm test` 214 passed · `tsc --noEmit` clean
 ```
 
-A loop that does not converge ends the same way, reported as `not-converged`
-with what is still open, and hands the decision to you.
+If the loop doesn't converge, the summary says `not-converged`, lists what is
+still open, and leaves the decision to you.
 
-Everyday controls:
+Commands you'll use:
 
-| you want to… | do this |
+| to | run |
 |---|---|
-| review a doc, config or plan on demand | `/self-review <path>` |
-| write the ticket before the code, and have it checked | `/ticket` |
-| switch the gate off for one session | launch with `SELF_REVIEW_GATE=off claude` |
+| review a doc, config file or plan | `/self-review <path>` |
+| write the ticket before the code and have it checked | `/ticket` |
+| send the maintainer a report on how the plugin behaved | `/self-review:retro` (see [Sending feedback](#sending-feedback)) |
+| turn the gate off for one session | start Claude with `SELF_REVIEW_GATE=off claude` |
 | see what your reviews cost | `node <plugin>/scripts/audit.mjs` |
 
-`<plugin>` is the installed plugin directory — `${CLAUDE_PLUGIN_ROOT}` inside
+`<plugin>` is the installed plugin directory, `${CLAUDE_PLUGIN_ROOT}` inside
 Claude Code.
 
-## How it works
+## How a review runs
 
 ```
  code changed ─▶ Stop gate blocks ─▶ round: fresh finders read the diff
@@ -113,74 +132,95 @@ Claude Code.
         converged marker ─▶ the turn may end
 ```
 
-1. **The gate arms.** Any `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, or any shell
-   command that writes a file (redirects, `sed -i`, `cp`, `tee`, `git apply`, …),
-   on a non-exempt path marks the turn as changed. So does launching a
-   `self-review-applier`, the one agent type that is dispatched to edit. Scratch
-   paths never count: `/tmp`, the session scratchpad, and Claude's own state
-   directories (`~/.claude/projects`, `plans`, `todos`, `sessions`, …) — but the
-   rest of `~/.claude` does, so editing your own hooks or skills is reviewed like
-   any code.
-2. **Scope, impact and tier.** The scripts collect the diff (untracked files
-   included, outside git too), search the tree for what still references the
-   symbols it moved, and size the review. Trivial changes get one reviewer,
-   standard ones three or four, large or risky ones up to six — a hard cap at
-   every tier. Risk markers (auth, payments, migrations, destructive operations,
-   infra, contract breaks) raise the tier. The model may raise it further for
-   what line counts cannot see, and may lower it only with a recorded reason.
-3. **A round.** All finders launch at once, each from a different angle —
-   line-level correctness, removed behaviour, cross-file ripple, intent fidelity,
-   security, quality, conventions — and each with a call budget. The session
-   then waits in one bounded call (`scripts/wait.mjs`) until every reviewer has
-   reported or gone silent.
-4. **Verify, fix, repeat.** Every candidate is checked against the file before it
-   is believed. What survives is fixed by an applier agent that has no shell,
-   so it cannot undo your work with git. A round that fixed anything forces
-   another round, because a fix is a new change that can be wrong. The next
-   round gets the dismissed ledger but never the list of what was fixed, so
-   each fix has to pass as correct on its own.
-5. **Mark.** Convergence is recorded, and only then can the turn end.
+1. A turn counts as changed when Claude writes a file outside the exempt paths.
+   That includes `Write`, `Edit`, `MultiEdit` and `NotebookEdit`, shell commands
+   that write files (redirects, `sed -i`, `cp`, `tee`, `git apply` and so on),
+   and launching a `self-review-applier`, the one agent type whose job is to
+   edit. Writes to scratch locations don't count: `/tmp`, the session
+   scratchpad, and Claude's own state folders such as `~/.claude/projects`,
+   `plans`, `todos` and `sessions`. The rest of `~/.claude` does count, so
+   changes to your own hooks and skills are reviewed like any other code.
+2. Scripts collect the diff (untracked files included, and files outside git),
+   look for code that still refers to symbols the change moved or renamed, and
+   decide how big the review should be. A trivial change gets one reviewer, a
+   normal one three or four, and a large or risky one up to six. Six is the cap
+   at every size. Changes touching auth, payments, migrations, destructive
+   operations, infrastructure or public contracts get a bigger review. Claude
+   can raise the size further when line counts miss something, and can lower it
+   only by recording a reason.
+3. The reviewers, called finders, all start at once, each looking from a
+   different angle: line-level correctness, removed behaviour, effects in other
+   files, whether the change does what was asked, security, quality and project
+   conventions. Each has a limit on tool calls. The session waits for all of
+   them in one bounded call to `scripts/wait.mjs`, which returns when every
+   finder has reported or gone quiet.
+4. Each reported problem is checked against the file before anything is done
+   about it. Confirmed problems are fixed by an applier agent that has no shell,
+   so it can't run git and lose your work. If a round fixed anything, another
+   round runs, because fixes can be wrong too. The next round's finders get the
+   list of dismissed findings but not the list of fixes, so a fix has to look
+   right to someone who doesn't know it was one.
+5. When the loop ends, Claude writes a convergence marker and the turn can end.
 
-Past reviews of a repository feed the next one: every verdict is recorded, and
-the findings that touch the files you changed are handed to the next review's
-reviewers.
+Verdicts are saved per repository. When a later review touches the same files,
+the earlier findings for those files go into its finders' briefs.
 
-## Why you can trust the result
+## Design choices
 
-- **Reviewers have no author context.** They are fresh subagents briefed with
-  the intent and the diff — never a fork of the session that wrote the code. They
-  are read-only by instruction, and keep Bash only for running tests and
-  reproductions.
-- **A finding needs a concrete failure; a dismissal needs quoted proof.** "Seems
-  fine" dismisses nothing. Large or risky changes always get an independent
-  verifier; at smaller tiers the author verifies against the file, and a single
-  dismissal or more than four candidates brings in the verifier — the gate
-  refuses a converged marker that has none behind it.
-- **Convergence is an outcome, not a counter.** The loop continues only while a
-  severity-weighted score strictly drops. A plateau, an oscillation (a round
-  calling a previous fix wrong) or the round backstop stops it and hands the
-  state to you. It never reports "clean" because it ran out of rounds.
-- **It checks the code against the intent, not the intent itself.** Reviewers
-  leave alone a deliberate cut that only narrows the ask, and flag one that
-  contradicts the request or a governing document the intent cites — so a
-  correct implementation of a wrong ticket still converges. The marker's
-  `intent` field says who read the ticket *before* the code existed: `validated`
-  (a `/ticket` validator did, and the gate checked the order), `author` (only
-  you), or `skipped`. All three are honest; only
-  `validated` is checked.
-- **Prose is not code.** By default, Markdown, JSON/YAML, data and images don't
-  arm the gate — a loop that churns on a README costs tokens and changes nothing. Review them on
-  demand with `/self-review <path>`.
-- **Waiting is cheap and bounded.** One call waits for all reviewers, and it ends
-  rather than hangs when a notification never arrives. A second hook denies
-  `ListAgents` / `TaskOutput` polling after two checks, because every status
-  check re-reads the whole context to learn nothing.
+### Reviewers start fresh
+
+They are new subagents given the stated intent and the diff, never a fork of the
+session that wrote the code. They are told not to edit anything and keep Bash
+only to run tests and reproduce bugs.
+
+### Findings need evidence
+
+A finder has to describe a concrete way the code fails, and dismissing a finding
+takes a quoted line that shows it is wrong. Large or risky changes always get a
+separate verifier agent. On smaller ones Claude checks findings against the file
+itself, but if it dismisses any, or if there are more than four, a verifier is
+brought in, and the gate won't accept a `converged` marker without one.
+
+### The loop stops on a score
+
+It runs another round only while a severity-weighted score of the findings keeps
+falling. If the score stalls, if a round says an earlier fix was wrong, or if
+the round limit is reached, it stops and hands you the current state. Hitting
+the round limit is never reported as clean.
+
+### Reviews check the code against the intent
+
+If the ticket deliberately leaves something out and that only narrows what was
+asked, finders don't flag it. If it contradicts the request or a document the
+intent cites, they do. A correct implementation of a wrong ticket will still
+converge. The marker's `intent` field records who read the ticket before the
+code was written: `validated` means a `/ticket` validator did and the gate
+checked the order, `author` means only Claude did, and `skipped` means nobody
+did. Only `validated` is checked.
+
+### Docs and config don't trigger the gate
+
+By default Markdown, JSON, YAML, data files and images don't arm it, because
+running the loop on a README costs tokens and rarely finds anything. You can
+still review them with `/self-review <path>`.
+
+### Waiting happens inside one call
+
+`scripts/wait.mjs` waits for all the finders and returns even when a
+notification never arrives. A second hook, the poll guard, denies `ListAgents`
+and `TaskOutput` after two status checks, because each check makes Claude
+re-read its whole context and learn nothing new. A third, the idle guard,
+catches a subagent that tries to end its turn while a background job it started
+is still running. A subagent isn't woken when that job finishes, so the hook
+sends it back, once per job, with a bounded wait to run instead. `IDLE_GUARD=off` disables
+it.
 
 ## Configuration
 
-Defaults ship in `config/defaults.json`. Override them per user in
-`~/.claude/self-review/config.json` (or `$SELF_REVIEW_CONFIG`). Objects merge and
-arrays replace, so you can shorten an exemption list, not only extend it.
+Defaults are in `config/defaults.json`. Override them in
+`~/.claude/self-review/config.json`, or in the file `$SELF_REVIEW_CONFIG` names.
+Objects are merged and arrays are replaced, so you can shorten an exemption
+list as well as extend it.
 
 ```json
 {
@@ -194,91 +234,123 @@ arrays replace, so you can shorten an exemption list, not only extend it.
 }
 ```
 
-- **`exempt.paths`** takes absolute globs only (`/…` or `~/…`); anything else is
-  dropped with a warning on the hook's stderr (visible with `claude --debug`),
-  because a relative glob in a global file would exempt that path in every
-  repository. `*` and `?` stay inside one path segment and `**` crosses them, so
-  `~/code/app/prototypes/**` covers everything below `prototypes/` and
-  `~/code/app/prototypes/*` only its direct children. An exempt path stops the
-  gate arming and nothing else: a review whose scope includes it still reads it.
-- **`gate.maxReminders`** is the escape hatch: after that many blocks in a row the
-  gate releases the turn with a notice rather than trapping the session.
-- **Bad config fails safe.** An override of the wrong type is ignored with a
-  warning; an override file that is unreadable or not an object is ignored
-  whole. If the shipped `config/defaults.json` is itself missing or corrupt,
-  the gate gates *every* file: a broken install costs you a review, never skips
-  one.
+- `exempt.paths` only accepts absolute globs, starting with `/` or `~/`. Others
+  are dropped with a warning on the hook's stderr (visible with
+  `claude --debug`), because a relative glob in a global config would exempt
+  that path in every repository. `*` and `?` match within one path segment and
+  `**` matches across segments: `~/code/app/prototypes/**` covers everything
+  under `prototypes/`, and `~/code/app/prototypes/*` only its direct children.
+  An exempt path only keeps the gate from arming. If a review's scope includes
+  it, the finders still read it.
+- `gate.maxReminders` is the way out if the gate gets in your way: after that
+  many blocks in a row it lets the turn end and shows a notice.
+- Bad config falls back to the safe side. An override with the wrong type is
+  ignored with a warning, and an override file that can't be read or isn't a
+  JSON object is ignored entirely. If the shipped `config/defaults.json` is
+  missing or broken, the gate treats every file as code, so a broken install
+  costs you extra reviews and never skips one.
 
 <details>
-<summary><strong>A repository's own <code>.self-review.json</code> — additive only</strong></summary>
+<summary><strong>A repository's own <code>.self-review.json</code> can only add risk words</strong></summary>
 
 <br>
 
-A repository can carry `.self-review.json` at its root, merged on top of your
-config for anyone reviewing changes in it. It is **default closed and additive
-only**: the one thing a repository may contribute is extra *words* for the risk
-markers (`tier.riskPaths`, `tier.riskContent`), appended to your lists — its own
-word for "payments", never a shorter list. Every other setting is yours. The Stop
-gate loads your config alone, so a repository's file shapes a round's tier and
-never when the gate arms or what releases it. The one exception can only add
-holds: in a repository you opted into branch review, its `riskPaths` words count
-toward the tier-L path test that holds a branch.
+A repository can include `.self-review.json` at its root. It is merged over your
+config when changes in that repository are reviewed, but it can only add. The
+one thing a repository can contribute is extra words for the risk markers
+(`tier.riskPaths`, `tier.riskContent`), which are appended to your lists: its
+own word for "payments", for example, but never a shorter list. Every other
+setting stays yours. The Stop gate reads only your config, so a repository's
+file can change how big a round is but never when the gate arms or what lets a
+turn end. The one exception can only add blocks: in a repository you have
+opted into branch review, its `riskPaths` words count toward the tier-L path
+check that holds a branch.
 
-Why so narrow: a repository is reviewed by whoever clones it, so in this threat
-model the attacker is the repository. This plugin's own review loop found eight
-ways a repository could use its config to weaken its own review — hiding files
-from the scan, emptying a marker list, raising the deep-tier bar out of reach,
-cutting the finder budget. Each patch left a neighbouring door open, so the
-surface is now an allow-list: a new setting stays closed to repositories until
-someone decides it can only add work. The added words are matched as literal
-text, not regexes, because a checked-in `(a+)+$` is a way to hang the machine
-reviewing it. Your own config keeps full regexes.
+It is this narrow because anyone who clones a repository runs its review, which
+makes the repository the thing to defend against. The plugin's own review loop
+found eight ways a repository's config could weaken its own review, including
+hiding files from the scan, emptying a marker list, raising the tier-L
+threshold out of reach and cutting the finders' budget. Each fix left a similar
+hole next to it, so repository settings are now an allow-list, and a new
+setting stays closed to repositories until someone confirms it can only add
+work. The added words are matched as plain text rather than regexes, because a
+checked-in `(a+)+$` could hang the machine running the review. Regexes in your
+own config still work.
 
 </details>
 
 <details>
-<summary><strong>Branch review — review a long branch in larger pieces (opt-in, per repository)</strong></summary>
+<summary><strong>Branch review: review a long branch in bigger pieces (opt-in, per repository)</strong></summary>
 
 <br>
 
-By default every code-writing turn has to converge before it ends. Opt a
-repository in from **your** config (a repository's own file cannot):
+By default every turn that writes code has to converge before it ends. For a
+repository where you'd rather review a branch in bigger pieces, opt it in from
+your own config (a repository's file can't do this):
 
 ```json
 { "repos": { "<id>": { "branchDebt": { "maxLines": 500 }, "tier": { "riskPaths": { "protected": ["^src/core/"] } } } } }
 ```
 
-`<plugin>/scripts/branch-debt.mjs --id` prints the id (the repository's hashed
-`origin` URL, so its clones and worktrees share it); `<plugin>/scripts/branch-debt.mjs`
-prints the branch, its reviewed baseline and its debt.
+`<plugin>/scripts/branch-debt.mjs --id` prints the id, a hash of the
+repository's `origin` URL, so its clones and worktrees share it. Without
+arguments, `<plugin>/scripts/branch-debt.mjs` prints the branch, its last
+reviewed point and how much code is unreviewed.
 
-In that repository, on a branch, a code turn may end unmarked while the branch's
-unreviewed code — `git diff` from the last reviewed tree to the worktree, prose
-not counted — stays within `maxLines` and touches no tier-L path (`riskPaths`,
-including the `protected` category, which escalates any one-line edit). Past
-that the gate holds, and names the commit to review from. A converged marker
-carrying the review's `review` id records the tree its last round read as
-reviewed, in `refs/self-review-reviewed/<branch>` — refs that clone, fetch and
-push never carry.
+In an opted-in repository, on a branch, a turn that changed code can end
+without a review as long as the branch's unreviewed code stays within
+`maxLines` and touches no tier-L path. Unreviewed code is the `git diff` from
+the last reviewed tree to the worktree, prose not counted. Tier-L paths are
+your `riskPaths` entries, including the `protected` category, which makes even
+a one-line edit count. Past either limit the gate blocks and tells you which
+commit to review from. A converged marker that carries the review's `review`
+id records the tree its last round read as reviewed, in
+`refs/self-review-reviewed/<branch>`. Clone, fetch and push don't carry those
+refs.
 
-- On main nothing is deferred: a Stop on main whose committed tree no review
-  covers — an unreviewed merge, a push from elsewhere — is held.
-- Only writes inside the repository defer. A turn that also wrote elsewhere, or
-  whose subagent or shell writes the gate cannot place, is gated per turn.
-  Untracked files your `.gitignore` hides are not measured.
-- `branchDebt.main` overrides `origin/HEAD` as main. The first Stop after opting
-  in records main's tip as reviewed, so earlier history is not debt.
-- **Opt out** by deleting the `repos.<id>` entry. **Reset** the baselines by
-  deleting the refs —
-  `git for-each-ref --format='%(refname)' refs/self-review-reviewed/ | xargs -n1 git update-ref -d`
-  — and the next Stop adopts main's tip again.
+- Nothing is deferred on main. If main's committed tree isn't covered by a
+  review, for example after an unreviewed merge or a push from elsewhere, a
+  Stop on main is blocked.
+- Only writes inside the repository can be deferred. A turn that also wrote
+  somewhere else, or whose subagent or shell writes the gate can't attribute,
+  is gated as usual. Untracked files hidden by your `.gitignore` aren't
+  measured.
+- `branchDebt.main` names main when it isn't `origin/HEAD`. The first Stop
+  after opting in records main's tip as reviewed, so older history doesn't
+  count as debt.
+- To opt out, delete the `repos.<id>` entry. To reset the baselines, delete the
+  refs with
+  `git for-each-ref --format='%(refname)' refs/self-review-reviewed/ | xargs -n1 git update-ref -d`.
+  The next Stop takes main's tip again.
 
-Known limit, the same class as `SELF_REVIEW_GATE=off`: a repository's checked-in
-`.claude/settings.json` can set `env`, so it can point `SELF_REVIEW_CONFIG` at a
-file that opts it in. The gate strips `GIT_*` variables from its own git calls
-for the same reason, so that hole is not also a forged-refs hole.
+A known gap, like `SELF_REVIEW_GATE=off`: a repository's checked-in
+`.claude/settings.json` can set `env`, so it could point `SELF_REVIEW_CONFIG`
+at a file that opts the repository in. The gate removes `GIT_*` variables from
+its own git calls for the same reason, so the gap can't also be used to forge
+the review refs.
 
 </details>
+
+## Sending feedback
+
+`/self-review:retro [days]` drafts a field report on how the plugin behaved in
+your sessions. It is about the plugin, never your code, and it runs only when
+you type it.
+
+It reads the plugin's logs in `~/.claude/self-review/` and up to 8 short
+excerpts from your transcripts in `~/.claude/projects/`. A local script scans
+the transcripts to count events, learn your project names and pick the
+excerpts. Only the picked excerpts and the counts reach the model, which reads
+them in your session like any other file. The excerpts are copied unredacted to
+a private temp folder whose path the command prints; delete it when you're
+done.
+
+The draft goes to `~/.claude/self-review/retro/<date>.md`. The command checks it
+for your paths, project names, session ids, email addresses and token-like
+strings, then stops. Nothing is sent. If you want to share it, edit it and paste
+it into the **Field report** issue form yourself. The check only knows the names
+that appear in your logs, so a client's name that appears nowhere else will
+only be caught by you reading the draft.
 
 ## Reference
 
@@ -287,63 +359,64 @@ for the same reason, so that hole is not also a forged-refs hole.
 
 <br>
 
-The gate accepts either of two forms, written after the last change, in a
-message of its own. The file form is the default — a scratch write needs no
-permission rule, so it works on any machine and under any permission mode:
+The gate accepts a marker in either of two forms, written after the last change
+in a message of its own. The file form is the default, because writing to
+scratch needs no permission rule and so works on any machine and in any
+permission mode:
 
 ```
 Write <scratchpad>/self-review/CONVERGED.json   {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "intent": "author"}
 ```
 
-It counts only under a scratch path — a `CONVERGED.json` committed in your
-project is not a marker. The script form is for humans and for work dirs outside
-scratch:
+It only counts under a scratch path, so a `CONVERGED.json` committed to your
+project isn't a marker. The script form is for people, and for review folders
+outside scratch:
 
 ```
 <plugin>/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 1 --tier M --intent author
 ```
 
-`<plugin>` is the installed plugin directory (`${CLAUDE_PLUGIN_ROOT}` when Claude
-Code expands it). The gate matches the script's *output*, so quoting or
-`cat`-ing it never counts, and the command has to resolve to this plugin's own
-copy.
+The gate matches the script's output, so quoting the command or `cat`-ing it
+doesn't count, and the command has to resolve to this plugin's own copy.
 
-The record is typed, and both forms refuse anything that is not:
+Both forms reject a record that doesn't fit its types:
 
-- `outcome` is `converged`, `not-converged` or `not-applicable`; the counts are
-  integers.
-- `intent` (`validated`, `author` or `skipped`) is required on any outcome that
-  has counts.
-- A turn the loop does not fit is `--not-applicable <reason>` with no counts,
-  never a review reported as `rounds=0`.
-- The summary is `key=value` tokens — `outcome=` first, then the counts, then
-  `reason=` or the `tier`/`adapter`/`intent` labels (`forced=` and `computed=`
-  join them when the tier was overridden) — so `scripts/audit.mjs` can count
-  reviews by tier and adapter instead of parsing prose. A `note` is the one
-  free-text field and never enters the summary.
+- `outcome` is `converged`, `not-converged` or `not-applicable`, and the counts
+  are integers.
+- `intent` (`validated`, `author` or `skipped`) is required whenever there are
+  counts.
+- A turn the loop doesn't apply to is marked `--not-applicable <reason>` with no
+  counts. It is never reported as a review with `rounds=0`.
+- The summary is a list of `key=value` tokens: `outcome=` first, then the
+  counts, then `reason=`, then the `tier`, `adapter` and `intent` labels, with
+  `forced=` and `computed=` added when the tier was overridden.
+  `--not-converged` requires `--reason`, which goes after the counts. A
+  not-applicable marker has no counts, so its `reason=` follows `outcome=`.
+  This lets `scripts/audit.mjs` count reviews by tier and adapter without
+  parsing prose. The free-text `note` field never goes into the summary.
 
-Either form appends a line to `~/.claude/self-review/log.jsonl`, and that log
-records `not-converged` runs as honestly as clean ones.
+Both forms add a line to `~/.claude/self-review/log.jsonl`, and `not-converged`
+runs are logged the same way as clean ones.
 
 </details>
 
 <details>
-<summary><strong>Delegating a review to another session</strong></summary>
+<summary><strong>Running a review in another session</strong></summary>
 
 <br>
 
 The loop runs in the session that changed the code. A subagent can't run it for
-its lead: the reviewers it launches never appear in the lead's transcript, so
-the lead's gate refuses the marker. To review finished work elsewhere, run
-`claude -p "/self-review <paths>"` in the repository, with the permission flags
-your headless sessions use (a `-p` session cannot answer a prompt, so a tool it
-is not allowed is denied). It is a session of its own, so its reviewers count,
-and its Stop gate checks its marker whenever its fixes change code.
+its lead: the reviewers it starts don't appear in the lead's transcript, so the
+lead's gate rejects the marker. To review finished work elsewhere, run
+`claude -p "/self-review <paths>"` in the repository with the permission flags
+you give headless sessions. A `-p` session can't answer prompts, so any tool it
+isn't allowed is denied. It is a separate session, so its reviewers count, and
+its own Stop gate checks its marker if its fixes changed code.
 
 </details>
 
 <details>
-<summary><strong>Uninstalling, and what stays behind</strong></summary>
+<summary><strong>Uninstalling</strong></summary>
 
 <br>
 
@@ -354,47 +427,46 @@ until you delete them:
 - the gate's decision log, `~/.claude/self-review/gate/` (one file a month,
   pruned after six)
 - your config, `~/.claude/self-review/config.json`
-- the `refs/self-review-reviewed/*` refs in any repository you opted into branch
-  review
+- the `refs/self-review-reviewed/*` refs in any repository you opted into
+  branch review
 
-`SELF_REVIEW_GATE=off` turns the gate off for a session without uninstalling.
+To turn the gate off for one session without uninstalling, use
+`SELF_REVIEW_GATE=off`.
 
 </details>
 
 <details>
-<summary><strong>What ships today, and what doesn't</strong></summary>
+<summary><strong>What ships today and what doesn't</strong></summary>
 
 <br>
 
-**Shipping:** the gate, the poll guard, the skill and its reviewer agents, the
-scope, salvage and wait scripts, the cost cutters (`brief.mjs` builds a round's
-briefs, `preflight.sh` runs the project's own checks first, `audit.mjs` reports
-what a review cost), the context pair (`impact.mjs` computes the blast radius,
-`tier.mjs` turns it into a tier and an angle plan), per-repository memory
-(`findings.mjs` records every verdict and feeds the matching ones into the next
-review's briefs), config with a per-repository layer, and its own test suite.
+**Shipping:** the gate, the poll guard, the idle guard, the skill and its reviewer agents, and
+the scope, salvage and wait scripts. Also the scripts that keep reviews cheap
+(`brief.mjs` writes each round's briefs, `preflight.sh` runs the project's own
+checks first, `audit.mjs` reports what a review cost), the context scripts
+(`impact.mjs` finds what a change affects, `tier.mjs` turns that into a review
+size and a plan of angles), per-repository memory (`findings.mjs` records every
+verdict and passes the relevant ones to the next review), config with a
+per-repository layer, and the plugin's own test suite.
 
-**Not yet:** the eval corpus and runner, and the measured numbers that come from
-them.
+**Not yet:** the eval corpus and runner, and the measured results that will
+come from them.
 
-**On `code-review-graph`:** the impact script uses it only when the repository
+**`code-review-graph`:** the impact script uses it only when the repository
 already has a `.code-review-graph/` index and the binary is on your `PATH`. It
-never builds one for you, and its authors' own caveat applies: on small
-repositories and single-file diffs the graph costs more than it returns. The
-name search underneath always runs, so there is no language support to fall
-outside of.
+never builds an index for you. Its authors point out that on small repositories
+and single-file diffs the graph costs more than it returns. A plain name search
+always runs underneath, so every language is covered.
 
-**On cost numbers:** the loop is budgeted — reviewer models and effort are
-pinned, every agent has a call budget, and the session waits inside one bounded
-call instead of polling. `scripts/audit.mjs` measures each review from the
-transcripts, including how much the angles of one round overlapped. The numbers
-stay out of this README until they come from more than one machine's sessions,
-because one session's figures published as typical would be exactly the kind of
-unverified claim this plugin exists to catch. Run it on your own sessions:
-`node <plugin>/scripts/audit.mjs`.
+**Cost:** reviewer models and effort levels are pinned, every agent has a
+tool-call limit, and the session waits in one bounded call instead of polling.
+`scripts/audit.mjs` measures each review from the transcripts, including how
+much the finders in a round overlapped. This README has no cost figures yet,
+because so far they come from one machine, and publishing them as typical would
+be an unchecked claim. Run `node <plugin>/scripts/audit.mjs` to see your own.
 
 </details>
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

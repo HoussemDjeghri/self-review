@@ -1,0 +1,40 @@
+name: 📋 Field report
+description: What the plugin did across weeks of your own sessions — drafted by /self-review:retro, read and edited by you
+title: "Field report: "
+labels: [field report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `/self-review:retro` in Claude Code first. It drafts this report on your machine from your own logs, checks it for paths and project names, and stops. Nothing is sent until you paste it here.
+
+        **Read the draft before you paste it.** The check catches the directories in your logs, absolute paths, session ids, emails and token shapes. It cannot catch a third-party name that appears in none of those. This repository is public, and your read is the guarantee.
+  - type: input
+    id: plugin_version
+    attributes:
+      label: self-review version
+      placeholder: "x.y.z — the header of the draft, or next to self-review in /plugin"
+    validations:
+      required: true
+  - type: textarea
+    id: signals
+    attributes:
+      label: Signals
+      description: The table from the draft's Signals section, exactly as the script printed it. Counts and fixed labels only.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: The rest of the draft — header, what worked, the weaknesses, and your own answers.
+    validations:
+      required: true
+  - type: checkboxes
+    id: read
+    attributes:
+      label: Before you file
+      options:
+        - label: I read this and it contains no code or names that aren't mine to publish
+          required: true

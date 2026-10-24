@@ -445,7 +445,13 @@ function agentsOf(sessionJsonl) {
 // review, so it is not a marker and the window stays open.
 const summaryOfFields = (fields) => {
   const { record } = validateMarker(fields);
-  return record ? formatSummary(record) : null;
+  if (record) return formatSummary(record);
+  if (fields.outcome !== "not-converged" || fields.reason) return null;
+  // Markers from before the reason field existed: the gate is strict, the audit reads history.
+  const { record: legacy } = validateMarker({ ...fields, reason: "other", note: "legacy" });
+  if (!legacy) return null;
+  const { reason, note, ...rest } = legacy;
+  return formatSummary(rest);
 };
 
 // A marker file's parsed body as a summary: the legacy `{"summary": "…"}` as

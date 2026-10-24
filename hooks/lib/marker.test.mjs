@@ -5,7 +5,16 @@
 // `rounds=0` non-review that used to read as a converged one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatSummary, validateMarker, fieldsFromFlags, INTENT_STATES } from "./marker.mjs";
+import { readFileSync } from "node:fs";
+import { formatSummary, validateMarker, fieldsFromFlags, INTENT_STATES, NC_REASONS } from "./marker.mjs";
+
+test("every not-converged reason but `other` is mapped to an exit in the self-review skill", () => {
+  const skill = readFileSync(new URL("../../skills/self-review/SKILL.md", import.meta.url), "utf8");
+  for (const reason of NC_REASONS.filter((r) => r !== "other")) {
+    // The name, not the word: `stall` in prose is not an exit, `--reason stall` is.
+    assert.match(skill, new RegExp(`--reason\\s+${reason}(?![\\w-])|\`${reason}\``), `SKILL.md names no exit for --reason ${reason}`);
+  }
+});
 
 const ok = (fields) => {
   const { record, problems } = validateMarker(fields);
@@ -25,8 +34,8 @@ test("a counted outcome formats to key=value tokens only", () => {
 });
 
 test("not-converged is counted the same way", () => {
-  const record = ok({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, intent: "author" });
-  assert.equal(formatSummary(record), "outcome=not-converged rounds=6 fixed=4 dismissed=2 open=3 intent=author");
+  const record = ok({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, reason: "rounds-cap", intent: "author" });
+  assert.equal(formatSummary(record), "outcome=not-converged rounds=6 fixed=4 dismissed=2 open=3 reason=rounds-cap intent=author");
 });
 
 test("every count is required for a counted outcome", () => {
@@ -55,8 +64,27 @@ test("reason=other must say what the case was", () => {
   assert.equal(formatSummary(record), "outcome=not-applicable reason=other");
 });
 
-test("a reason on a counted outcome is refused", () => {
+test("a reason on converged is refused — a review that converged did not stop short", () => {
   bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, reason: "user-declined" }, /only applies to/);
+  bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0, reason: "rounds-cap" }, /only applies to/);
+});
+
+// Why a review stopped short. 132 not-converged rows predate the field and not
+// one says why, so it is required for the reason intent is: optional keeps
+// "forgot" and "nobody knows" the same row.
+test("not-converged requires a reason from its own closed set", () => {
+  const counts = { outcome: "not-converged", rounds: 2, fixed: 1, dismissed: 0, open: 1, intent: "author" };
+  bad(counts, /^reason is required for outcome=not-converged/);
+  bad({ ...counts, reason: "ran-out-of-patience" }, /is not one of .*the reasons for outcome=not-converged/);
+  // A not-applicable reason is not a not-converged one: the vocabulary follows the outcome.
+  bad({ ...counts, reason: "scratch-only" }, /is not one of/);
+  for (const reason of NC_REASONS.filter((r) => r !== "other")) assert.equal(ok({ ...counts, reason }).reason, reason);
+});
+
+test("not-converged reason=other must say what the case was, like not-applicable", () => {
+  const counts = { outcome: "not-converged", rounds: 2, fixed: 1, dismissed: 0, open: 1, intent: "author", reason: "other" };
+  bad(counts, /^note is required/);
+  assert.equal(formatSummary(ok({ ...counts, note: "the host slept" })), "outcome=not-converged rounds=2 fixed=1 dismissed=0 open=1 reason=other intent=author");
 });
 
 test("the outcome itself is checked", () => {
@@ -131,7 +159,7 @@ test("the legacy summary string is a key like any other, and refused as one", ()
 // when someone remembered to make it true.
 test("a counted outcome without intent is refused, so silence cannot pass as author-written", () => {
   bad({ outcome: "converged", rounds: 1, fixed: 0, dismissed: 0, open: 0 }, /^intent is required/);
-  bad({ outcome: "not-converged", rounds: 2, fixed: 1, dismissed: 0, open: 1 }, /^intent is required/);
+  bad({ outcome: "not-converged", rounds: 2, fixed: 1, dismissed: 0, open: 1, reason: "stall" }, /^intent is required/);
 });
 
 test("every intent state the gate can be told is accepted, and nothing else is", () => {

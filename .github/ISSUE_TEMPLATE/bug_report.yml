@@ -1,0 +1,81 @@
+name: 🐛 Bug report
+description: The gate, the loop or a script did something wrong — crashed, hung, looped, or broke your session
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If the review *ran fine* but flagged or blocked something it shouldn't have, use the **False positive** form instead.
+
+        For a pattern across many sessions rather than one incident, run `/self-review:retro` and use the **Field report** form: it drafts the report from your own logs, and you read it before anything is posted.
+
+        **Do not paste code you don't have the right to publish.** This repository is public. Describe the change by its shape ("a 40-line edit to a Bash deploy script") rather than pasting it.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched [existing issues](https://github.com/HoussemDjeghri/self-review/issues) and this isn't one of them
+          required: true
+        - label: I'm on the latest self-review (update it from the `/plugin` menu) and restarted the session afterwards
+          required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: What you saw, including any `[self-review-gate]` message.
+      placeholder: The gate kept sending the turn back after the loop wrote CONVERGED.json…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. In a git repo, ask Claude to …
+        2. The turn ends and the gate says …
+    validations:
+      required: true
+  - type: dropdown
+    id: without
+    attributes:
+      label: Does it happen with the gate off?
+      description: Launch with `SELF_REVIEW_GATE=off claude` and try again.
+      options:
+        - "No — only with the gate on"
+        - "Yes — it happens either way"
+        - "Didn't try"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The matching lines from `~/.claude/self-review/gate/` (the gate's decision log) and `~/.claude/self-review/log.jsonl`, and any hook stderr from `claude --debug`. Check them for paths or names you'd rather not publish.
+      render: shell
+  - type: input
+    id: plugin_version
+    attributes:
+      label: self-review version
+      placeholder: "x.y.z — shown next to self-review in /plugin"
+    validations:
+      required: true
+  - type: input
+    id: cc_version
+    attributes:
+      label: Claude Code version
+      description: "`claude --version`"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS, Node version, model
+      placeholder: "macOS 15, Node 20, Opus"

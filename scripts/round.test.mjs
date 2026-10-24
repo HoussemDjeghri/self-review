@@ -975,7 +975,7 @@ test("R3: at the cap, a round that fixed only a minor ends the review — the ne
   refusedAfter(done, review, 3);
   const lines = done.stdout.trim().split("\n");
   assert.match(lines[0], /^STOP — round budget of 2 is spent/);
-  assert.match(lines[1], /^next: (?:'[^']*converged\.sh'|\S*converged\.sh) --not-converged --rounds 2 --fixed 3 --dismissed 0 --open 0 --tier S /);
+  assert.match(lines[1], /^next: (?:'[^']*converged\.sh'|\S*converged\.sh) --not-converged --reason rounds-cap --rounds 2 --fixed 3 --dismissed 0 --open 0 --tier S /);
   assert.match(lines.slice(2).join("\n"), /^ {2}round 2's fixes ship unreviewed/, "and the line that says this is the honest end");
 });
 

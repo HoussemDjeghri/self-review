@@ -832,7 +832,7 @@ test("the none and stale refusals name --not-converged after STOP before they sa
   const stale = run([human("go"), ...reviewed(), ...write(`${PROJECT}/src/a.ts`), ...marker(), said("done")]);
   for (const [label, r] of [["none", none], ["stale", stale]]) {
     assert.ok(blocks(r), label);
-    const stop = r.json.reason.indexOf("If converge said STOP, the budget is spent and the honest marker is `--not-converged` with your counts — not another finder.");
+    const stop = r.json.reason.indexOf("If converge said STOP, the budget is spent and the honest marker is `--not-converged` with the reason converge's `next:` line prints (`rounds-cap`, or `open-blocker` when a CONFIRMED is left unfixed) with your counts — not another finder.");
     assert.ok(stop !== -1, `${label}: ${r.json.reason}`);
     assert.ok(stop < r.json.reason.indexOf("launch one self-review-finder"), `${label}: STOP comes first`);
   }
@@ -858,7 +858,7 @@ test("the plugin prefix is tolerated: a bare self-review-finder type qualifies",
 });
 
 test("only converged is gated — not-converged and not-applicable end the turn with no reviewer", () => {
-  for (const body of [{ outcome: "not-converged", rounds: 1, fixed: 0, dismissed: 0, open: 2, intent: "author" },
+  for (const body of [{ outcome: "not-converged", rounds: 1, fixed: 0, dismissed: 0, open: 2, reason: "rounds-cap", intent: "author" },
     { outcome: "not-applicable", reason: "user-declined" }]) {
     assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...writeMarker(body))).stdout, "", JSON.stringify(body));
   }
@@ -1170,11 +1170,11 @@ test("a marker in an EARLIER turn still clears the applier — the discharge is 
 test("an applier that never reported stays armed on its launch, and not-converged discharges it honestly", () => {
   const crashed = [human("go"), ...applier("ap1"), said("x"), human("i"), said("y"), human("ii"), said("z")];
   assert.ok(blocks(run(crashed)), "aged out of pending, but its launch still demands an answer");
-  const NOT_CONV = `${CONVERGED_Q} --not-converged --rounds 1 --fixed 0 --dismissed 0 --open 1`;
+  const NOT_CONV = `${CONVERGED_Q} --not-converged --reason open-blocker --rounds 1 --fixed 0 --dismissed 0 --open 1`;
   // The banner is the same for every outcome — the gate reads `outcome=` out of
   // it, not the headline — so a fixture that invents "SELF-REVIEW NOT
   // CONVERGED" tests a marker the script never prints.
-  const honest = run([...crashed, ...bash(NOT_CONV, "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1")]);
+  const honest = run([...crashed, ...bash(NOT_CONV, "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1 reason=open-blocker")]);
   assert.equal(honest.stdout, "", "not-converged needs no reviewer behind it, so a dead applier is not a deadlock");
 });
 
@@ -2681,8 +2681,8 @@ const ORCHESTRATOR = "self-review:self-review-orchestrator";
 // text, and the two fixtures that hold that line need to craft one.
 const orch = (id, type = ORCHESTRATOR) => launch(id, type);
 const resume = (to) => call("SendMessage", { to, message: "keep going" }, "Message sent");
-const NOT_CONVERGED = [`${CONVERGED_Q} --not-converged --rounds 1 --fixed 0 --dismissed 0 --open 1`,
-  "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1"];
+const NOT_CONVERGED = [`${CONVERGED_Q} --not-converged --reason open-blocker --rounds 1 --fixed 0 --dismissed 0 --open 1`,
+  "SELF-REVIEW CONVERGED — outcome=not-converged rounds=1 fixed=0 dismissed=0 open=1 reason=open-blocker"];
 
 test("an orchestrator that completed after the lead's last edit satisfies converged", () => {
   const r = run(turn(...write(`${PROJECT}/a.ts`), ...orch("o1"), notification("o1"), ...marker()));

@@ -647,11 +647,31 @@ test("the typed script marker is read as the record it is, not as a summary stri
 test("the typed file marker keeps its outcome, so a not-converged review is not read as clean", () => {
   const file = session([
     assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
-    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, tier: "L", intent: "author" })]),
+    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, reason: "rounds-cap", tier: "L", intent: "author" })]),
   ]);
   const [review] = audit(file).reviews;
   assert.equal(review.outcome, "not-converged");
   assert.deepEqual([review.rounds, review.fixed, review.dismissed, review.open], [6, 4, 2, 3]);
+});
+
+test("a typed not-converged marker from before the reason field is still read as not-converged", () => {
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
+    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: 6, fixed: 4, dismissed: 2, open: 3, intent: "author" })]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.outcome, "not-converged");
+  assert.deepEqual([review.rounds, review.open], [6, 3]);
+  assert.doesNotMatch(review.marker, /reason=/, "the stand-in reason must not reach the summary");
+});
+
+test("a malformed reason-less not-converged marker is still not a marker", () => {
+  const file = session([
+    assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")]),
+    assistant("2026-08-23T10:30:00Z", [fileMarkerTyped({ outcome: "not-converged", rounds: "abc", fixed: 4, dismissed: 2, open: 3, intent: "author" })]),
+  ]);
+  const [review] = audit(file).reviews;
+  assert.equal(review.markerSource, null);
 });
 
 test("a --note never reaches the summary, however it is quoted", () => {
