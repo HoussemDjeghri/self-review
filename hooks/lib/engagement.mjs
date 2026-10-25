@@ -126,8 +126,10 @@ export const OURS = /^(self-review:)?self-review-(finder|verifier|cold-grader|ap
  * No rows at all is not a finding: a round whose reviewers ran no Bash — a
  * cold-grader has no shell — exercised nothing to prove.
  */
-export function auditEngagement(text, { round = null } = {}) {
-  const rows = String(text ?? "").split("\n").filter(Boolean).flatMap((line) => {
+export function auditEngagement(log, { round = null } = {}) {
+  // Parsed rows, or the log's text: the log only grows, so its reader passes
+  // rows from lib/jsonl.mjs rather than one string of the whole file.
+  const rows = Array.isArray(log) ? log : String(log ?? "").split("\n").filter(Boolean).flatMap((line) => {
     try { return [JSON.parse(line)]; } catch { return []; }
   });
   // From the round's own marker to the NEXT marker, not to the end of the file:

@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { LOG_DIR, isMain, loadConfig, realpathOr } from "../hooks/lib/config.mjs";
 import { normaliseRemote, repoId } from "../hooks/lib/repo-id.mjs";
 import { auditEngagement, engagementFile, engagementLine, openEngagement } from "../hooks/lib/engagement.mjs";
+import { jsonlOf } from "../hooks/lib/jsonl.mjs";
 import { parseDiff } from "./lib/diff.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
 import { classifyPath } from "./lib/paths.mjs";
@@ -751,13 +752,12 @@ function receiptRounds(work) {
 // the wrong name reads "no file" and records `[]` over them. A line that does
 // not parse counts as nothing: the check refuses, so it leans towards not.
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-function objectLines(text) {
+function objectLines(file) {
   let count = 0;
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let value;
-    try { value = JSON.parse(line); } catch { continue; }
-    count += Array.isArray(value) ? value.filter(isObject).length : isObject(value) ? 1 : 0;
+  try {
+    for (const value of jsonlOf(file)) count += Array.isArray(value) ? value.filter(isObject).length : isObject(value) ? 1 : 0;
+  } catch (error) {
+    throw fail(`cannot read a reviewer's state file (${file}): ${error.message}`);
   }
   return count;
 }
@@ -775,7 +775,7 @@ function stateCandidates(dir) {
     throw fail(`cannot list the round's state dir ${dir} (${error.message})`);
   }
   return names.filter((name) => name.endsWith(".jsonl") && !name.startsWith("self-review-verifier-"))
-    .map((name) => ({ file: path.join(dir, name), count: objectLines(read(path.join(dir, name), "a reviewer's state file")) }))
+    .map((name) => ({ file: path.join(dir, name), count: objectLines(path.join(dir, name)) }))
     .filter(({ count }) => count > 0)
     .map(({ file, count }) => ({ file, says: `${count} filed` }));
 }
@@ -984,9 +984,9 @@ export function main(argv, { log = console.log, stdin } = {}) {
     log(next);
     // Did the guard that protects the author's tree actually watch this round?
     // Silence here used to be indistinguishable from "watching nothing".
-    let engagement = "";
-    try { engagement = readFileSync(engagementFile(repoRoot, logDir), "utf8"); } catch { /* no log here: auditEngagement reports the absence */ }
-    // Unconditionally, including for the empty string: a missing log is
+    let engagement = [];
+    try { engagement = [...jsonlOf(engagementFile(repoRoot, logDir))]; } catch { /* no log here: auditEngagement reports the absence */ }
+    // Unconditionally, including for an empty list: a missing log is
     // `opened: false`, which has a line of its own, and gating on truthiness
     // made that line — the one for the case SKILL.md §3 names — unreachable
     // from the only caller. An audit that goes silent when it has nothing to

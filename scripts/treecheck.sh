@@ -107,7 +107,10 @@ record_snapshot() {
   # subdirectory would copy nothing and hand git a path of its own invention.
   # On git < 2.31 --path-format is unknown, the copy is skipped, and the
   # snapshot degrades to the slow-but-correct rebuild.
-  cp "$(git -C "$root" rev-parse --path-format=absolute --git-path index 2>/dev/null)" "$idx" 2>/dev/null || true
+  # -p keeps the real index's mtime: a copy stamped now would turn git's racy
+  # entries clean and hide a same-size rewrite made in the second of the last
+  # `git add`. A copy whose time could not be kept is removed, so the rebuild runs.
+  cp -p "$(git -C "$root" rev-parse --path-format=absolute --git-path index 2>/dev/null)" "$idx" 2>/dev/null || rm -f "$idx"
   GIT_INDEX_FILE="$idx" git -C "$root" add -A || { rm -f "$idx"; return 1; }
   tree="$(GIT_INDEX_FILE="$idx" git -C "$root" write-tree)" || { rm -f "$idx"; return 1; }
   # An unborn HEAD has no parent to give, and a repository with no commits is
@@ -146,7 +149,7 @@ if [ "$changed" -eq 1 ]; then
   git -C "$root" rev-parse --verify -q "$(snapshot_ref)^{commit}" >/dev/null 2>&1 || { echo "treecheck.sh: no snapshot for round $round of this review" >&2; exit 3; }
   top="$(git -C "$root" rev-parse --show-toplevel)"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  cp "$(git -C "$root" rev-parse --path-format=absolute --git-path index 2>/dev/null)" "$tmp/index" 2>/dev/null || true
+  cp -p "$(git -C "$root" rev-parse --path-format=absolute --git-path index 2>/dev/null)" "$tmp/index" 2>/dev/null || rm -f "$tmp/index"
   GIT_INDEX_FILE="$tmp/index" git -C "$root" add -A
   now_tree="$(GIT_INDEX_FILE="$tmp/index" git -C "$root" write-tree)"
   git -C "$root" diff-tree -r -z --name-only "$(snapshot_ref)^{tree}" "$now_tree" |

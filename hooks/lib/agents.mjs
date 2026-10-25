@@ -15,6 +15,7 @@
 // SendMessage `success:true` and nothing was delivered to the lead for 2h49m,
 // while their transcripts said finished within ten minutes.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { jsonlOf } from "./jsonl.mjs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -77,9 +78,7 @@ const apiErrorOf = (last) => {
 };
 
 export function readAgent(file) {
-  const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((line) => {
-    try { return [JSON.parse(line)]; } catch { return []; } // a torn final line is expected in a killed transcript
-  });
+  const entries = [...jsonlOf(file)]; // a torn final line, expected in a killed transcript, is skipped
   // The harness records its own notices (e.g. the session-limit banner) as
   // assistant entries with zeroed usage; only entries that billed tokens are
   // the model's calls, and only their text is the agent's work.

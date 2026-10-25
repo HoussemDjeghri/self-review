@@ -7,7 +7,8 @@
 // (a report claimed while the model was still mid-message).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { constants } from "node:buffer";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { agentNameOf, agentStatus, findAgentFiles, isOwnTranscript, readAgent, reportCandidates } from "./agents.mjs";
@@ -96,6 +97,17 @@ test("readAgent reports the calls, the context, the texts and when it started", 
   assert.deepEqual(agent.texts, ["one", "two"]);
   assert.ok(agent.startedMs > 0);
   assert.match(agent.stem, /^acounts-/);
+});
+
+test("a transcript larger than any string is read either side of the gap", () => {
+  dir ??= mkdtempSync(path.join(tmpdir(), "agents-"));
+  const file = path.join(dir, "agent-ahuge-aaaaaaaaaaaaaaaa.jsonl");
+  writeFileSync(file, `${JSON.stringify(said([text("one"), uses("Read")], "tool_use"))}\n`);
+  truncateSync(file, constants.MAX_STRING_LENGTH + 1024);  // sparse: no disk
+  appendFileSync(file, `\n${JSON.stringify(said([text("two")], "end_turn"))}\n`);
+  const agent = readAgent(file);
+  assert.deepEqual(agent.texts, ["one", "two"]);
+  assert.equal(agent.endsWithReport, true);
 });
 
 test("a torn final line does not stop the rest being read", () => {

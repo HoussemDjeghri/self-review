@@ -38,6 +38,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import path from "node:path";
 import { LOG_DIR, isMain, loadConfig } from "../hooks/lib/config.mjs";
 import { agentNameOf, agentStatus, findAgentFiles, readAgent, reportCandidates, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
+import { linesOf } from "../hooks/lib/jsonl.mjs";
 import { reviewName, reviewNumber } from "./brief.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
 import { gitRoot } from "./lib/repo.mjs";
@@ -104,13 +105,16 @@ const mtimeOr = (file, fallback) => { try { return statSync(file).mtimeMs; } cat
 // An unparseable line still counts as one, because a truncated append is a line
 // the lead has to go and read.
 const stateLinesIn = (file) => {
-  let text;
-  try { text = readFileSync(file, "utf8"); } catch { return null; }
-  return text.split("\n").filter(Boolean).reduce((n, line) => {
-    let parsed;
-    try { parsed = JSON.parse(line); } catch { return n + 1; }
-    return n + (Array.isArray(parsed) ? parsed.length : 1);
-  }, 0);
+  let n = 0;
+  try {
+    for (const line of linesOf(file)) {
+      if (!line) continue;
+      let parsed;
+      try { parsed = JSON.parse(line); } catch { n += 1; continue; }
+      n += Array.isArray(parsed) ? parsed.length : 1;
+    }
+  } catch { return null; }
+  return n;
 };
 
 // The fallback session id is in the work dir's own path — the scratchpad Claude

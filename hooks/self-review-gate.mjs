@@ -116,7 +116,7 @@
  * A gate must never break the session: every failure path is a silent exit 0.
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { runHook } from "./lib/hook.mjs";
@@ -127,6 +127,7 @@ import { globToRegExp } from "../scripts/lib/paths.mjs";
 import { NA_REASONS, NC_REASONS, formatSummary, validateMarker } from "./lib/marker.mjs";
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
 import { agentStatus, findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
+import { linesOf } from "./lib/jsonl.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
@@ -1155,9 +1156,10 @@ function logFileMarker({ id, summary }, cwd) {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
     const file = path.join(LOG_DIR, "log.jsonl");
-    let logged = "";
-    try { logged = readFileSync(file, "utf8"); } catch { /* no log yet */ }
-    if (logged.includes(`"marker":"${id}"`)) return;
+    const needle = `"marker":"${id}"`;
+    let logged = false;
+    try { for (const line of linesOf(file)) if (line.includes(needle)) { logged = true; break; } } catch { /* no log yet */ }
+    if (logged) return;
     appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), cwd, summary, marker: id }) + "\n");
   } catch (err) {
     process.stderr.write(`self-review-gate: could not log convergence: ${err.message}\n`);

@@ -33,7 +33,7 @@
  * as "measure nothing, gate the turn as today" — the strict direction.
  */
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -107,7 +107,18 @@ export function worktreeTree(top) {
   const index = path.join(dir, "index");
   try {
     const real = line(git(top, ["rev-parse", "--path-format=absolute", "--git-path", "index"]));
-    if (real) { try { copyFileSync(real, index); } catch { /* rebuilt from scratch: slower, not wrong */ } }
+    // The copy keeps the real index's mtime: git trusts an entry's stat only when
+    // the entry is older than the index file, so a copy stamped now would turn
+    // every racy entry clean and hide a same-size rewrite made in the second of
+    // the last `git add`. An empty index is also correct, but 2.7-9x slower
+    // (339 vs 38 ms on 570 files, 1250 vs 467 ms on 2213, measured 2026-10-25).
+    if (real) {
+      try {
+        copyFileSync(real, index);
+        const { atime, mtime } = statSync(real);
+        utimesSync(index, atime, mtime);
+      } catch { rmSync(index, { force: true }); /* rebuilt from scratch: slower, not wrong */ }
+    }
     if (git(top, ["add", "-A"], { GIT_INDEX_FILE: index }) === null) return null;
     return line(git(top, ["write-tree"], { GIT_INDEX_FILE: index }));
   } finally {

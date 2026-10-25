@@ -66,6 +66,12 @@ test("a round in which the guard matched nothing at all is the same defect from 
   assert.match(engagementLine(audit), /matched none of the 2 subagent shell calls/);
 });
 
+test("parsed rows audit the same as the log's text", () => {
+  const entries = [round(1), agent("self-review-finder-r1-gqv", false), agent("self-review-finder-r1-ab", true)];
+  assert.deepEqual(auditEngagement(entries), auditEngagement(log(...entries)));
+  assert.deepEqual(auditEngagement([]), auditEngagement(""));
+});
+
 test("a round the guard watched says so, and one with nothing to watch says nothing", () => {
   const watched = auditEngagement(log(round(1), agent("self-review-finder-r1-ab", true), agent("general-purpose", false)));
   assert.equal(watched.blind, false);

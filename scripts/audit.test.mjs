@@ -1,7 +1,8 @@
 // Run: node --test plugin/scripts/audit.test.mjs   (or ./test.sh for everything)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, truncateSync, writeFileSync } from "node:fs";
+import { constants } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -108,6 +109,17 @@ test("a summary with no key=value tokens still reports converged with the text k
   assert.equal(parsed.outcome, "converged");
   assert.equal(parsed.rounds, null);
   assert.ok(parsed.notes.includes("reviewed"));
+});
+
+test("a session larger than any string is still audited: the review either side of the gap is found", () => {
+  // Sessions of 591-1,659 MB killed the 0.11.1 audit with ERR_STRING_TOO_LONG.
+  // Sparse, so the run of zero bytes past V8's string cap costs no disk.
+  const file = session([assistant("2026-08-23T10:01:00Z", [spawn("r1-abd")])]);
+  truncateSync(file, constants.MAX_STRING_LENGTH + 1024);
+  appendFileSync(file, `\n${JSON.stringify(assistant("2026-08-23T10:30:00Z", [bashMarker("rounds=1 fixed=2 dismissed=0 open=0 tier=M")]))}\n`);
+  const { reviews } = audit(file);
+  assert.equal(reviews.length, 1);
+  assert.equal(reviews[0].fixed, 2);
 });
 
 test("a review runs from the first reviewer spawn to the marker, with its agents attributed", () => {

@@ -29,7 +29,7 @@
  * Nothing here opens a network path; the skill prints how to submit, and the
  * user does it.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { PLUGIN_ROOT, isMain } from "../hooks/lib/config.mjs";
@@ -37,6 +37,7 @@ import { OUTCOMES, reasonsFor } from "../hooks/lib/marker.mjs";
 import { commandOf, separateHeredocs, splitSegments, words } from "../hooks/lib/shell.mjs";
 import { isHumanPrompt, textOf } from "../hooks/lib/transcript.mjs";
 import { agentNameOf } from "../hooks/lib/agents.mjs";
+import { jsonlOf } from "../hooks/lib/jsonl.mjs";
 import { walkFiles } from "../hooks/lib/tree.mjs";
 import { auditSession, parseSummary, recordsByReview, reflagOf } from "./audit.mjs";
 
@@ -53,8 +54,10 @@ const DEFAULT_RETENTION_DAYS = 30;
 // the plugin's test suite and the eval corpus write thousands of them, with
 // basenames like `repo` and `target`. The trade: a path under a temp dir is
 // still refused by the absolute-path clause, but the bare name of a project
-// that only ever lived under a temp dir is not watched.
-const TEMP_CWD = new RegExp(`^(${[tmpdir().endsWith("/") ? tmpdir() : `${tmpdir()}/`, "/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"]
+// that only ever lived under a temp dir is not watched. The eval runners keep
+// their working copies under ~/.cache, outside tmpdir so the Stop gate arms
+// in them; those sessions are scratch too.
+const TEMP_CWD = new RegExp(`^(${[tmpdir().endsWith("/") ? tmpdir() : `${tmpdir()}/`, "/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", `${HOME}/.cache/sr-eval/`, `${HOME}/.cache/sr-build/`]
   .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`);
 export const isTempCwd = (cwd) => typeof cwd === "string" && TEMP_CWD.test(cwd.endsWith("/") ? cwd : `${cwd}/`);
 // The plugin's own scripts, read from the tree rather than listed, so a new one
@@ -69,9 +72,18 @@ const AGENT_TOOLS = new Set(["Agent", "Task"]);
 // ---------- reading ----------
 
 const readJsonl = (file) => {
-  let text;
-  try { text = readFileSync(file, "utf8"); } catch { return []; }
-  return text.split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  try { return [...jsonlOf(file)].filter(Boolean); } catch { return []; }
+};
+// The first `bytes` of a file, without reading the rest: a transcript can be
+// larger than any string.
+const headOf = (file, bytes) => {
+  const fd = openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    return buffer.subarray(0, readSync(fd, buffer, 0, bytes, 0)).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
 };
 const inPeriod = (period, ts) => typeof ts === "string" && ts >= period.since && ts < period.until;
 const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
@@ -599,7 +611,7 @@ export function userCwds({ projects = DEFAULTS.projects, logDir = DEFAULTS.logDi
     // The cwd is on every entry, so the head of the file holds every one a
     // session used short of a mid-session `cd` into another project.
     let head = "";
-    try { head = readFileSync(file, "utf8").slice(0, 256 * 1024); } catch { continue; }
+    try { head = headOf(file, 256 * 1024); } catch { continue; }
     for (const m of head.matchAll(/"cwd":"((?:[^"\\]|\\.)*)"/g)) { try { cwds.add(JSON.parse(`"${m[1]}"`)); } catch { /* torn escape */ } }
   }
   return [...cwds].filter((c) => c && !isTempCwd(c));

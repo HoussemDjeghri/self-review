@@ -6,7 +6,7 @@
 // detection does not, and it turns a silent loss into a named one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -182,6 +182,24 @@ test("--changed names what differs from the round's snapshot, and says when ther
   const real = realpathSync(repo);
   assert.deepEqual(changed.stdout.split("\0").filter(Boolean).map((f) => f.replace(real, repo)), [path.join(repo, "fix.test.mjs")],
     "src.mjs was already dirty at the snapshot, so it is not new");
+});
+
+test("--changed names a same-size fix made in the second of the last git add", () => {
+  // The fix lands in the second the real index was last written, so git holds
+  // the entry racy and reads its content; a copy of the index stamped now would
+  // trust the stat instead. --record's own `git status` rewrites the index,
+  // which is why its second is pinned after the record and not before.
+  const { repo, work, git } = fixture();
+  git("config", "core.trustctime", "false");  // ctime moves with the clock; only the mtime race is under test
+  const file = path.join(repo, "src.mjs"), when = 1_700_000_000;
+  utimesSync(file, when, when);
+  git("add", "-A");
+  assert.equal(run(repo, "--work", work, "--round", "1", "--root", repo, "--record").status, 0);
+  utimesSync(path.join(repo, ".git", "index"), when, when);
+  writeFileSync(file, "export const one = 3;\n"); utimesSync(file, when, when);
+  const changed = run(repo, "--work", work, "--round", "1", "--root", repo, "--changed");
+  assert.equal(changed.status, 0, changed.stderr);
+  assert.deepEqual(changed.stdout.split("\0").filter(Boolean).map((f) => path.basename(f)), ["src.mjs"]);
 });
 
 test("--changed lists a file deleted since the snapshot", () => {

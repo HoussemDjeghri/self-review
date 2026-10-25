@@ -29,6 +29,7 @@
  * tokens, and labelled as such.
  */
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { jsonlOf } from "../hooks/lib/jsonl.mjs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isMain } from "../hooks/lib/config.mjs";
@@ -53,10 +54,7 @@ const COUNT_KEYS = COUNTS;
 const LABEL_KEYS = [...LABELS, "reason"];
 const OUTCOMES = new Set(MARKER_OUTCOMES);
 
-const readJsonl = (file) =>
-  readFileSync(file, "utf8").split("\n").filter(Boolean)
-    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
-    .filter(Boolean);
+const readJsonl = (file) => [...jsonlOf(file)].filter(Boolean);
 
 const textOf = (message) =>
   typeof message?.content === "string"

@@ -7,12 +7,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { constants } from "node:buffer";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { field, header } from "../hooks/lib/frontmatter.mjs";
-import { CONVERGE_VERDICTS, GATE_RULES, angleTokens, destructiveGit, isTempCwd, lint, outsideDeletion, periodOf, rank, watchedNames } from "./retro.mjs";
+import { CONVERGE_VERDICTS, GATE_RULES, angleTokens, destructiveGit, isTempCwd, lint, outsideDeletion, periodOf, rank, userCwds, watchedNames } from "./retro.mjs";
 
 const SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "retro.mjs");
 const HOME = homedir();
@@ -427,6 +428,16 @@ test("check: no traversal through the plugin's own paths, and the harness's enco
   assert.deepEqual(clauses("~/.claude/self-review/log.jsonl"), []);
 });
 
+test("check: a session larger than any string still gives up the cwd at its head", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "retro-cwds-"));
+  const project = path.join(root, "projects", "-Users-x-huge");
+  mkdirSync(project, { recursive: true });
+  const file = path.join(project, "s.jsonl");
+  writeFileSync(file, `${JSON.stringify({ type: "user", cwd: "/Users/x/huge-client" })}\n`);
+  truncateSync(file, constants.MAX_STRING_LENGTH + 1024);  // sparse: no disk
+  assert.deepEqual(userCwds({ projects: path.join(root, "projects"), logDir: path.join(root, "log") }), ["/Users/x/huge-client"]);
+});
+
 test("check: a path under a temp dir is refused, and the bare name of a temp-dir-only project is not watched", () => {
   assert.ok(lint("see /tmp/bigclient-app/x", { paths: [], names: [] }).some((p) => p.clause === "absolute path"));
   // The stated limit, pinned so a change to it is deliberate.
@@ -445,6 +456,8 @@ test("check: a watched name is caught inside compounds and across separators, an
 test("a temp prefix matches a directory, not a name that starts with it", () => {
   for (const cwd of ["/tmpwork/Acme", "/tmp-projects/x"]) assert.equal(isTempCwd(cwd), false, cwd);
   for (const cwd of ["/tmp/x", `${tmpdir()}/x`]) assert.equal(isTempCwd(cwd), true, cwd);
+  for (const cwd of [path.join(homedir(), ".cache", "sr-eval", "sr-eval-js-cli-x"), path.join(homedir(), ".cache", "sr-build", "sr-build-y")]) assert.equal(isTempCwd(cwd), true, cwd);
+  assert.equal(isTempCwd(path.join(homedir(), ".cache", "sr-evalish")), false);
 });
 
 test("check: a draft with no Signals block fails once a table is saved, and passes as before when none is given", () => {

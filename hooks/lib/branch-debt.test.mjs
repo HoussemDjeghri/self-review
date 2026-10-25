@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { REVIEWED_NS, branchOf, mainOf, smallestDebt, mainCovered, setDeadline, topOf, treeOf, pruneReviewed, reviewSnapshot, reviewedRefs, riskPathTest, writeReviewed } from "./branch-debt.mjs";
+import { REVIEWED_NS, branchOf, mainOf, smallestDebt, mainCovered, setDeadline, topOf, treeOf, worktreeTree, pruneReviewed, reviewSnapshot, reviewedRefs, riskPathTest, writeReviewed } from "./branch-debt.mjs";
 import { repoId } from "./repo-id.mjs";
 
 const TREECHECK = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "scripts", "treecheck.sh");
@@ -23,6 +23,19 @@ function repo(t) {
   const sha = (rev) => git(["rev-parse", rev]).stdout.trim();
   return { dir, top, git, sha };
 }
+
+test("worktreeTree: a same-size rewrite in the second of the last add is not mistaken for clean", (t) => {
+  // The file and the index share a second, so git holds the entry racy and
+  // reads its content. A copy of the index stamped now would make the stat
+  // look trustworthy, and the rewrite would vanish from the tree.
+  const { top, git } = repo(t);
+  const file = path.join(top, "a.ts"), when = 1_700_000_000;
+  writeFileSync(file, "export const a = 2;\n"); utimesSync(file, when, when);
+  git(["add", "-A"]); git(["commit", "-qm", "two"]);
+  utimesSync(path.join(top, ".git", "index"), when, when);
+  writeFileSync(file, "export const a = 3;\n"); utimesSync(file, when, when);
+  assert.notEqual(worktreeTree(top), treeOf(top, "HEAD"));
+});
 
 test("pruneReviewed: never main's ref, even with no local main; an old ref of a gone branch, yes", (t) => {
   const { top, git, sha } = repo(t);
