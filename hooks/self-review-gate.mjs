@@ -670,10 +670,17 @@ function copyWrites(ws) {
   const operands = [], targets = [];
   let unsure = false, flags = true;
   for (let i = 0; i < rest.length; i++) {
-    const w = rest[i];
-    if (/^[0-9&]*[<>]/.test(w)) { if (/^[0-9&]*(?:<|>{1,2}\|?|>&)$/.test(w)) i++; continue; } // a redirection, not an operand
+    let w = rest[i];
+    // A redirection is not an operand, but what is glued before it is: `dest>log`.
+    const cut = w.search(/[<>]/);
+    if (cut >= 0) {
+      const op = w.slice(cut).match(/^(?:<|>&|>{1,2}\|?)/)?.[0] ?? "";
+      if (w.length === cut + op.length) i++; // the operator alone: its target is the next word
+      w = w.slice(0, cut);
+      if (/^[0-9&]*$/.test(w)) continue; // `2>err`, `&>log`: an fd, no operand
+    }
     if (flags && w === "--") { flags = false; continue; }
-    if (flags && !rsync && (w === "-t" || w === "--target-directory")) { if (rest[i + 1] !== undefined) targets.push(rest[++i]); continue; }
+    if (flags && !rsync && (w === "-t" || w === "--target-directory")) { if (rest[i + 1] !== undefined) targets.push(rest[++i].split(/[<>]/)[0]); continue; }
     if (flags && !rsync && w.startsWith("--target-directory=")) { targets.push(w.slice("--target-directory=".length)); continue; }
     if (flags && w.startsWith("-")) {
       // After an operand, a flag's value may be the last word: `rsync a b --exclude x`.

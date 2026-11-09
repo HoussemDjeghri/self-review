@@ -1503,10 +1503,14 @@ test("a converged marker is refused when the session wrote, moved or removed its
     ["rsync's older spelling of it", bash(`rsync --remove-sent-files ${report} /tmp/keep/`)],
     ["a copy over it, then a copy of it", bash(`cp /tmp/forged.txt ${report}; cp ${report} /tmp/keep.txt`)],
     ["a copy into it with -t", bash(`cp -t ${work}/round-1 /tmp/forged/preflight.txt`)],
+    ["a copy into it with -t, a redirect glued to the dir", bash(`cp -t ${work}/round-1>/tmp/cp.log /tmp/forged/preflight.txt`)],
     ["rsync -t, which keeps times", bash(`rsync -t /tmp/forged.txt ${report}`)],
     ["a copy over it, its output redirected", bash(`cp /tmp/forged.txt ${report} > /tmp/cp.log`)],
     ["a write inside bash -e -c", bash(`bash -e -c "echo PASS > ${report}"`)],
     ["a copy over it, a flag after the operands", bash(`rsync -a /tmp/forged.txt ${report} --exclude x`)],
+    ["a copy over it, a redirect glued to it", bash(`cp /tmp/forged.txt ${report}>/tmp/cp.log`)],
+    ["a copy over it, its output sent with >&", bash(`cp /tmp/forged.txt ${report} >& /tmp/cp.log`)],
+    ["a copy over it, its errors sent with 2>&", bash(`cp /tmp/forged.txt ${report} 2>& /tmp/cp.log`)],
     ["a pipe after an escaped >", bash(`echo \\>| tee ${report}`)],
     ["a glob that names the review dir", bash(`rm -rf ${path.dirname(work)}/review-*`)],
     ["a glob above the round dir", bash(`rm -f ${path.dirname(work)}/review-*/round-1/preflight.txt`)],
@@ -1540,7 +1544,7 @@ test("only round.sh run as a command allocates a review dir: a command that prin
   assert.ok(blocks(r), "an echo naming round.sh is not an allocation");
   const allocatedBy = (call) => run(turn(...write(`${PROJECT}/src/a.ts`), bash(`rm -rf ${work}/round-1`),
     bash(call, `work: ${work}`), ...reviewed(), ...markIn(work)));
-  assert.equal(allocatedBy(`bash ${PLUGIN_ROOT}/scripts/round.sh --new-review --work reviews`).stdout, "", "round.sh run through bash allocates");
+  assert.equal(allocatedBy(`bash '${PLUGIN_ROOT}/scripts/round.sh' --new-review --work reviews`).stdout, "", "round.sh run through bash allocates");
   assert.equal(allocatedBy(`bash -c "cd /x && round.sh --new-review --work reviews"`).stdout, "", "so does round.sh inside bash -c");
   assert.equal(allocatedBy("round.sh --work a --round 2; round.sh --new-review --work reviews").stdout, "", "the second round.sh of a command counts");
   assert.equal(allocatedBy("timeout -k 5 600 round.sh --new-review --work reviews").stdout, "", "round.sh under timeout allocates");
