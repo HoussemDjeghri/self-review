@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -193,6 +193,33 @@ test("--work writes the record to <work>/CONVERGED.json, with the review id roun
   const record = JSON.parse(readFileSync(path.join(work, "CONVERGED.json"), "utf8"));
   assert.equal(record.outcome, "converged");
   assert.equal(record.review, id);
+});
+
+test("converged is refused while pre-flight has no verdict on a check; checks-unverified is the honest end", () => {
+  const logDir = freshLogDir();
+  const work = reviewDir();
+  mkdirSync(path.join(work, "round-1"));
+  writeFileSync(path.join(work, "round-1", "preflight.txt"),
+    "# self-review preflight\nINFRA test    pnpm test   (did not finish in 300s — no verdict on the code; re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged)\n");
+  const refused = run([...CONVERGED_ARGS, "--work", work], logDir);
+  assert.notEqual(refused.status, 0);
+  assert.doesNotMatch(refused.stdout, /SELF-REVIEW CONVERGED/);
+  assert.match(refused.stderr, /pre-flight has no verdict on test `pnpm test` \(did not finish in 300s/);
+  assert.equal(existsSync(path.join(work, "CONVERGED.json")), false);
+  const honest = run(["--not-converged", "--reason", "checks-unverified", ...CONVERGED_ARGS.slice(1), "--work", work], logDir);
+  assert.equal(honest.status, 0, honest.stderr);
+  assert.match(honest.stdout, /outcome=not-converged .*reason=checks-unverified/);
+});
+
+test("a newer pre-flight report with a real verdict clears the refusal", () => {
+  const work = reviewDir();
+  mkdirSync(path.join(work, "round-1"));
+  const old = path.join(work, "round-1", "preflight.txt");
+  writeFileSync(old, "INFRA test    pnpm test   (did not finish in 300s — no verdict on the code; re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged)\n");
+  utimesSync(old, 1_700_000_000, 1_700_000_000);
+  writeFileSync(path.join(work, "preflight-rerun.txt"), "PASS  test    pnpm test\n");
+  const result = run([...CONVERGED_ARGS, "--work", work], freshLogDir());
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test("a --review that names another review than --work is refused for every outcome, and nothing is written", () => {

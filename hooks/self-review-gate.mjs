@@ -128,6 +128,7 @@ import { NA_REASONS, NC_REASONS, formatSummary, validateMarker } from "./lib/mar
 import { deliveredText, hasToolResult, idleAgentNames, intEnv, isHumanPrompt, isInterrupt, isTaskNotification, readMainChain, textOf, toolUses } from "./lib/transcript.mjs";
 import { agentStatus, findAgentFiles, isOwnTranscript, readAgent, resolveSubagentsDir } from "./lib/agents.mjs";
 import { linesOf } from "./lib/jsonl.mjs";
+import { candidateDirs, convergedProblems } from "./lib/review-evidence.mjs";
 import { INTERPRETER_RE, SHELL_INTERPRETERS, afterPrefixes, commandOf, inlineShell, maskQuotes, separateHeredocs, splitSegments, words } from "./lib/shell.mjs";
 
 const GATE_TAG = "[self-review-gate]";
@@ -253,8 +254,8 @@ function scriptField(text, field) {
 // out must validate — this text and `validateMarker` are one contract, and the
 // version that omitted `intent` told the session to write a record the very
 // next call refused.
-const MARKER_BODY = `Write {"outcome":"converged","rounds":2,"fixed":3,"dismissed":1,"open":0,"intent":"author"} (your real counts; intent is validated, author or skipped) to <your scratchpad>/self-review/CONVERGED.json (a scratch write needs no permission rule), or run: ${MARKER_INVOCATION} --converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author`;
-const NA_BODY = `Write {"outcome":"not-applicable","reason":"user-declined"} to that same path, or run: ${MARKER_INVOCATION} --not-applicable user-declined`;
+const MARKER_BODY = `Write {"outcome":"converged","rounds":2,"fixed":3,"dismissed":1,"open":0,"intent":"author"} (your real counts; intent is validated, author or skipped) to <work>/CONVERGED.json — the work: path round.sh printed, under <your scratchpad>/self-review/ (a scratch write needs no permission rule), or run: ${MARKER_INVOCATION} --converged --rounds 2 --fixed 3 --dismissed 1 --open 0 --intent author --work <work>`;
+const NA_BODY = `Write {"outcome":"not-applicable","reason":"user-declined"} to <your scratchpad>/self-review/CONVERGED.json (or <work>/CONVERGED.json if a review started), or run: ${MARKER_INVOCATION} --not-applicable user-declined`;
 const MAX_REMINDERS = intEnv("SELF_REVIEW_GATE_MAX_REMINDERS", CONFIG.gate.maxReminders);
 const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const HOME = homedir();
@@ -525,18 +526,25 @@ function pathOperands(ws) {
 // otherwise the target paths — exact for redirects and tee, the path operands
 // for cp/mv/sed/…, and empty when an inline script computes them (unknown is
 // not scratch).
-function segmentWriteTargets(segment, ws) {
+//
+// `roles` (the evidence check's walk) reads a copier the way it runs: its
+// destination is written and its sources only read (copyWrites), and a writer
+// with a redirect writes both.
+function segmentWriteTargets(segment, ws, roles = false) {
   const masked = maskQuotes(segment);
   // Checked before the redirect: `tar xf "$a" > log` used to resolve to `log`
   // alone — a named prose target — and the extraction was never witnessed. The
   // redirect's own target goes unnamed, but the whole call is then decided by
   // the witness, which reads git status inside the repository.
   if (commandOf(ws) === "patch" || PATCH_APPLIERS.test(masked) || extractsArchive(ws)) return [];
+  const writer = COMMAND_WRITERS.has(commandOf(ws)) || ARG_WRITE_PATTERNS.some((re) => re.test(masked));
+  const operands = () => (roles && COPIERS.has(commandOf(ws)) ? copyWrites(ws).filter(pathLike) : pathOperands(ws));
   if (REDIRECT_RE.test(masked) || TEE_RE.test(masked)) {
     const after = (re) => [...masked.matchAll(re)].map((m) => wordAt(segment, m.index + m[0].length));
-    return [...after(/(?:^|[^<>&0-9])>{1,2}(?!&)\s*/g), ...after(/\btee\b(?:\s+-\w+)*\s+/g)].filter((p) => p && p !== "/dev/null");
+    const redirected = [...after(/(?:^|[^<>&0-9])>{1,2}(?!&)\s*/g), ...after(/\btee\b(?:\s+-\w+)*\s+/g)].filter((p) => p && p !== "/dev/null");
+    return roles && writer ? [...redirected, ...operands()] : redirected;
   }
-  if (COMMAND_WRITERS.has(commandOf(ws)) || ARG_WRITE_PATTERNS.some((re) => re.test(masked))) return pathOperands(ws);
+  if (writer) return operands();
   if (INTERPRETER_RE.test(commandOf(ws)) && SCRIPT_WRITE_PATTERNS.some((re) => re.test(segment))) return [];
   return null;
 }
@@ -584,7 +592,7 @@ function analyzeShell(text, dir, acc) {
       if (unknowable) acc.dirKnown = false;
       else if (target !== undefined && (target.startsWith("~") || path.isAbsolute(expandHome(target)))) acc.dirKnown = true;
     }
-    const found = segmentWriteTargets(segment, ws);
+    const found = segmentWriteTargets(segment, ws, acc.roles);
     if (found === null) { after(); continue; }
     // A relative target in an unknown directory is as unnameable as an unexpanded one.
     const opaque = found.filter((t) => UNEXPANDED.test(expandHome(t)) || (!acc.dirKnown && !path.isAbsolute(expandHome(t))));
@@ -617,9 +625,10 @@ function analyzeShell(text, dir, acc) {
 // `dirs` and `literals` are the other two witnesses for a write whose targets
 // did not resolve: every directory the command cd'd into, and every path its
 // own text names — interpreter heredoc bodies included, by their quoted strings.
-function bashWrites(command, cwd) {
-  if (typeof command !== "string") return null;
-  const acc = { writes: false, unknown: false, targets: [], dirs: [], literals: [], cwd, root: undefined, blind: null, dirKnown: true };
+// One walk of a command, heredoc bodies included, for both readers below.
+// `rootCwd` is what deletedOutside measures against; null turns it off.
+function analyzeCommand(command, cwd, rootCwd, roles = false) {
+  const acc = { roles, writes: false, unknown: false, targets: [], dirs: [], literals: [], cwd: rootCwd, root: undefined, blind: null, dirKnown: true };
   const { shell, scripts } = separateHeredocs(command);
   const dir = analyzeShell(shell, cwd, acc);
   for (const { interpreter, body } of scripts) {
@@ -627,9 +636,118 @@ function bashWrites(command, cwd) {
     for (const m of body.matchAll(QUOTED_RE)) addLiteral(acc, m[2], dir);
     if (SCRIPT_WRITE_PATTERNS.some((re) => re.test(body))) { acc.writes = true; acc.unknown = true; }
   }
+  return acc;
+}
+
+function bashWrites(command, cwd) {
+  if (typeof command !== "string") return null;
+  const acc = analyzeCommand(command, cwd, cwd);
   if (!acc.writes) return null;
   const named = [...new Set(acc.targets)];
   return { named, gated: named.filter((p) => !isExempt(p)), unknown: acc.unknown, dirs: [...new Set(acc.dirs)], literals: [...new Set(acc.literals)], blind: acc.blind };
+}
+
+// Every path a command names as written, moved or removed — deletions outside
+// the session root included: unlike bashWrites, this asks "did the lead touch
+// this file", not "is it a change", so a copy's source is read, not touched
+// (copyWrites). A write whose target the walk cannot name (an interpreter, a
+// variable) is not counted: counting it would refuse every review that ran a
+// one-liner, and forgery by intent is outside what this check is for — it
+// catches a slip, the threat model the pre-flight gate has.
+function bashTouched(command, cwd) {
+  if (typeof command !== "string") return [];
+  return [...new Set(analyzeCommand(command, cwd, null, true).targets)];
+}
+
+// What a copy-style command writes: its destination — the last operand, or the
+// `-t`/`--target-directory` dir — and its sources too when rsync removes them.
+// A target flag in any other spelling (`-rt`, a `--targ` prefix), or a flag
+// after an operand, makes every operand count: unsure is the closed side. rsync has no target flag; its -t
+// keeps times.
+const COPIERS = new Set(["cp", "rsync", "install", "ln"]);
+function copyWrites(ws) {
+  const at = afterPrefixes(ws), rsync = ws[at] === "rsync", rest = ws.slice(at + 1);
+  const operands = [], targets = [];
+  let unsure = false, flags = true;
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (/^[0-9&]*[<>]/.test(w)) { if (/^[0-9&]*(?:<|>{1,2}\|?|>&)$/.test(w)) i++; continue; } // a redirection, not an operand
+    if (flags && w === "--") { flags = false; continue; }
+    if (flags && !rsync && (w === "-t" || w === "--target-directory")) { if (rest[i + 1] !== undefined) targets.push(rest[++i]); continue; }
+    if (flags && !rsync && w.startsWith("--target-directory=")) { targets.push(w.slice("--target-directory=".length)); continue; }
+    if (flags && w.startsWith("-")) {
+      // After an operand, a flag's value may be the last word: `rsync a b --exclude x`.
+      if ((!rsync && /^-[^-]*t|^--t/.test(w)) || (operands.length && !w.includes("="))) unsure = true;
+      continue;
+    }
+    operands.push(w);
+  }
+  if (unsure || (rsync && rest.some((w) => /^--remove-(?:source|sent)-files$/.test(w)))) return [...operands, ...targets];
+  return targets.length ? targets : operands.slice(-1);
+}
+
+// The argv of each command a segment runs: wrappers, `timeout <flags> <n>` and
+// `bash`/`sh` with their flags dropped, and the body of `bash [flags] -c "…"`
+// split into its own segments. `$(…)` bodies are already segments of their own
+// (splitSegments).
+function invocations(segment) {
+  let ws = words(segment), i = afterPrefixes(ws);
+  const skipFlags = (valued) => { while (/^[-+]/.test(ws[i] ?? "")) i += valued.has(ws[i]) ? 2 : 1; };
+  if (ws[i] === "timeout") { i++; skipFlags(new Set(["-k", "-s", "--kill-after", "--signal"])); ws = ws.slice(i + 1); i = afterPrefixes(ws); }
+  const inline = inlineShell(ws);
+  if (inline !== null) return splitSegments(inline).flatMap(invocations);
+  if (SHELL_INTERPRETERS.has(ws[i])) { i++; skipFlags(new Set(["-o", "+o", "-O", "+O"])); }
+  return [ws.slice(i)];
+}
+
+// Whether the command runs round.sh as a command — not `echo`, `grep` or a
+// data heredoc naming it, which could print a `work:` line of their own.
+function runsRoundSh(command) {
+  const { shell, scripts } = separateHeredocs(command);
+  const texts = [shell, ...scripts.filter((s) => SHELL_INTERPRETERS.has(s.interpreter)).map((s) => s.body)];
+  return texts.some((text) => splitSegments(text).flatMap(invocations).some((argv) => path.basename(argv[0] ?? "") === "round.sh"));
+}
+
+// What the gate needs to judge a `converged` marker against its review's
+// pre-flight evidence (hooks/lib/review-evidence.mjs), read once
+// over the whole main chain: the work dirs round.sh printed and converged.sh
+// was given, and every path the lead's own calls that ran wrote, moved or
+// removed. Each event carries its order (`seq`), and `allocations` the order
+// of every `round.sh --new-review` that allocated a dir: round.sh reuses the
+// first free `review-<k>`, so a dir removed earlier comes back at the same
+// path, and what happened to the old one is not evidence against the new one.
+function markerContext(entries, results, cwd) {
+  const didNotRun = neverRan(entries);
+  const works = [], written = [], allocations = [];
+  let seq = 0;
+  for (const entry of entries) {
+    for (const use of toolUses(entry)) {
+      seq += 1;
+      if (didNotRun(use)) continue;
+      if (EDIT_TOOLS.has(use.name)) {
+        const file = use.input?.file_path ?? use.input?.notebook_path;
+        if (typeof file === "string") written.push({ file: path.resolve(cwd ?? "", expandHome(file)), how: use.name, seq });
+        continue;
+      }
+      if (use.name !== "Bash") continue;
+      const command = use.input?.command ?? "";
+      // Only round.sh's own `work:` line names a review: any other command can print one.
+      // round.sh prints `work:` only when --new-review allocated the dir.
+      if (runsRoundSh(command)) {
+        for (const m of (results.get(use.id) ?? "").matchAll(/^work: (\/.+)$/gm)) {
+          works.push(m[1].trim());
+          allocations.push({ dir: m[1].trim(), seq });
+        }
+      }
+      if (invokesMarkerScript(command, cwd)) {
+        const w = /--work\s+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(command);
+        if (w) works.push(path.resolve(cwd ?? "", expandHome(w[1] ?? w[2] ?? w[3])));
+      }
+      const how = `Bash \`${command.length > 80 ? command.slice(0, 77) + "…" : command}\``;
+      for (const file of bashTouched(command, cwd)) written.push({ file, how, seq });
+    }
+  }
+  return { works, written, allocations, candidates: candidateDirs(works), bases: [...new Set(works.map((w) => path.dirname(path.resolve(w))))] };
 }
 
 /**
@@ -1034,12 +1152,7 @@ const stem = (file) => path.basename(file).split(".")[0];
 
 // The marker script at command position — `cd x && /abs/converged.sh "…"` is an
 // invocation; `echo '…converged.sh…'` and `grep converged.sh …` only mention it.
-function commandWord(segment) {
-  const ws = words(segment), inline = inlineShell(ws);
-  if (inline !== null) return commandWord(inline);
-  const i = afterPrefixes(ws);
-  return (SHELL_INTERPRETERS.has(ws[i]) ? ws[i + 1] : ws[i]) ?? "";
-}
+const commandWord = (segment) => invocations(segment)[0]?.[0] ?? "";
 // Data heredocs are dropped first: prose in a ledger appended beside the marker
 // can hold an apostrophe, which would otherwise read as an unclosed quote.
 function invokesMarkerScript(command, cwd) {
@@ -1071,7 +1184,7 @@ function isMarkerScript(word, cwd) {
 // block can say which, rather than repeating the generic reminder.
 //
 // Returns null (not a marker attempt), {record, summary}, or {problems}.
-function fileMarkerSummary(use, results) {
+function fileMarkerSummary(use, results, ctx = null) {
   const file = use.input?.file_path ?? "";
   if (use.name !== "Write" || !MARKER_FILE_RE.test(file) || !isScratchPath(file)) return null;
   if (!/successfully/i.test(results.get(use.id) ?? "")) return null;
@@ -1088,7 +1201,20 @@ function fileMarkerSummary(use, results) {
     return { problems: ['`summary` is no longer a string: name the fields instead, so the record cannot be mistyped.'] };
   }
   const { record, problems } = validateMarker(body);
-  return record ? { record, summary: formatSummary(record) } : { problems };
+  if (!record) return { problems };
+  // A `converged` record is checked against its review's pre-flight evidence:
+  // the dir it sits in when that is a review dir, else the review its id
+  // names, else every open review dir beside it.
+  if (record.outcome === "converged" && ctx) {
+    const dir = path.dirname(file);
+    const inReview = /^review-\d+$/.test(path.basename(dir));
+    const evidence = convergedProblems({
+      dir: inReview ? dir : null, review: record.review ?? null,
+      candidates: candidateDirs(ctx.works, inReview ? [] : [dir]), openBases: inReview ? [] : [dir, ...ctx.bases], written: ctx.written, allocations: ctx.allocations,
+    });
+    if (evidence.length) return { problems: evidence };
+  }
+  return { record, summary: formatSummary(record) };
 }
 
 // The three verdict counts off a marker of either form, or `null` when any one
@@ -1122,20 +1248,28 @@ function countsFrom(read) {
 // script form. It is null when it cannot be read — a marker whose outcome is
 // unknown is never gated, because refusing on a value we failed to parse is a
 // block bought with a guess.
-function lastMarker(turn, results, cwd) {
+function lastMarker(turn, results, cwd, ctx = null) {
   let at = -1, fileMarker = null, rejectedAt = -1, rejected = null, outcome = null, intent = null, counts = null, review = null;
   turn.forEach((entry, index) => {
     for (const use of toolUses(entry)) {
       const text = results.get(use.id) ?? "";
       if (use.name === "Bash" && invokesMarkerScript(use.input?.command ?? "", cwd) && MARKER_TOKEN_RE.test(text)) {
-        at = index; fileMarker = null;
-        outcome = scriptField(text, "outcome");
+        const said = scriptField(text, "outcome"), named = scriptField(text, "review");
+        // The script form is checked here, not only in converged.sh: without
+        // --work the script has no review dir to read. A refusal leaves `at`
+        // where it was, as a refused file write does.
+        if (said === "converged" && ctx) {
+          const evidence = convergedProblems({
+            review: named, candidates: ctx.candidates, openBases: ctx.bases, written: ctx.written, allocations: ctx.allocations,
+          });
+          if (evidence.length) { rejectedAt = index; rejected = evidence; continue; }
+        }
+        at = index; fileMarker = null; outcome = said; review = named;
         intent = scriptField(text, "intent");
-        review = scriptField(text, "review");
         counts = countsFrom((key) => scriptField(text, key));
         continue;
       }
-      const written = fileMarkerSummary(use, results);
+      const written = fileMarkerSummary(use, results, ctx);
       if (written === null) continue;
       if (written.problems) { rejectedAt = index; rejected = written.problems; continue; }
       at = index; fileMarker = { id: use.id, summary: written.summary };
@@ -1647,9 +1781,9 @@ const countUnverified = reminderCounter(UNVERIFIED_TAG);
 // window, and the re-mark after the review the hold asks for needs evidence of
 // its own — the stricter reading.
 const MARKER_REFUSAL_TAGS = [UNREVIEWED_TAG, UNVALIDATED_TAG, UNVERIFIED_TAG];
-function previousAcceptedMarker(entries, results, cwd, before) {
+function previousAcceptedMarker(entries, results, cwd, before, ctx = null) {
   for (let next = before; next >= 0;) {
-    const at = lastMarker(entries.slice(0, next), results, cwd).at;
+    const at = lastMarker(entries.slice(0, next), results, cwd, ctx).at;
     const counts = at >= 0
       ? MARKER_REFUSAL_TAGS.map((tag) => entries.slice(at + 1, next).filter((e) => isReminderFor(e, tag)).length)
       : [];
@@ -1838,8 +1972,9 @@ function evaluate(entries, cwd, transcriptPath) {
   // live: identical facts block in the same turn and pass silently one human
   // prompt later. logFileMarker is safe at window scope because it already
   // dedupes on the marker id anywhere in the log.
-  const { at: markerAt, rejected } = lastMarker(turn, results, cwd);
-  const { at: markerAtW, fileMarker, outcome, intent, counts, review } = lastMarker(entries, results, cwd);
+  const markerCtx = markerContext(entries, results, cwd);
+  const { at: markerAt, rejected } = lastMarker(turn, results, cwd, markerCtx);
+  const { at: markerAtW, fileMarker, outcome, intent, counts, review } = lastMarker(entries, results, cwd, markerCtx);
   // What the decision log records beside the rule: the outcome of a marker in
   // THIS turn when there is one — an earlier turn's is not this Stop's — and
   // whichever count the deciding branch read.
@@ -1902,7 +2037,7 @@ function evaluate(entries, cwd, transcriptPath) {
   // sets `rejectedAt`, and a script call whose output lacks the token sets
   // nothing. So this is unambiguous without reading any outcome. A well-formed
   // marker this gate then REFUSED is skipped too — see previousAcceptedMarker.
-  const prevMarkerAt = previousAcceptedMarker(entries, results, cwd, markerAtW);
+  const prevMarkerAt = previousAcceptedMarker(entries, results, cwd, markerAtW, markerCtx);
   // A human prompt is an INTERJECTION when some agent launched before it was
   // still running across it; it is a TASK BOUNDARY when none was. Turn-scoping
   // on `boundary` alone reintroduces the 2026-08-22 false block, because an

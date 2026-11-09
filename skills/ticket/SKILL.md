@@ -61,7 +61,11 @@ spellings keep it under tree-guard. Its prompt carries three things and
 nothing else:
 
 - the absolute path to `<reviews>/intent.md`
-- the user's request, verbatim — the thing the ticket claims to serve
+- the absolute path to `<reviews>/user-words.md` — the user's own words, the thing the
+  ticket claims to serve, written by one Bash call before the spawn:
+  `"${CLAUDE_PLUGIN_ROOT}/scripts/user-words.mjs" --out <reviews>/user-words.md`.
+  It reads them from the session transcript, so no paraphrase of yours stands in
+  for them; the review reads them again at round 1, so a correction typed after the ticket still reaches the finders.
 - the repository root, so it can grep the premise
 
 Then, as the very next call with nothing in between, Bash `timeout` `600000`:

@@ -1404,8 +1404,9 @@ test("a write marker before the last change, or one whose write failed, does not
 
 test("the block reason names the write marker and the plugin's converged.sh, and the plugin-qualified skill name", () => {
   const r = run(turn(...write(`${PROJECT}/src/a.ts`)));
-  assert.match(r.json.reason, /self-review\/CONVERGED\.json/);
+  assert.match(r.json.reason, /<work>\/CONVERGED\.json — the work: path round\.sh printed, under <your scratchpad>\/self-review\//);
   assert.match(r.json.reason, new RegExp(CONVERGED_SH));
+  assert.match(r.json.reason, /--intent author --work <work>/, "the script form names its review");
   assert.match(r.json.reason, /skill "self-review:self-review"/);
 });
 
@@ -1445,6 +1446,166 @@ test("a marker in a per-review work dir counts: one review-<k>/ segment, and not
   assert.ok(cleared(`${SCRATCH}/self-review/CONVERGED.json`), "the base path still is one");
   assert.ok(!cleared(`${SCRATCH}/self-review/review-3/x/CONVERGED.json`), "a second segment is not");
   assert.ok(!cleared(`${SCRATCH}/self-review/evil/CONVERGED.json`), "an arbitrary segment is not");
+});
+
+test("a converged marker in a review dir is refused while that review's pre-flight has no verdict on a check", () => {
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "sr-")), "self-review", "review-1");
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  writeFileSync(path.join(work, "round-1", "preflight.txt"), "# self-review preflight\nINFRA test    pnpm test   (did not finish in 300s — no verdict on the code)\n");
+  const file = path.join(work, "CONVERGED.json");
+  const markAt = (body) => call("Write", { file_path: file, content: JSON.stringify(body) }, `File created successfully at: ${file}`);
+  const refused = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markAt(CONVERGED_RECORD)));
+  assert.ok(blocks(refused));
+  assert.match(refused.json.reason, /pre-flight has no verdict on test `pnpm test`/);
+  const honest = { outcome: "not-converged", reason: "checks-unverified", rounds: 1, fixed: 0, dismissed: 0, open: 0, intent: "author" };
+  assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markAt(honest))).stdout, "", "the honest end is accepted");
+  writeFileSync(path.join(work, "preflight-rerun.txt"), "# self-review preflight\nPASS  test    pnpm test\n");
+  utimesSync(path.join(work, "preflight-rerun.txt"), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+  assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markAt(CONVERGED_RECORD))).stdout, "", "a newer real verdict clears it");
+});
+
+// The evidence a converged marker is judged by is preflight.sh's
+// own, and the marker is judged whichever form or path it took.
+const UNFINISHED_REPORT = "# self-review preflight\nINFRA test    pnpm test   (did not finish in 300s — no verdict on the code)\n";
+function reviewDir({ unverified = false, k = 1 } = {}) {
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "sr-")), "self-review", `review-${k}`);
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  writeFileSync(path.join(work, "round-1", "preflight.txt"), unverified ? UNFINISHED_REPORT : "# self-review preflight\nPASS  test    pnpm test\n");
+  return work;
+}
+const markIn = (dir, body = CONVERGED_RECORD) => {
+  const file = path.join(dir, "CONVERGED.json");
+  return call("Write", { file_path: file, content: JSON.stringify(body) }, `File created successfully at: ${file}`);
+};
+const idOf = (work) => spawnSync("git", ["hash-object", "--stdin"], { input: work, encoding: "utf8" }).stdout.slice(0, 8);
+const announce = (work) => bash("round.sh --new-review --work reviews", `work: ${work}\nreview: ${idOf(work)}`);
+
+test("a converged marker is refused when the session wrote, moved or removed its review's pre-flight report by hand", () => {
+  const work = reviewDir();
+  const report = path.join(work, "round-1", "preflight.txt");
+  const rerun = path.join(work, "preflight-rerun.txt");
+  const forms = [
+    ["Write", call("Write", { file_path: rerun, content: "PASS  test    pnpm test\n" }, `File created successfully at: ${rerun}`)],
+    ["Edit", edit(report)],
+    [">", bash(`printf 'PASS  test    pnpm test\\n' > ${rerun}`)],
+    [">>", bash(`echo 'PASS  test    pnpm test' >> ${report}`)],
+    ["tee", bash(`echo PASS | tee ${rerun}`)],
+    ["cp", bash(`cp /tmp/forged.txt ${rerun}`)],
+    ["mv source", bash(`mv ${report} ${work}/old.txt`)],
+    ["rm", bash(`rm -f ${report}`)],
+    ["sed -i", bash(`sed -i '' 's/INFRA/PASS/' ${report}`)],
+    ["truncate", bash(`truncate -s 0 ${report}`)],
+    [">|", bash(`echo PASS >| ${report}`)],
+    ["a glob", bash(`rm -f ${work}/round-1/preflight*.txt`)],
+    ["a glob in the round dir part", bash(`rm -f ${work}/round-*/preflight.txt`)],
+    ["a copy, then a write over its source", bash(`cp ${report} /tmp/keep.txt; echo PASS > ${report}`)],
+    ["rsync that removes its source", bash(`rsync --remove-source-files ${report} /tmp/keep/`)],
+    ["rsync's older spelling of it", bash(`rsync --remove-sent-files ${report} /tmp/keep/`)],
+    ["a copy over it, then a copy of it", bash(`cp /tmp/forged.txt ${report}; cp ${report} /tmp/keep.txt`)],
+    ["a copy into it with -t", bash(`cp -t ${work}/round-1 /tmp/forged/preflight.txt`)],
+    ["rsync -t, which keeps times", bash(`rsync -t /tmp/forged.txt ${report}`)],
+    ["a copy over it, its output redirected", bash(`cp /tmp/forged.txt ${report} > /tmp/cp.log`)],
+    ["a write inside bash -e -c", bash(`bash -e -c "echo PASS > ${report}"`)],
+    ["a copy over it, a flag after the operands", bash(`rsync -a /tmp/forged.txt ${report} --exclude x`)],
+    ["a pipe after an escaped >", bash(`echo \\>| tee ${report}`)],
+    ["a glob that names the review dir", bash(`rm -rf ${path.dirname(work)}/review-*`)],
+    ["a glob above the round dir", bash(`rm -f ${path.dirname(work)}/review-*/round-1/preflight.txt`)],
+    ["a brace list", bash(`rm ${work}/round-1/preflight{,-rerun}.txt`)],
+    ["the round dir", bash(`rm -rf ${work}/round-1`)],
+    ["the review dir", bash(`mv ${work} ${work}-old`)],
+    ["into the round dir", bash(`cp /tmp/forged/preflight.txt ${work}/round-1/`)],
+    // macOS: tmpdir() is /var/…, its realpath /private/var/… — one dir, two spellings.
+    ["the other spelling", bash(`rm -f ${realpathSync(work)}/round-1/preflight.txt`)],
+  ];
+  for (const [how, calls] of forms) {
+    const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...calls, ...markIn(work)));
+    assert.ok(blocks(r), `${how}: ${JSON.stringify(r.json)}`);
+    assert.match(r.json.reason, /pre-flight evidence in .* was written by hand/, how);
+  }
+});
+
+test("a review dir removed and then reallocated by round.sh --new-review is judged on what happened after the allocation", () => {
+  const work = reviewDir();
+  const marked = (...calls) => run(turn(...write(`${PROJECT}/src/a.ts`), ...calls, ...reviewed(), ...markIn(work)));
+  const before = marked(bash(`rm -rf ${work}`), announce(work));
+  assert.equal(before.stdout, "", `the removal was of the earlier review at this path: ${before.stdout}`);
+  const after = marked(announce(work), bash(`rm -rf ${work}/round-1`));
+  assert.ok(blocks(after), "a removal after the allocation still counts");
+});
+
+test("only round.sh run as a command allocates a review dir: a command that prints its work: line does not reset the evidence", () => {
+  const work = reviewDir();
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), bash(`rm -rf ${work}/round-1`),
+    bash("echo round.sh --new-review", `work: ${work}`), ...reviewed(), ...markIn(work)));
+  assert.ok(blocks(r), "an echo naming round.sh is not an allocation");
+  const allocatedBy = (call) => run(turn(...write(`${PROJECT}/src/a.ts`), bash(`rm -rf ${work}/round-1`),
+    bash(call, `work: ${work}`), ...reviewed(), ...markIn(work)));
+  assert.equal(allocatedBy(`bash ${PLUGIN_ROOT}/scripts/round.sh --new-review --work reviews`).stdout, "", "round.sh run through bash allocates");
+  assert.equal(allocatedBy(`bash -c "cd /x && round.sh --new-review --work reviews"`).stdout, "", "so does round.sh inside bash -c");
+  assert.equal(allocatedBy("round.sh --work a --round 2; round.sh --new-review --work reviews").stdout, "", "the second round.sh of a command counts");
+  assert.equal(allocatedBy("timeout -k 5 600 round.sh --new-review --work reviews").stdout, "", "round.sh under timeout allocates");
+  assert.equal(allocatedBy("w=$(bash -x round.sh --new-review --work reviews)").stdout, "", "so does round.sh in a substitution, under bash -x");
+  assert.equal(allocatedBy(`bash -e -c "round.sh --new-review --work reviews"`).stdout, "", "and inside bash -c behind another flag");
+  assert.ok(blocks(allocatedBy(`cat <<'EOF'\nround.sh --new-review\nwork: ${work}\nEOF`)), "a heredoc line naming round.sh is data, not a run");
+});
+
+test("preflight.sh writing its own report, another review's report, and a call that never ran do not trip the evidence check", () => {
+  const work = reviewDir();
+  const other = path.join(path.dirname(work), "review-2");
+  mkdirSync(other);
+  const ok = (calls) => run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...calls, ...markIn(work))).stdout === "";
+  assert.ok(ok(bash(`${PLUGIN_ROOT}/scripts/preflight.sh --root ${PROJECT} --out ${work}/preflight-rerun.txt`)), "--out is preflight.sh writing its own report");
+  assert.ok(ok(bash(`echo PASS > ${other}/preflight.txt`)), "another review's dir is not this review's evidence");
+  assert.ok(ok(bash(`echo PASS > ${work}/notes.txt`)), "a file that is not a report");
+  assert.ok(ok(bash(`cp ${work}/round-1/preflight.txt /tmp/keep.txt`)), "a copy reads its source");
+  assert.ok(ok(bash(`cp -R ${work} /tmp/save-review`)), "so does a copy of the whole review");
+  assert.ok(ok(bash(`cd ${work}/round-1 && cp preflight.txt /tmp/keep.txt`)), "and a copy from inside the round dir");
+  assert.ok(ok(bash(`cat ${work}/round-1/preflight.txt | head -20`)), "reading a report writes nothing");
+  assert.ok(ok(bash(`sed -n 1,20p ${work}/round-1/preflight.txt`)), "nor does sed without -i");
+  assert.ok(ok(bash(`awk '/INFRA/' ${work}/round-1/preflight.txt > /tmp/infra.txt`)), "nor awk, redirected elsewhere");
+  // A write the walk cannot name is not counted (a known limit): counting it would refuse every review that ran a one-liner.
+  assert.ok(ok(bash(`python3 -c "print(open('${work}/round-1/preflight.txt').read())"`)), "an interpreter that reads one");
+  assert.ok(ok(bash(`SELF_REVIEW_PREFLIGHT_TIMEOUT=1800 ${PLUGIN_ROOT}/scripts/preflight.sh --root ${PROJECT} --out ${work}/preflight-rerun.txt > /dev/null 2>&1`)), "the re-run converge prints, quieted");
+  const id = `Bash${++seq}`;
+  const denied = [toolUse("Bash", { command: `echo PASS > ${work}/preflight-rerun.txt` }, id),
+    { type: "user", uuid: `r${seq}`, timestamp: stamp(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "Permission to use Bash has been denied.", is_error: true }] } }];
+  assert.ok(ok(denied), "a denied call wrote nothing");
+});
+
+test("a bare-path converged marker is judged by the review its id names, and refused when the id names none", () => {
+  const work = reviewDir({ unverified: true });
+  const base = path.dirname(work);
+  const named = run(turn(...announce(work), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markIn(base, { ...CONVERGED_RECORD, review: idOf(work) })));
+  assert.ok(blocks(named), JSON.stringify(named.json));
+  assert.match(named.json.reason, /pre-flight has no verdict on test `pnpm test`/);
+  const unknown = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markIn(base, { ...CONVERGED_RECORD, review: "0000beef" })));
+  assert.ok(blocks(unknown), JSON.stringify(unknown.json));
+  assert.match(unknown.json.reason, /review 0000beef matches no review dir/);
+});
+
+test("a bare-path converged marker with no id is judged by every open review dir beside it", () => {
+  const work = reviewDir({ unverified: true });
+  const base = path.dirname(work);
+  const r = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markIn(base)));
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /pre-flight has no verdict on test `pnpm test`/);
+  writeFileSync(path.join(work, "CONVERGED.json"), JSON.stringify({ outcome: "not-converged", reason: "checks-unverified" }));
+  assert.equal(run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...markIn(base))).stdout, "", "a closed review is not the one being closed");
+});
+
+test("the script form without --work is judged by the review its printed id names", () => {
+  const work = reviewDir({ unverified: true });
+  const id = idOf(work);
+  const script = bash(`${MARKER_CMD} --review ${id}`, `${MARKER_OUT} review=${id}`);
+  const r = run(turn(...announce(work), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...script));
+  assert.ok(blocks(r), JSON.stringify(r.json));
+  assert.match(r.json.reason, /pre-flight has no verdict on test `pnpm test`/);
+  const clean = reviewDir();
+  const cid = idOf(clean);
+  const ok = run(turn(...announce(clean), ...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...bash(`${MARKER_CMD} --review ${cid}`, `${MARKER_OUT} review=${cid}`)));
+  assert.equal(ok.stdout, "", JSON.stringify(ok.json));
+  const stray = run(turn(...write(`${PROJECT}/src/a.ts`), ...reviewed(), ...bash(`${MARKER_CMD} --review 0000beef`, `${MARKER_OUT} review=0000beef`)));
+  assert.ok(blocks(stray), "an id no announced review hashes to is refused");
 });
 
 test("the write marker is logged once even when another session's entry landed after it", () => {
@@ -3078,7 +3239,12 @@ test("every marker body the gate hands out validates under the grammar the gate 
     .map((m) => m[0].split(/\s+—\s+|\.(?:\s|$)/)[0].trim());
   assert.ok(commands.length >= 2, `expected the converged and not-applicable commands, got ${commands.length}`);
   for (const command of commands) {
-    const { fields, problems: parseProblems } = fieldsFromFlags(command.trim().split(/\s+/));
+    // --work is taken out before the fields are parsed, as marker.mjs does: it
+    // is where the record goes, not a field of it.
+    const argv = command.trim().split(/\s+/);
+    const work = argv.indexOf("--work");
+    if (work >= 0) argv.splice(work, 2);
+    const { fields, problems: parseProblems } = fieldsFromFlags(argv);
     assert.deepEqual(parseProblems, [], `${command} — unparseable: ${parseProblems.join(" | ")}`);
     const { problems } = validateMarker(fields);
     assert.deepEqual(problems, [], `${command} — the gate offers a command its own grammar refuses: ${problems.join(" | ")}`);
@@ -3731,6 +3897,15 @@ const HELD = "the branch's unreviewed code is past what this repository defers";
 const heldFeedback = () => ({ type: "user", isMeta: true, timestamp: stamp(),
   message: { role: "user", content: `Stop hook feedback:\n${GATE_TAG} On branch feat, ${HELD}: 600 unreviewed code lines.` } });
 const reviewedMarker = (review) => writeMarker({ ...CONVERGED_RECORD, review });
+// A review the session's round.sh announced: a real review-<k> dir, its id as
+// round.sh derives it, and the Bash call that printed both — the gate resolves
+// a marker's id only among the reviews a session can show it.
+function announcedReview() {
+  const work = path.join(mkdtempSync(path.join(tmpdir(), "srg-rev-")), "review-1");
+  mkdirSync(work);
+  const id = spawnSync("git", ["hash-object", "--stdin"], { input: work, encoding: "utf8" }).stdout.slice(0, 8);
+  return { id, work, announce: bash("round.sh --new-review --work reviews", `work: ${work}\nreview: ${id}`) };
+}
 
 test("branch review: code written outside the opted-in repository is not deferred by its debt", () => {
   const fx = branchRepo();
@@ -3818,8 +3993,9 @@ test("branch review: main is covered by a merge of a reviewed branch", () => {
   const fx = branchRepo();
   run(turn(...bash("ls", "a")), fx.opts); // adopt main
   fx.put("src/a.ts", codeLines(30));
-  const snap = snapshotReview(fx, "abcd1234");
-  const r = run(turn(...write(path.join(fx.repo, "src/a.ts")), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  const rv = announcedReview();
+  const snap = snapshotReview(fx, rv.id);
+  const r = run(turn(...rv.announce, ...write(path.join(fx.repo, "src/a.ts")), ...reviewed(), ...reviewedMarker(rv.id)), fx.opts);
   assert.ok(!blocks(r), JSON.stringify(r.json));
   assert.equal(fx.sha("refs/self-review-reviewed/feat"), snap, "the marker's review moved the branch's ref");
   fx.git("add", "-A"); fx.git("commit", "-qm", "feature");
@@ -3832,12 +4008,13 @@ test("branch review: main is covered by a merge of a reviewed branch", () => {
 test("branch review: a tree that moved after the review counts as debt, not as a refused marker", () => {
   const fx = branchRepo({ maxLines: 50 });
   fx.put("src/a.ts", codeLines(30));
-  snapshotReview(fx, "abcd1234");
+  const rv = announcedReview();
+  snapshotReview(fx, rv.id);
   const file = fx.put("src/b.ts", codeLines(10)); // after the last round read the tree
-  const under = run(turn(...write(file), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  const under = run(turn(...rv.announce, ...write(file), ...reviewed(), ...reviewedMarker(rv.id)), fx.opts);
   assert.ok(!blocks(under), JSON.stringify(under.json));
   fx.put("src/c.ts", codeLines(60));
-  const over = run(turn(...write(path.join(fx.repo, "src/c.ts")), ...reviewed(), ...reviewedMarker("abcd1234")), fx.opts);
+  const over = run(turn(...rv.announce, ...write(path.join(fx.repo, "src/c.ts")), ...reviewed(), ...reviewedMarker(rv.id)), fx.opts);
   assert.ok(blocks(over), JSON.stringify(over.json));
   assert.match(over.json.reason, /70 unreviewed code lines .* measured from refs\/self-review-reviewed\/feat/s);
 });
@@ -3848,11 +4025,13 @@ test("branch review: a marker without a review id, or from a narrowed review, le
   const bare = run(turn(...write(file), ...reviewed(), ...writeMarker()), fx.opts);
   assert.ok(blocks(bare), JSON.stringify(bare.json));
   assert.match(bare.json.reason, /it names no review — add --work <work> to converged\.sh/);
-  snapshotReview(fx, "beef0001", { partial: true });
-  const narrow = run(turn(...write(file), ...reviewed(), ...reviewedMarker("beef0001")), fx.opts);
+  const partial = announcedReview();
+  snapshotReview(fx, partial.id, { partial: true });
+  const narrow = run(turn(...partial.announce, ...write(file), ...reviewed(), ...reviewedMarker(partial.id)), fx.opts);
   assert.match(narrow.json.reason, /was narrowed to a path list/);
-  snapshotReview(fx, "beef0002", { base: "1".repeat(40) });
-  const elsewhere = run(turn(...write(file), ...reviewed(), ...reviewedMarker("beef0002")), fx.opts);
+  const moved = announcedReview();
+  snapshotReview(fx, moved.id, { base: "1".repeat(40) });
+  const elsewhere = run(turn(...moved.announce, ...write(file), ...reviewed(), ...reviewedMarker(moved.id)), fx.opts);
   assert.match(elsewhere.json.reason, /which is not a reviewed tree/);
   assert.equal(fx.sha("refs/self-review-reviewed/feat"), "");
 });
@@ -3869,8 +4048,9 @@ test("branch review: a detached HEAD is gated per turn, and says why", () => {
 test("branch review: the script form of the marker carries the review id too", () => {
   const fx = branchRepo({ maxLines: 10 });
   const file = fx.put("src/a.ts", codeLines(30));
-  const snap = snapshotReview(fx, "abcd1234");
-  const r = run(turn(...write(file), ...reviewed(), ...bash(`${MARKER_CMD} --review abcd1234`, `${MARKER_OUT} review=abcd1234`)), fx.opts);
+  const rv = announcedReview();
+  const snap = snapshotReview(fx, rv.id);
+  const r = run(turn(...rv.announce, ...write(file), ...reviewed(), ...bash(`${MARKER_CMD} --review ${rv.id}`, `${MARKER_OUT} review=${rv.id}`)), fx.opts);
   assert.ok(!blocks(r), JSON.stringify(r.json));
   assert.equal(fx.sha("refs/self-review-reviewed/feat"), snap);
 });

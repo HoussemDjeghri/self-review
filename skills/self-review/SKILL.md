@@ -102,7 +102,7 @@ substitute: unsubstituted, `<` and `>` are redirections.
 Write the **INTENT block** (template: `references/briefs.md`) to
 `<reviews>/intent.md`; `--new-review` moves it, and the ticket's `ticket/`, into
 the review dir so the next review cannot brief against this one's ticket. It
-holds the user's ask in their words, the constraints, the **governing
+holds your one-line reading of the ask (round.sh puts the user's own words, read from the transcript, above it in every brief), the constraints, the **governing
 documents** (the line ranges of every approved plan, spec or ruling the work
 implements — a whole file only under ~20 lines, so finders load only the
 lines that govern — or
@@ -132,12 +132,16 @@ Then set the round up in **one call**:
   [--base <ref>] [--force S|M|L --reason "…"] [paths…]
 ```
 
+Give that call — and every `round.sh` call — the Bash `timeout` `600000`:
+round 1 can spend up to 480 s on pre-flight on a large repository, and past the
+default 120 s the call is moved to the background.
+
 Round `N` ≥ 2 is `round.sh --work <work> --round <N> --intent <work>/intent.md`;
 it replays round 1's scope (paths and `--base` are refused: a new scope is a
 new review), prints `findings.mjs converge`'s verdict on round `N−1` above the plan (§3),
 and when that verdict is `STOP` or `UNRECORDED` it refuses the round (exit 5,
 nothing created) and prints the `next:` call to run instead.
-That one call is scope, pre-flight, impact, tier, prior findings and every
+The round-1 call is scope, pre-flight, impact, tier, prior findings and every
 brief; it prints the tier line, one `Agent {…}` line per finder, and the
 pre-flight verdicts last (act on those before spawning). **Do not run those
 scripts separately** — each extra call is a full-context turn with no judgment
@@ -201,12 +205,17 @@ directly only to re-check a fix:
 "${CLAUDE_PLUGIN_ROOT}/scripts/preflight.sh" --root <repo> --out <work>/round-1/preflight.txt
 ```
 
-It exits 0 even when a check fails: the report is the answer. What it detects,
+It exits 0 even when a check fails: the report is the answer. An `INFRA … did not finish` or
+`SKIP … budget spent` line in `preflight.txt` (not round.sh's `artifact-suite` line) is no verdict — the check outran round 1's budget;
+call it unverified, never failing (`references/scripts.md` → **Pre-flight**). While
+one stands, converge will not print the `converged` call and `converged.sh --work` refuses it: converge's `next:` prints the
+re-run with a longer cap, and a check that still cannot finish ends the review
+`--not-converged --reason checks-unverified`. What it detects,
 `preflight.skip`, and `preflight.artifactRoot` (off by default; user-global, so
 it applies to every project) are in `references/scripts.md` → **Pre-flight**; an
 artifact-root `SKIP` (no node tests there) is not a failure of the reviewed
-repository. `round.sh` runs pre-flight on a **copy** of the tree with an empty
-HOME (`pre-flight (from …)`): a check that fails there and passes in the
+repository. `round.sh` runs pre-flight on a **copy** of the tree
+(`pre-flight (from …)`): a check that fails there and passes in the
 checkout is a finding — something resolved a path against where the code
 lives — so report both results. By hand you are back in the checkout, which is
 fine for re-checking a fix.
@@ -465,7 +474,7 @@ design: ask §2e's question, and consider deleting it.
 Rounds are an **outcome, not a setting**, because a round that fixes ten
 findings and stops leaves ten fixes unreviewed. Decide from the trend:
 
-- **Clean round → converged** (`converge` says `CLEAN`). Go to §4.
+- **Clean round → converged** (`converge` says `CLEAN`). Go to §4 — unless its `next:` asks for a pre-flight re-run: a check with no verdict blocks `converged` (§1).
 - **The round fixed something → another round is mandatory** unless a check
   below stops it, because its fixes are unreviewed. Re-capture the full scope
   and run fresh, tapered finders (≈2 at round 2, compact + S from round 3,
@@ -544,7 +553,16 @@ finder is the floor, because tier S *is* one finder. `--not-converged` (with
 real counts and a `--reason`) and `--not-applicable` (with a reason) need no reader and are never
 gated.
 
-**Write the file** — the default; a scratch write needs no permission rule:
+**Write the file** — the default; a scratch write needs no permission rule.
+A `converged` record is refused by the Stop gate while its review's pre-flight
+has no verdict on a check (§1), as `converged.sh --work` refuses it, and when
+any call this session ran wrote, moved or removed a `preflight*.txt` in the
+review dir by hand — only preflight.sh writes evidence. The gate finds the
+review from `<work>/CONVERGED.json`'s path, else from the `review` id, else
+(a bare `<reviews>/CONVERGED.json` with no id) checks every open review dir
+beside it; an id matching no `work:` round.sh printed or `--work` converged.sh
+was given, nor a review dir beside one, is refused. Write the
+per-review path.
 
 ```
 Write  <work>/CONVERGED.json          # i.e. <reviews>/review-<k>/CONVERGED.json

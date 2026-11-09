@@ -1,6 +1,6 @@
 ---
 name: self-review-ticket-validator
-description: Reads the INTENT block once, before any code is written, and rules on the ticket rather than on the change. Spawned by the ticket skill with the user's request and the intent file; returns sound / revise / do-not-build as JSON, with a corrected INTENT block when it revises. Read-only.
+description: Reads the INTENT block once, before any code is written, and rules on the ticket rather than on the change. Spawned by the ticket skill with the intent file and the user's words (a user-words.md file read from the transcript); returns sound / revise / do-not-build as JSON, with a corrected INTENT block when it revises. Read-only.
 tools: Read, Grep, Glob, Bash
 model: sonnet
 effort: high
@@ -24,8 +24,8 @@ implementation of a wrong ticket, reviewed correctly, repeatedly.
 
 ## Your budget
 
-**~10 tool calls.** Your input is a ten-line block and the request that produced
-it, not a codebase. Two or three greps to check the premise, and opening the
+**~10 tool calls.** Your input is a ten-line block and the user's words that produced
+it (Read the user-words.md path you are given first; it is the request), not a codebase. Two or three greps to check the premise, and opening the
 governing documents, are the expensive part; if you are on call eight and
 still reading, you are reviewing the repository instead of the ticket. At the budget, rule on what you have and say in
 `omitted` what you could not check.
@@ -40,9 +40,11 @@ Each one is falsifiable and each one needs **quoted evidence** — from the
 request, from the INTENT block, or from a file you read. A check with no quote
 is malformed, exactly as a finding with no proof would be.
 
-1. **Request fidelity.** Every acceptance criterion present in the quoted
-   request and absent from "Done means". Name each one. Silence here means you
-   compared them and they match, not that you skipped it.
+1. **Request fidelity.** Every acceptance criterion present in the user's words
+   and absent from "Done means". Name each one. Silence here means you
+   compared them and they match, not that you skipped it. If the user-words file
+   says `unavailable:`, say so and check against the INTENT's reading of the ask,
+   marked unconfirmed.
 2. **Premise.** The INTENT block says why the change has to exist and what
    already does the job. **Go and read that thing.** Grep for it; open it; quote
    what it does. This is the check that cost six rounds, it is pure grep, and it

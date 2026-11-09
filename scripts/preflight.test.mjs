@@ -3,7 +3,7 @@
 // about detection, gating, skipping and reporting, not about anyone's toolchain.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -51,7 +51,7 @@ test("a package.json script becomes a check, named by kind and run through the p
   const out = run(p);
   assert.match(out, /PASS {2}lint {4}npm run lint/);
   assert.match(out, /PASS {2}test {4}npm test/);
-  assert.match(out, /# 2 run, 0 failed, 0 could not start, 0 skipped/);
+  assert.match(out, /# 2 run, 0 failed, 0 could not start, 0 did not finish, 0 skipped/);
 });
 
 test("a failing check reports its exit code and the tail of its output", () => {
@@ -82,7 +82,7 @@ test("a check named in preflight.skip is reported, not run", () => {
   }, { npm: 'echo ran; exit 1' });
   const out = run(p, [], { SELF_REVIEW_CONFIG: path.join(p.root, "config.json") });
   assert.match(out, /SKIP {2}test {4}\(preflight.skip\)/);
-  assert.match(out, /# 1 run, 1 failed, 0 could not start, 1 skipped/);
+  assert.match(out, /# 1 run, 1 failed, 0 could not start, 0 did not finish, 1 skipped/);
   assert.doesNotMatch(out, /FAIL {2}test/, "a skipped check cannot fail");
 });
 
@@ -120,10 +120,10 @@ test("an executable ./test.sh is the test command when the project defines no ot
   assert.match(run(p), /PASS {2}test {4}\.\/test\.sh/);
 });
 
-test("a hanging check is killed and reported as a timeout, not left to block the turn", () => {
+test("a hanging check is stopped and reported as no verdict, not left to block the turn", () => {
   const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) }, { npm: "sleep 30" });
-  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1" });
-  assert.match(out, /FAIL {2}test {4}npm test {3}\(timeout 1s\)/);
+  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1", SELF_REVIEW_PREFLIGHT_GRACE: "1" });
+  assert.match(out, /INFRA test {4}npm test {3}\(did not finish in 1s — no verdict on the code; re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged\)/);
 });
 
 test("the config is found however the script was invoked", () => {
@@ -190,7 +190,7 @@ test("a check whose command cannot be run is INFRA, not FAIL", () => {
     { npm: "exit 127" });
   const out = run(p);
   assert.match(out, /INFRA test {4}npm test {3}\(exit 127 — the command could not be run; the check never started\)/);
-  assert.match(out, /# 1 run, 0 failed, 1 could not start, 0 skipped/,
+  assert.match(out, /# 1 run, 0 failed, 1 could not start, 0 did not finish, 0 skipped/,
     "an environment that is broken must not be counted as a red suite");
   assert.doesNotMatch(out, /^FAIL/m);
 });
@@ -201,13 +201,72 @@ test("a check found but not executable is INFRA too", () => {
   assert.match(run(p), /INFRA test .*\(exit 126/);
 });
 
-test("a timeout stays FAIL, because a hang can be real", () => {
+// Campaign 2, szz/1e525716 rep 1: two checks "capped" at 300 s took 1052 s,
+// because the cap was one TERM to the check's shell. A runner that handles TERM
+// (pnpm waiting on its vitest workers) kept `wait` blocked; a cap that can be
+// declined is not a cap.
+test("a check that ignores TERM is still killed at its cap, not waited on", () => {
   const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
-    { npm: "sleep 5" });
-  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1" });
-  assert.match(out, /FAIL {2}test/);
-  assert.match(out, /timeout 1s/);
-  assert.match(out, /# 1 run, 1 failed, 0 could not start, 0 skipped/);
+    { npm: "trap '' TERM; sleep 30" });
+  const started = Date.now();
+  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1", SELF_REVIEW_PREFLIGHT_GRACE: "1" });
+  const seconds = (Date.now() - started) / 1000;
+  assert.ok(seconds < 10, `preflight took ${seconds}s for a 1s cap`);
+  assert.match(out, /INFRA test {4}npm test {3}\(did not finish in 1s/);
+});
+
+test("nothing a timed-out check started outlives it", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
+    { npm: '( sleep 3; touch "$MARK" ) & sleep 30' });
+  const mark = path.join(p.root, "grandchild-survived");
+  run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1", SELF_REVIEW_PREFLIGHT_GRACE: "1", MARK: mark });
+  spawnSync("sleep", ["4"]);
+  assert.equal(existsSync(mark), false, "a grandchild of the killed check kept running and wrote its file");
+});
+
+test("a capped check gets EOF on stdin, not the caller's open pipe", () => {
+  const capped = path.join(HERE, "lib", "capped.sh");
+  const marker = path.join(mkdtempSync(path.join(tmpdir(), "capped-")), "timed-out");
+  const r = spawnSync("bash", ["-c", `sleep 8 | bash -c '. "${capped}"; capped_run 4 1 "${marker}" sh -c "cat >/dev/null; echo done"'`],
+    { encoding: "utf8", timeout: 20000 });
+  assert.match(r.stdout, /done/);
+  assert.equal(existsSync(marker), false, "the check waited out its cap reading the caller's stdin");
+});
+
+// Ruled 2026-11-08 (advisor, campaign-2 fixes §1): a stopped suite is no
+// verdict. It used to be FAIL — "a hang can be real" — and in 6 of 12
+// CopilotKit runs that FAIL sat over a suite whose own tail read 915/915 passed.
+test("a stopped check is counted apart from the ones that could not start, and keeps its tail", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
+    { npm: 'echo "915 passed so far"; sleep 5' });
+  const outFile = path.join(p.root, "report.txt");
+  const out = run(p, ["--out", outFile], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1", SELF_REVIEW_PREFLIGHT_GRACE: "1" });
+  assert.match(out, /# 1 run, 0 failed, 0 could not start, 1 did not finish, 0 skipped/);
+  assert.doesNotMatch(out, /EVERY check failed to start/, "a slow suite is not a missing tool");
+  assert.match(readFileSync(outFile, "utf8"), /--- DID NOT FINISH test[\s\S]*915 passed so far/);
+});
+
+test("a suite that exits 143 by itself is a red suite, not a stopped one", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) }, { npm: "exit 143" });
+  assert.match(run(p), /FAIL {2}test {4}npm test {3}\(exit 143\)/);
+});
+
+test("--deadline gives each check what is left of it, and skips by name what cannot start in time", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { lint: "x", test: "x" } }) },
+    { npm: 'case "$*" in "run lint") sleep 30 ;; *) exit 0 ;; esac' });
+  const started = Date.now();
+  const deadline = Math.floor(Date.now() / 1000) + 12;
+  const out = run(p, ["--deadline", String(deadline)], { SELF_REVIEW_PREFLIGHT_GRACE: "1" });
+  assert.ok((Date.now() - started) / 1000 < 20, "the lint check was held to the deadline, not to the 300 s cap");
+  assert.match(out, /INFRA lint {4}npm run lint {3}\(did not finish in 1[0-2]s/);
+  assert.match(out, /SKIP {2}test {4}npm test {3}\(pre-flight budget spent — re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged\)/);
+});
+
+test("a malformed --deadline is a usage error", () => {
+  const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) }, { npm: okStub });
+  const result = spawnSync("bash", [SCRIPT, "--root", p.root, "--deadline", "soon"], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /--deadline needs an epoch time/);
 });
 
 test("every check failing to start says so, and says why: a tool that could not be run", () => {

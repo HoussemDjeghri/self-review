@@ -106,3 +106,11 @@ export function intEnv(name, fallback) {
 
 /** `NAME=off` (or 0/false/no) switches a hook off for the session. */
 export const isDisabled = (envName) => /^(0|off|false|no)$/i.test(process.env[envName] ?? "");
+
+// The fallback session id is in the work dir's own path — the scratchpad Claude
+// Code hands a session is `<project>/<session-id>/scratchpad/…` — so a shell
+// without CLAUDE_CODE_SESSION_ID still needs no --session. It is the fallback,
+// not the first choice, because the path can name another session's scratchpad
+// while the variable always names the session holding the reviewers.
+export const sessionIdFrom = (workDir) =>
+  /[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\]scratchpad([/\\]|$)/i.exec(workDir)?.[1] ?? null;

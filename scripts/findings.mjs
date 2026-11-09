@@ -35,6 +35,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LOG_DIR, isMain, loadConfig, realpathOr } from "../hooks/lib/config.mjs";
+import { unverifiedChecks } from "../hooks/lib/preflight-report.mjs";
 import { normaliseRemote, repoId } from "../hooks/lib/repo-id.mjs";
 import { auditEngagement, engagementFile, engagementLine, openEngagement } from "../hooks/lib/engagement.mjs";
 import { jsonlOf } from "../hooks/lib/jsonl.mjs";
@@ -620,7 +621,7 @@ const shellWord = (word) => (/^(?:<[\w|]+>)?[\w@%+=:,./-]*$/.test(word) ? word :
  * `counts` are this review's records across all its rounds. `--intent` is left
  * for the lead: whether the ticket was validated is stored nowhere this reads.
  */
-export function nextAction(result, counts, { work = null, tier = null, scripts = HERE } = {}) {
+export function nextAction(result, counts, { work = null, tier = null, root = null, scripts = HERE, unverified = [] } = {}) {
   const { round, verdict } = result;
   const dir = work ?? "<work>";
   const identity = `--work ${shellWord(dir)}`;
@@ -630,10 +631,24 @@ export function nextAction(result, counts, { work = null, tier = null, scripts =
   // verdict already knows, so the printed call carries it and the lead never
   // has to pick one at the two commonest exits.
   const marker = (outcome, reason) => [script("converged.sh"), outcome, ...(reason ? ["--reason", reason] : []), "--rounds", counts.rounds, "--fixed", counts.fixed,
-    "--dismissed", counts.dismissed, "--open", counts.open, "--tier", tier === null || tier === undefined ? "<S|M|L>" : shellWord(tier), "--intent", "<validated|author|skipped>"].join(" ");
+    "--dismissed", counts.dismissed, "--open", counts.open, "--tier", tier === null || tier === undefined ? "<S|M|L>" : shellWord(tier), "--intent", "<validated|author|skipped>", ...(work === null ? [] : ["--work", shellWord(dir)])].join(" ");
   if (verdict === "UNRECORDED") {
     return `next: ${script("findings.mjs")} record ${identity} --round ${round} --in <findings.json>\n`
       + "  `[]` if it had nothing to record (refused while this round's state/ files hold candidates: record each as a row); record then prints the round's verdict and the call after it";
+  }
+  // A clean round is not a converged review while a pre-flight check has no
+  // verdict — stopped at its cap or never started for want of budget. Ruled
+  // 2026-11-08: the cap took away a false red, and with it the only alarm a
+  // hang introduced by the change raised. The evidence that clears it is a
+  // report preflight.sh writes, never a claim (hooks/lib/preflight-report.mjs).
+  if (verdict === "CLEAN" && unverified.length) {
+    const names = unverified.map((c) => `${c.kind} \`${c.cmd}\` (${c.why})`).join("; ");
+    // pnpm_config_verify_deps_before_run=false: the same switch round.sh sets for every pre-flight run.
+    const rerun = ["pnpm_config_verify_deps_before_run=false", `SELF_REVIEW_PREFLIGHT_TIMEOUT=1800`, script("preflight.sh"),
+      "--root", typeof root === "string" && root ? shellWord(root) : "<repo>", "--out", shellWord(path.join(dir, "preflight-rerun.txt"))].join(" ");
+    return `next: ${rerun}\n`
+      + `  round ${round} is clean, but pre-flight has no verdict on: ${names}. Re-run it with a longer cap, in a background Bash call (run_in_background) so the 600 s limit does not apply; wait for it inside your calls (an until-loop on the report file), never by ending the turn; then run ${script("findings.mjs")} converge ${identity} --round ${round} again.\n`
+      + `  If it still cannot finish, the honest end is: ${marker("--not-converged", "checks-unverified")}`;
   }
   if (verdict === "CLEAN") return `next: ${marker("--converged")}`;
   const unfixed = result.unfixed ?? [];
@@ -838,7 +853,19 @@ function judge(mine, round, { work, budget }) {
     try { first = JSON.parse(readFileSync(path.join(work, "round-1", "tier.json"), "utf8")) ?? {}; } catch { first = {}; }
   }
   const tier = typeof first.tier === "string" && first.tier ? first.tier : null;
-  return { result, budget, budgetFrom, next: nextAction(result, counts, { work, tier }) };
+  // The re-run's --root: the repository round 1 scoped (scope.diff's `# repo:`
+  // line), not the directory the lead started in — from a monorepo subdirectory
+  // that would detect other checks and never clear the one that hung. One repo
+  // only; a multi-repo scope leaves the placeholder for the lead to fill.
+  let root = null;
+  try {
+    // Stop at the non-git section, as round.sh does: it holds raw file text, and
+    // a scoped file containing a `# repo: ` line must not name the repository.
+    const text = readFileSync(path.join(work, "round-1", "scope.diff"), "utf8").split(/^# self-review scope \(not a git repo/m)[0];
+    const repos = [...text.matchAll(/^# repo: (.+)$/gm)].map((m) => m[1]);
+    root = new Set(repos).size === 1 ? repos[0] : null;
+  } catch { root = null; }
+  return { result, budget, budgetFrom, next: nextAction(result, counts, { work, tier, root, unverified: unverifiedChecks(work) }) };
 }
 
 // Rows the memory file holds but no reader can use. Said on stderr, never

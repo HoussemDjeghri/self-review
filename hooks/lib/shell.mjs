@@ -41,9 +41,15 @@ export function afterPrefixes(ws) {
 }
 export const commandOf = (ws) => ws[afterPrefixes(ws)] ?? "";
 // The string `bash -c` runs — a command list of its own, for writes and for the marker alike.
+// Other flags may come first (`bash -e -c`, `bash -o pipefail -c`).
 export function inlineShell(ws) {
-  const i = afterPrefixes(ws);
-  return SHELL_INTERPRETERS.has(ws[i]) && /^-\w*c\w*$/.test(ws[i + 1] ?? "") ? ws[i + 2] ?? "" : null;
+  let i = afterPrefixes(ws);
+  if (!SHELL_INTERPRETERS.has(ws[i])) return null;
+  for (i++; /^[-+]/.test(ws[i] ?? ""); i++) {
+    if (/^-\w*c\w*$/.test(ws[i])) return ws[i + 1] ?? "";
+    if (/^[-+][oO]$/.test(ws[i])) i++; // its option name
+  }
+  return null;
 }
 
 export function afterSingleQuoted(cmd, i) {
@@ -194,9 +200,11 @@ function substitutionBodies(cmd) {
 // a `$( … )` is at command position somewhere.
 export function splitSegments(cmd) {
   const segments = [];
-  let current = "", quote = null, escapes = false;
+  let current = "", quote = null, escapes = false, redirect = false;
   for (let i = 0; i < cmd.length; i++) {
     const ch = cmd[i];
+    const afterRedirect = redirect; // the previous character was an unquoted, unescaped `>`
+    redirect = false;
     if (quote) {
       if (ch === quote) quote = null;
       current += ch;
@@ -207,10 +215,13 @@ export function splitSegments(cmd) {
       i++; // a line continuation: bash removes both and joins the lines
     } else if (ch === "\\" && i + 1 < cmd.length) {
       current += ch + cmd[++i]; // an escaped separator is not a separator
+    } else if (ch === "|" && afterRedirect) {
+      // `>|` is noclobber's override: a redirect, not a pipe.
     } else if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
       segments.push(current); current = "";
     } else {
       current += ch;
+      redirect = ch === ">";
     }
   }
   segments.push(current);

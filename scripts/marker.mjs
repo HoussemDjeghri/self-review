@@ -9,7 +9,7 @@
  *
  * Usage:
  *   converged.sh --converged      --rounds N --fixed N --dismissed N --open N --intent validated|author|skipped [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--review ID] [--work DIR] [--note "…"]
- *   converged.sh --not-converged  --reason <rounds-cap|stall|oscillation|open-blocker|reviewer-failed|budget|user-stopped|single-pass|other> --rounds N --fixed N --dismissed N --open N --intent … [--tier …] [--adapter …] [--work DIR] [--note "…"]
+ *   converged.sh --not-converged  --reason <rounds-cap|stall|oscillation|open-blocker|reviewer-failed|budget|user-stopped|single-pass|checks-unverified|other> --rounds N --fixed N --dismissed N --open N --intent … [--tier …] [--adapter …] [--work DIR] [--note "…"]
  *   converged.sh --not-applicable <no-code-changed|user-declined|scratch-only|other> [--work DIR] [--note "…"]
  *
  * The printed token line is `SELF-REVIEW CONVERGED — <summary>` for every
@@ -23,6 +23,7 @@ import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, unli
 import path from "node:path";
 import { homedir } from "node:os";
 import { INTENT_STATES, NA_REASONS, NC_REASONS, fieldsFromFlags, formatSummary, validateMarker } from "../hooks/lib/marker.mjs";
+import { unverifiedChecks } from "../hooks/lib/preflight-report.mjs";
 
 const COUNTED = `--rounds N --fixed N --dismissed N --open N --intent <${INTENT_STATES.join("|")}> [--tier S|M|L] [--forced S|M|L --computed S|M|L] [--adapter X] [--review ID] [--work DIR] [--note "…"]`;
 const USAGE = [
@@ -92,6 +93,14 @@ if (work && scope) {
   }
 }
 const { record, problems } = validateMarker(fields);
+// `converged` with a pre-flight check that never got a verdict is refused, the
+// same rule converge's `next:` line applies (hooks/lib/preflight-report.mjs).
+// Only with --work: without it there is no review dir to read the reports from.
+if (work && fields.outcome === "converged") {
+  for (const c of unverifiedChecks(work)) {
+    workProblems.push(`pre-flight has no verdict on ${c.kind} \`${c.cmd}\` (${c.why}, ${c.report}) — re-run preflight.sh with a longer cap (findings.mjs converge prints the call), or end --not-converged --reason checks-unverified.`);
+  }
+}
 const all = [...workProblems, ...argProblems, ...problems];
 if (all.length || !record) die(all.length ? all : ["invalid marker."]);
 

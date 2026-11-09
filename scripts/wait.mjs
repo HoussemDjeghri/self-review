@@ -39,6 +39,7 @@ import path from "node:path";
 import { LOG_DIR, isMain, loadConfig } from "../hooks/lib/config.mjs";
 import { agentNameOf, agentStatus, findAgentFiles, readAgent, reportCandidates, resolveSubagentsDir } from "../hooks/lib/agents.mjs";
 import { linesOf } from "../hooks/lib/jsonl.mjs";
+import { sessionIdFrom } from "../hooks/lib/transcript.mjs";
 import { reviewName, reviewNumber } from "./brief.mjs";
 import { editDistance } from "./lib/edit-distance.mjs";
 import { gitRoot } from "./lib/repo.mjs";
@@ -117,13 +118,9 @@ const stateLinesIn = (file) => {
   return n;
 };
 
-// The fallback session id is in the work dir's own path — the scratchpad Claude
-// Code hands a session is `<project>/<session-id>/scratchpad/…` — so a shell
-// without CLAUDE_CODE_SESSION_ID still needs no --session. It is the fallback,
-// not the first choice, because the path can name another session's scratchpad
-// while the variable always names the session holding the reviewers.
-export const sessionIdFrom = (workDir) =>
-  /[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\]scratchpad([/\\]|$)/i.exec(workDir)?.[1] ?? null;
+// sessionIdFrom lives in hooks/lib/transcript.mjs (user-words.mjs needs it too,
+// and importing it from here closed an import cycle through brief.mjs).
+export { sessionIdFrom };
 
 // Reads each agent's transcript, re-parsing only the files that grew since the
 // last poll. A finder's transcript reaches a few hundred KB and a round waits

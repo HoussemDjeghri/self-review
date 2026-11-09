@@ -19,6 +19,16 @@ import { jsonlOf } from "./jsonl.mjs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+// The Claude config's projects directory. `~` in CLAUDE_CONFIG_DIR is
+// expanded, as the sibling hooks do (context-mode-cache-heal.mjs, #577).
+export function projectsRoot() {
+  const cfg = process.env.CLAUDE_CONFIG_DIR;
+  const root = cfg
+    ? cfg.startsWith("~") ? path.join(homedir(), cfg.replace(/^~[/\\]?/, "")) : cfg
+    : path.join(homedir(), ".claude");
+  return path.join(root, "projects");
+}
+
 // Where a session's subagent transcripts live, from whatever the caller has:
 // a bare session id, the session's .jsonl, its directory, or the subagents
 // directory itself.
@@ -30,13 +40,8 @@ export function resolveSubagentsDir(place) {
   }
   if (place.endsWith(".jsonl")) return path.join(place.slice(0, -".jsonl".length), "subagents");
   // A bare session id: find it under the projects root, newest first when a
-  // session somehow exists in several projects. `~` in CLAUDE_CONFIG_DIR is
-  // expanded, as the sibling hooks do (context-mode-cache-heal.mjs, #577).
-  const cfg = process.env.CLAUDE_CONFIG_DIR;
-  const root = cfg
-    ? cfg.startsWith("~") ? path.join(homedir(), cfg.replace(/^~[/\\]?/, "")) : cfg
-    : path.join(homedir(), ".claude");
-  const projects = path.join(root, "projects");
+  // session somehow exists in several projects.
+  const projects = projectsRoot();
   const hits = (existsSync(projects) ? readdirSync(projects) : [])
     .map((p) => path.join(projects, p, place, "subagents"))
     .filter(existsSync)

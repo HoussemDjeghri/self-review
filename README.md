@@ -8,7 +8,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.11.2" src="https://img.shields.io/badge/version-0.11.2-191919">
+  <img alt="version 0.12.0" src="https://img.shields.io/badge/version-0.12.0-191919">
   <img alt="dependencies: node and bash" src="https://img.shields.io/badge/deps-node%20%2B%20bash-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -365,10 +365,11 @@ scratch needs no permission rule and so works on any machine and in any
 permission mode:
 
 ```
-Write <scratchpad>/self-review/CONVERGED.json   {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "intent": "author"}
+Write <work>/CONVERGED.json   {"outcome": "converged", "rounds": 2, "fixed": 3, "dismissed": 1, "open": 1, "tier": "M", "intent": "author", "review": "<id>"}
 ```
 
-It only counts under a scratch path, so a `CONVERGED.json` committed to your
+`<work>` is the review folder the skill's `round.sh` printed, under your
+scratchpad. It only counts under a scratch path, so a `CONVERGED.json` committed to your
 project isn't a marker. The script form is for people, and for review folders
 outside scratch:
 

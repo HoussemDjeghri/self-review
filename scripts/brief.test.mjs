@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief, reviewName, reviewNumber, writeBriefs } from "./brief.mjs";
+import { angleSections, buildPlan, dismissedFrom, estimateTokens, fixedFrom, impactLines, logPriorShown, main, priorIdsIn, renderBrief, reviewName, reviewNumber, wordsSection, writeBriefs } from "./brief.mjs";
 import { agentSettings } from "../hooks/lib/agent-settings.mjs";
 import { reviewFromWork } from "./findings.mjs";
 
@@ -130,7 +130,8 @@ test("broken references are protected wherever they sit, and the rows above them
   const brief = renderBrief(briefArgs({ impact, budget: { ...budget, maxTokens: 600 } }));
   assert.match(brief.text, /salvage\.mjs:44/, "the broken reference survives");
   assert.doesNotMatch(brief.text, /caller19/, "the last caller row goes first");
-  assert.ok(brief.tokens <= 600, `still ${brief.tokens} tokens`);
+  const limit = 600 + estimateTokens(wordsSection(undefined));
+  assert.ok(brief.tokens <= limit, `still ${brief.tokens} tokens`);
 });
 
 test("impact depth: full is capped at brief.impactMaxLines", () => {
@@ -175,12 +176,25 @@ test("the state-file instructions follow the agent the plan assigned, not the an
 
 test("an over-budget brief trims impact rows first, from the lowest-ranked end", () => {
   const impact = impactLines(IMPACT, "full", budget);
-  const brief = renderBrief(briefArgs({ impact, budget: { ...budget, maxTokens: 600 } }));
+  const brief = renderBrief(briefArgs({ impact, budget: { ...budget, maxTokens: 620 } }));
   assert.ok(brief.trimmedImpact > 0);
-  assert.match(brief.text, /# trimmed to fit 600 tokens: \d+ impact rows/);
+  assert.match(brief.text, /# trimmed to fit \d+ tokens \(620 \+ \d+ for the user's words\): \d+ impact rows/);
   assert.match(brief.text, /salvage\.mjs:44/, "broken references survive the trim");
   assert.doesNotMatch(brief.text, /caller29/, "the last-listed caller goes first");
-  assert.ok(brief.tokens <= 600, `still ${brief.tokens} tokens`);
+  const limit = 620 + estimateTokens(wordsSection(undefined));
+  assert.ok(brief.tokens <= limit, `still ${brief.tokens} tokens`);
+});
+
+test("the user's words sit on top of the budget and never evict impact rows", () => {
+  const rows = ["IMPACT: counts", "# line numbers as of now", "", "## Callers and references (code)",
+    ...Array.from({ length: 60 }, (_, i) => `- src/caller${i}.ts:${i} -> run`)].join("\n");
+  const impact = impactLines(rows, "full", budget);
+  const words = "USER'S WORDS (verbatim)\n" + "w".repeat(12 * 1024);
+  const tight = { ...budget, maxTokens: 600 };
+  const withWords = renderBrief(briefArgs({ impact, userWords: words, budget: tight }));
+  const without = renderBrief(briefArgs({ impact, budget: tight }));
+  assert.ok(without.trimmedImpact > 0, "this budget must actually cut impact rows");
+  assert.equal(withWords.trimmedImpact, without.trimmedImpact);
 });
 
 test("prior findings are trimmed only after impact, and the angle is never trimmed", () => {
@@ -554,4 +568,39 @@ test("writeBriefs reads the cold-run plan from tier.json, and keeps the section 
   assert.match(write({ kinds: { executable: ["bin/x.sh"] }, coldSkipped: "the cold run executed nothing" }, "skipped"),
     /No cold run this round \(the cold run executed nothing\)/);
   assert.match(write({}, "unknown"), /No cold run this round \(no transcript was produced\)/, "a --tier plan has no kinds");
+});
+
+// Campaign 2: every finder checked the fix against the author's paraphrase of the
+// ask. The user's own words sit above the INTENT in every brief, always.
+test("every brief carries the user's words above the INTENT, and says so when they are missing", () => {
+  const words = "USER'S WORDS (verbatim from the session transcript — every prompt since the start of the session; …)\n--- prompt 1 of 1 ---\nmake the line red\n";
+  const brief = renderBrief(briefArgs({ userWords: words }));
+  assert.ok(brief.text.indexOf("make the line red") < brief.text.indexOf("INTENT\n"), "the words come before the author's reading");
+  const missing = renderBrief(briefArgs()).text;
+  assert.match(missing, /USER'S WORDS: unavailable: no user-words file was passed/);
+  assert.ok(missing.indexOf("USER'S WORDS") < missing.indexOf("INTENT\n"));
+});
+
+test("--user-words is read into every finder brief", () => {
+  const dir = workdir();
+  const out = path.join(dir, "review-1", "round-1", "briefs");
+  writeFileSync(path.join(dir, "intent.md"), "INTENT\nAuthor's reading of the ask: make it red\n");
+  writeFileSync(path.join(dir, "words.md"), "USER'S WORDS (verbatim …)\n--- prompt 1 of 1 ---\nthe red line, not the border\n");
+  writeFileSync(path.join(dir, "scope.diff"), "diff\n");
+  const results = main(["--tier", "S", "--intent", path.join(dir, "intent.md"), "--scope", path.join(dir, "scope.diff"),
+    "--out", out, "--live", dir, "--user-words", path.join(dir, "words.md")], { log: () => {}, logDir: workdir() });
+  for (const { file } of results) assert.match(readFileSync(file, "utf8"), /the red line, not the border/);
+});
+
+test("--verify carries <work>/user-words.md, or says it is unavailable", () => {
+  const dir = workdir();
+  mkdirSync(path.join(dir, "round-1"), { recursive: true });
+  writeFileSync(path.join(dir, "intent.md"), "INTENT\n");
+  writeFileSync(path.join(dir, "cands.json"), JSON.stringify([{ id: "r1-1", title: "x" }]));
+  const run = () => main(["--verify", path.join(dir, "cands.json"), "--work", dir, "--round", "1", "--live", dir],
+    { log: () => {}, logDir: workdir() })[0].file;
+  assert.match(readFileSync(run(), "utf8"), /USER'S WORDS: unavailable: no .*user-words\.md/);
+  writeFileSync(path.join(dir, "user-words.md"), "USER'S WORDS (verbatim …)\nkeep the red line\n");
+  const brief = readFileSync(run(), "utf8");
+  assert.ok(brief.indexOf("keep the red line") < brief.indexOf("INTENT"));
 });

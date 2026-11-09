@@ -32,12 +32,13 @@
 // than an expensive one.
 //
 // Exit 0; 2 usage; 3 an input file is missing or unreadable.
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { LOG_DIR, PLUGIN_ROOT, isMain, loadConfig, qualified } from "../hooks/lib/config.mjs";
 import { agentSettings, finderSettings, rowSettings } from "../hooks/lib/agent-settings.mjs";
 import { gitRoot, workRepo } from "./lib/repo.mjs";
 import { logReviewRow } from "./lib/review-log.mjs";
+import { unavailable } from "./user-words.mjs";
 
 export const estimateTokens = (text) => Math.ceil(Buffer.byteLength(text, "utf8") / 3.5);
 
@@ -243,7 +244,11 @@ export function impactLines(impactText, depth, { impactMaxLines }) {
 }
 
 // --- rendering -------------------------------------------------------------
-function renderSections({ row, index, total, round, intent, scope, live, angles, impact, prior, dismissed, fixed = [], stateFile, cold, coldPlanned = true, coldSkipped = "" }) {
+/** The USER'S WORDS section exactly as a brief carries it. */
+export const wordsSection = (userWords) =>
+  `${(userWords || unavailable("no user-words file was passed to brief.mjs")).trim()}\n`;
+
+function renderSections({ row, index, total, round, userWords = "", intent, scope, live, angles, impact, prior, dismissed, fixed = [], stateFile, cold, coldPlanned = true, coldSkipped = "" }) {
   // Angle X's own reviewer has no shell (see agents/self-review-cold-grader.md),
   // so its lifeboat is written rather than appended with Bash.
   //
@@ -269,6 +274,9 @@ function renderSections({ row, index, total, round, intent, scope, live, angles,
     .join("\n\n");
   return {
     head: `You are reviewer ${index + 1} of ${total} in round ${round} of a self-review.\n`,
+    // Always present and above the INTENT: the INTENT is the author's reading of
+    // the ask, and in campaign 2 that reading was the defect three runs shipped.
+    words: wordsSection(userWords),
     intent: `${intent.trim()}\n`,
     scope:
       `SCOPE\nRead ${scope} first — changed-file list, diff, and new files rendered as\n` +
@@ -337,6 +345,10 @@ const assemble = (notes, sections) =>
 
 export function renderBrief(args) {
   const { maxTokens } = args.budget;
+  // The user's words are carried whole and on top of the budget (capped at
+  // source by user-words.mjs), so they never squeeze out impact or prior lines.
+  const wordsTokens = estimateTokens(wordsSection(args.userWords));
+  const limit = maxTokens + wordsTokens;
   const impact = args.impact.lines.map((text, index) => ({ text, keep: args.impact.protectedFlags?.[index] ?? false }));
   let prior = [...args.prior];
   let trimmedImpact = 0, trimmedPrior = 0;
@@ -347,7 +359,7 @@ export function renderBrief(args) {
     const parts = [];
     if (trimmedImpact) parts.push(`${trimmedImpact} impact row${trimmedImpact === 1 ? "" : "s"}`);
     if (trimmedPrior) parts.push(`${trimmedPrior} prior line${trimmedPrior === 1 ? "" : "s"}`);
-    return [`trimmed to fit ${maxTokens} tokens: ${parts.join(", ")}`];
+    return [`trimmed to fit ${limit} tokens (${maxTokens} + ${wordsTokens} for the user's words): ${parts.join(", ")}`];
   };
   const build = () => {
     const text = assemble(notes(), renderSections({ ...args, impact: impact.map((row) => row.text), prior }));
@@ -363,16 +375,16 @@ export function renderBrief(args) {
   };
 
   let { text, tokens } = build();
-  while (tokens > maxTokens && dropLowestRanked()) {
+  while (tokens > limit && dropLowestRanked()) {
     trimmedImpact += 1;
     ({ text, tokens } = build());
   }
-  while (tokens > maxTokens && prior.length) {
+  while (tokens > limit && prior.length) {
     prior.pop();
     trimmedPrior += 1;
     ({ text, tokens } = build());
   }
-  if (tokens > maxTokens) {
+  if (tokens > limit) {
     // Nothing left that may be cut: the angle text and the ledger stay whole,
     // and the brief says why it is over rather than shipping a silent overrun.
     const over = args.dismissed.length
@@ -418,7 +430,7 @@ export function logPriorShown(shown, { round, cwd = process.cwd(), logDir = LOG_
   }
 }
 
-export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, live, impactText, prior, dismissed, fixed = [], config, cold }) {
+export function writeBriefs({ plan, outDir, stateDir, angles, userWords = "", intent, scope, live, impactText, prior, dismissed, fixed = [], config, cold }) {
   // The whole plan is checked before the first file exists: a bad row must not
   // leave the earlier rows' briefs behind as a half-written round.
   const reject = (message) => { throw Object.assign(new Error(message), { exitCode: 3 }); };
@@ -454,7 +466,7 @@ export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, liv
     const brief = renderBrief({
       row, index, total,
       round: plan.round ?? 1,
-      intent, scope, live, angles, stateFile, dismissed, fixed, cold,
+      userWords, intent, scope, live, angles, stateFile, dismissed, fixed, cold,
       // A plan without `kinds` (the --tier default) cannot say nothing is
       // runnable, so it keeps the section.
       coldPlanned: plan.kinds ? Boolean(plan.kinds.executable?.length) : true,
@@ -471,7 +483,7 @@ export function writeBriefs({ plan, outDir, stateDir, angles, intent, scope, liv
 // --- CLI -------------------------------------------------------------------
 function parseArgs(argv) {
   const options = {};
-  const flags = ["round", "plan", "tier", "intent", "scope", "impact", "prior", "ledger", "out", "angles", "live", "cold", "verify", "work", "batch"];
+  const flags = ["round", "plan", "tier", "intent", "scope", "impact", "prior", "ledger", "out", "angles", "live", "cold", "user-words", "verify", "work", "batch"];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const [name, inline] = arg.startsWith("--") ? arg.slice(2).split(/=(.*)/s) : [null, null];
@@ -487,7 +499,7 @@ const USAGE = [
   "usage: brief.mjs --round N (--plan round-N/tier.json | --tier S|M|L)",
   "                 --intent intent.md --scope round-N/scope.diff --out round-N/briefs/",
   "                 [--impact round-N/impact.md] [--prior prior.md] [--ledger ledger.md]",
-  "                 [--angles <file>] [--live <dir>] [--cold <transcript.md>]",
+  "                 [--angles <file>] [--live <dir>] [--cold <transcript.md>] [--user-words <file>]",
   "       brief.mjs --verify candidates.json --work <work> --round N [--batch B]",
 ].join("\n");
 
@@ -544,6 +556,7 @@ export function main(argv, { log = console.log, logDir = LOG_DIR } = {}) {
     outDir,
     stateDir: path.join(path.dirname(outDir), "state"),
     angles: angleSections(read(anglesFile, "the angle catalogue")),
+    userWords: options["user-words"] ? read(path.resolve(options["user-words"]), "the user's words") : "",
     intent: read(path.resolve(options.intent), "the intent block"),
     scope: path.resolve(options.scope),
     live: options.live ? path.resolve(options.live) : gitRoot(),
@@ -612,6 +625,10 @@ export function verifierBrief(options, { log = console.log, usage, logDir = LOG_
   }
   if (!Array.isArray(candidates) || candidates.length === 0) throw usage("--verify needs a non-empty JSON array of candidates");
   const intent = read(path.join(work, "intent.md"), "the intent block").trimEnd();
+  // round.sh writes it once per review at round 1; a review that predates it,
+  // or a hand-run verifier, gets the field saying so rather than no field.
+  const wordsFile = path.join(work, "user-words.md");
+  const userWords = (existsSync(wordsFile) ? read(wordsFile, "the user's words") : unavailable(`no ${wordsFile}`)).trimEnd();
   const live = options.live ? path.resolve(options.live) : gitRoot();
   const size = Math.ceil(candidates.length / Math.ceil(candidates.length / VERIFIER_MAX));
   const batches = [];
@@ -629,6 +646,8 @@ export function verifierBrief(options, { log = console.log, usage, logDir = LOG_
     const file = path.join(roundDir, "briefs", `${name}.md`);
     writeFileSync(file, [
       `Verify these ${group.length} candidate findings from round ${round} of a self-review.`,
+      "",
+      userWords,
       "",
       intent,
       "",

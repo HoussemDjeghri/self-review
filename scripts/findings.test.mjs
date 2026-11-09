@@ -451,6 +451,23 @@ test("convergence: W is computed from the records, over the angles two rounds sh
     "W scores what a round fixed; a dismissal cost no fix");
 });
 
+test("CLI: a clean round with an unfinished check prints a re-run rooted at the repository round 1 scoped", () => {
+  const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
+  const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [1]);
+  const run = (args, input = "") => spawnSync(process.execPath, [SCRIPT, ...args], { input, encoding: "utf8", cwd: repo });
+  mkdirSync(path.join(work, "round-1"), { recursive: true });
+  // The lead started in a subdirectory; scope.diff names the repository root.
+  // A non-git file's raw text in the plain section must not name a second repository.
+  writeFileSync(path.join(work, "round-1", "scope.diff"), "# repo: /x/mono\n# base: HEAD\n# self-review scope (not a git repo)\n# repo: /not/this\n");
+  writeFileSync(path.join(work, "round-1", "preflight.txt"),
+    "# self-review preflight\nINFRA test    pnpm test   (did not finish in 300s — no verdict on the code)\n");
+  assert.equal(run(["record", "--work", work, "--round", "1", "--log-dir", logDir], "[]").status, 0);
+  const out = run(["converge", "--work", work, "--round", "1", "--log-dir", logDir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout.replaceAll("'", ""), /preflight\.sh --root \/x\/mono --out /);
+  assert.match(out.stdout, /checks-unverified/);
+});
+
 test("CLI: converge reads this review's own records and names the rule it did not check", () => {
   const logDir = workdir(), repo = gitRepo({ origin: "https://github.com/o/r.git" });
   const work = scoped(path.join(workdir(), "scratchpad", "self-review"), repo, [1, 2]);
@@ -979,7 +996,19 @@ const nextFor = (verdict, over = {}) => nextAction(verdictOf(verdict, over), COU
 
 test("nextAction: a clean round prints the converged marker, counts and tier filled in", () => {
   assert.equal(nextFor("CLEAN", { tail: null }),
-    "next: /plug/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
+    "next: /plug/scripts/converged.sh --converged --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped> --work /w/review-1");
+});
+
+test("nextAction: a clean round with a check pre-flight never got a verdict on asks for the re-run, not the marker", () => {
+  const unverified = [{ kind: "test", cmd: "pnpm test", why: "did not finish in 300s", report: "/w/review-1/round-1/preflight.txt" }];
+  const next = nextAction(verdictOf("CLEAN", { tail: null }), COUNTS, { work: "/w/review-1", tier: "M", scripts: SCRIPTS, unverified });
+  assert.match(next, /^next: pnpm_config_verify_deps_before_run=false SELF_REVIEW_PREFLIGHT_TIMEOUT=1800 \/plug\/scripts\/preflight\.sh --root <repo> --out \/w\/review-1\/preflight-rerun\.txt\n/);
+  const rooted = nextAction(verdictOf("CLEAN", { tail: null }), COUNTS, { work: "/w/review-1", tier: "M", root: "/r", scripts: SCRIPTS, unverified });
+  assert.match(rooted, /preflight\.sh --root \/r --out /);
+  assert.match(next, /no verdict on: test `pnpm test` \(did not finish in 300s\)/);
+  assert.match(next, /converged\.sh --not-converged --reason checks-unverified /);
+  assert.match(next, /converged\.sh --not-converged --reason checks-unverified .* --work \/w\/review-1$/);
+  assert.doesNotMatch(next, /converged\.sh --converged/);
 });
 
 test("nextAction: a clean round on the last affordable round converges — it does not read as STOP", () => {
@@ -1000,7 +1029,7 @@ test("nextAction: an earned extension prints the one round it buys, forced to S 
 test("nextAction: STOP prints not-converged with the counts, and says that is the honest end", () => {
   const next = nextFor("STOP").split("\n");
   assert.equal(next[0],
-    "next: /plug/scripts/converged.sh --not-converged --reason rounds-cap --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped>");
+    "next: /plug/scripts/converged.sh --not-converged --reason rounds-cap --rounds 2 --fixed 3 --dismissed 1 --open 2 --tier M --intent <validated|author|skipped> --work /w/review-1");
   assert.match(next.slice(1).join("\n"), /^ {2}round 2's fixes ship unreviewed: list them in the report\. This is the correct end of a capped review; a new review to turn it into converged is not\.$/);
 });
 

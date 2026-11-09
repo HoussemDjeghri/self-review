@@ -109,7 +109,16 @@ assume: read the thing the premise names, run it when cheap. A change that
 duplicates what already works is the costliest kind of correct code, and no
 other angle will ask. A reviewer with this angle is the only one guarding the
 gap between what was built and what was wanted; be literal about the request
-and concrete about the gap.
+and concrete about the gap. When the request reports a symptom, find where the user sees
+it: take the symptom's wording (an error message, a label, a log line) from
+the USER'S WORDS block and grep the repository for it with `grep -rni`
+(case-insensitive), and when several places emit it, decide which one the user
+meant from their words, not from the INTENT. Then trace from there to the
+changed lines. If the changed code is off that path, the fix is in the wrong
+place, and that is a blocker, not a test gap. A changed branch you cannot reach
+with the user's input is this finding, whichever lens noticed it. If the block
+says the words are unavailable, trace from the INTENT's reading and say in the
+finding that the ask is unconfirmed.
 
 ### F · Verification audit
 Establish what proves this change works and whether that proof exists. Are
@@ -309,7 +318,11 @@ change actually has surface: whether the change needs to exist (does something
 already do this — check the brief's premise line); correctness of each changed
 line in its enclosing context; anything removed that enforced a behaviour; callers and references of
 anything renamed or re-typed; whether the change does exactly what was asked,
-no less and no more — read the line ranges the brief's governing-documents line
+no less and no more — for a reported symptom, whether the changed lines are on
+the path from where the user sees it (grep the repository with `grep -rni` for
+the symptom's wording from the USER'S WORDS block); code off that path is a
+blocker, not a test gap;
+read the line ranges the brief's governing-documents line
 cites (only those lines), and flag any deliberate cut or choice that contradicts them or the
 request, whatever the INTENT calls it, unless that line cites the owner's
 approval of it as a committed range (a cut narrows, never contradicts; the remedy is the owner's

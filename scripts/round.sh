@@ -64,6 +64,40 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/path.sh
 . "$here/lib/path.sh"
+# shellcheck source=lib/capped.sh
+. "$here/lib/capped.sh"
+
+# Round 1 has to come back inside ONE Bash call — the lead's tool allows 600 s at
+# most — with the briefs printed. Campaign 2 measured the alternative: on a pnpm
+# monorepo staging, lint and a `pnpm test` that alone met its 300 s cap ran
+# round 1 past the call in all 12 CopilotKit runs, and in two the lead abandoned
+# round.sh and reviewed with one hand-briefed finder. So everything that can run
+# long — staging, the checks, the re-run from the checkout, the artifact-root
+# suite — spends one budget, counted from here; the 120 s left under the ceiling
+# is for the tripwire walk (uncapped; 7 s measured on a 44-tree pnpm monorepo),
+# the cold run (its own cap, 90 s by default, clipped so it ends by 570 s) and
+# then impact, tier and briefs, which take seconds. What does not fit is reported by
+# name, never waited on. Ruled 2026-11-08.
+round_started=$(date +%s)
+positive_or() {  # <value> <default> <name>
+  case "$1" in
+    ''|*[!0-9]*|0) [ -z "$1" ] || echo "round.sh: $3 must be a positive whole number of seconds, not '$1'; using $2" >&2
+                   echo "$2" ;;
+    *) v=$((10#$1))
+       if [ "$v" -eq 0 ]; then
+         echo "round.sh: $3 must be a positive whole number of seconds, not '$1'; using $2" >&2
+         echo "$2"
+       else
+         echo "$v"
+       fi ;;
+  esac
+}
+pf_budget="$(positive_or "${SELF_REVIEW_PREFLIGHT_BUDGET:-}" 480 SELF_REVIEW_PREFLIGHT_BUDGET)"
+stage_cap="$(positive_or "${SELF_REVIEW_STAGE_TIMEOUT:-}" 120 SELF_REVIEW_STAGE_TIMEOUT)"
+pf_grace="$(positive_or "${SELF_REVIEW_PREFLIGHT_GRACE:-}" 5 SELF_REVIEW_PREFLIGHT_GRACE)"
+cold_cap="$(positive_or "${SELF_REVIEW_COLDRUN_TIMEOUT:-}" 90 SELF_REVIEW_COLDRUN_TIMEOUT)"
+pf_deadline=$((round_started + pf_budget))
+pf_left() { echo $((pf_deadline - $(date +%s))); }
 
 die() { echo "round.sh: $*" >&2; exit 2; }
 
@@ -220,6 +254,14 @@ if [ "$new_review" -eq 1 ]; then
   cp "$intent" "$work/intent.md"
   intent="$work/intent.md"
 fi
+
+# The user's own words, read from the session transcript once per review and
+# frozen: every brief carries them above the INTENT, which is only the author's
+# reading of them (campaign 2: three runs paraphrased the ask, and every finder
+# checked the fix against the paraphrase). The extractor never fails a round —
+# when it cannot read them it writes "unavailable: <reason>" instead.
+[ -e "$work/user-words.md" ] || "$here/user-words.mjs" --out "$work/user-words.md" 2>/dev/null || true
+words=""; [ ! -f "$work/user-words.md" ] || words="$work/user-words.md"
 
 dir="$work/round-$round"
 mkdir -p "$dir/state"   # reviewers append their lifeboat lines here
@@ -408,9 +450,21 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   #
   # A staging failure is reported, not fatal: pre-flight from the checkout is
   # what every release until now did, and it is worth more than no pre-flight.
+  #
+  # Staging is a copy and normally takes 20-30 s on a monorepo; one campaign-2
+  # run spent 973 s in it. It gets its own cap inside the budget, and a stage
+  # that overruns is the same news as one that failed.
   pf_from="$repo_root"
   stage="$dir/cold run – ü"
-  if ship="$("$here/coldrun.sh" --root "$pf_from" --stage-only --out "$stage" 2>"$dir/stage.err")" && [ -d "$ship" ]; then
+  cap=$stage_cap; left=$(pf_left); [ "$left" -ge "$cap" ] || cap=$left
+  [ "$cap" -ge 1 ] || cap=1
+  stage_rc=0
+  capped_run "$cap" "$pf_grace" "$dir/stage.stopped" \
+    "$here/coldrun.sh" --root "$pf_from" --stage-only --out "$stage" >"$dir/stage.out" 2>"$dir/stage.err" || stage_rc=$?
+  ship="$(head -n 1 "$dir/stage.out" 2>/dev/null || true)"
+  if [ -e "$dir/stage.stopped" ]; then
+    echo "round.sh: staging did not finish in ${cap}s (${dir}/stage.err) — pre-flight runs from the checkout, where a path bug cannot show" >&2
+  elif [ "$stage_rc" -eq 0 ] && [ -n "$ship" ] && [ -d "$ship" ]; then
     pf_from="$ship"
   else
     echo "round.sh: could not stage the install copy (${dir}/stage.err) — pre-flight runs from the checkout, where a path bug cannot show" >&2
@@ -446,7 +500,7 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # exit 1, a FAIL on code nobody broke. Off for pre-flight wherever it runs: a
   # review has no business installing anything. The `pnpm_config_` spelling is
   # the one pnpm reads; `npm_config_…` is ignored (seen in a field run).
-  if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$pf_from" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
+  if ! pnpm_config_verify_deps_before_run=false SELF_REVIEW_PREFLIGHT_GRACE="$pf_grace" "$here/preflight.sh" --root "$pf_from" --deadline "$pf_deadline" --out "$dir/preflight.txt" >/dev/null 2>"$dir/preflight.err"; then
     echo "round.sh: preflight.sh failed (${dir}/preflight.err) — the project's own checks did not run; say so in the report" >&2
   fi
 
@@ -518,11 +572,18 @@ TRIP  $trip_count linked trees    pre-flight wrote into the checkout through the
   # it says a tool was not found. Worded that way, it was printed ~55 times over
   # venv projects whose tools were not on PATH in the checkout either. Which of
   # the two trees lacks the tool is measured by the re-run, and said below.
-  if [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
+  #
+  # The re-run spends the same budget: with under 10 s of it left (the point at
+  # which preflight.sh itself stops starting checks) it is not attempted, and the
+  # line says so instead of the round outliving the lead's call.
+  if [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null && [ "$(pf_left)" -lt 10 ]; then
+    tripped="$tripped
+INFRA staging  no check could start in the install copy, and the re-run from the checkout was not attempted — the ${pf_budget}s pre-flight budget is spent (see ${dir}/preflight.txt)"
+  elif [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
     echo "round.sh: no check could start in the install copy — a tool not found or not executable there (exit 127/126). Re-running pre-flight from the checkout." >&2
     mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
     # The same pnpm switch as the first run, for the same reason.
-    if ! pnpm_config_verify_deps_before_run=false "$here/preflight.sh" --root "$repo_root" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
+    if ! pnpm_config_verify_deps_before_run=false SELF_REVIEW_PREFLIGHT_GRACE="$pf_grace" "$here/preflight.sh" --root "$repo_root" --deadline "$pf_deadline" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
       echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
     fi
     if grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
@@ -594,14 +655,20 @@ INFRA staging  no check could start in the install copy, and they do from the ch
         # run" is a skip, and it says so rather than staying silent.
         pf="$pf
 SKIP artifact-suite  no *.test.mjs under $artifact_root/ — nothing to run as the installed root"
+      elif [ "$(pf_left)" -lt 10 ]; then
+        pf="$pf
+SKIP artifact-suite  pre-flight budget spent — run it by hand: (cd $ship_root && node --test)"
       else
         ship_rc=0
-        ( cd "$ship_root" && env -u NODE_TEST_CONTEXT -u NODE_OPTIONS \
-            SELF_REVIEW_LOG_DIR="$dir/artifact-log" \
-            node --test --test-reporter tap "${ship_tests[@]}" ) >"$dir/artifact-suite.txt" 2>&1 || ship_rc=$?
+        capped_run "$(pf_left)" "$pf_grace" "$dir/artifact.stopped" \
+          sh -c 'cd "$1" && shift && exec env -u NODE_TEST_CONTEXT -u NODE_OPTIONS SELF_REVIEW_LOG_DIR="$0" node --test --test-reporter tap "$@"' \
+          "$dir/artifact-log" "$ship_root" "${ship_tests[@]}" >"$dir/artifact-suite.txt" 2>&1 || ship_rc=$?
         ship_plan="$(awk '/^# tests [1-9]/{t=1} /^# fail 0$/{f=1} END{print (t && f) ? "yes" : "no"}' "$dir/artifact-suite.txt" 2>/dev/null)"
         ship_count="$(awk '/^# tests [0-9]+$/{print $3}' "$dir/artifact-suite.txt" 2>/dev/null | tail -1)"
-        if [ "$ship_rc" -eq 0 ] && [ "$ship_plan" = "yes" ]; then
+        if [ -e "$dir/artifact.stopped" ]; then
+          pf="$pf
+INFRA artifact-suite  did not finish inside the pre-flight budget — no verdict; see $dir/artifact-suite.txt"
+        elif [ "$ship_rc" -eq 0 ] && [ "$ship_plan" = "yes" ]; then
           pf="$pf
 PASS artifact-suite  ${ship_count:-?} tests green with $artifact_root/ as the root"
         else
@@ -749,26 +816,40 @@ elif node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.arg
   # Reported, not swallowed, and never fatal: the skip is recorded in tier.json
   # and printed below, which is a true statement about the review. Losing the
   # round over it would not be.
+  # The cap is its own and not the pre-flight budget: a slow suite spends that
+  # budget and must not cost angle X, whose run is bounded independently
+  # (≤ 20 invocations × 12 s plus staging).
+  cold_left=$((round_started + 570 - $(date +%s)))
+  cold_for=$(( cold_left < cold_cap ? cold_left : cold_cap ))
+  cold_rc=0
   if [ -z "$repo_root" ]; then
     cold_skipped="every path in the scope is outside a repository — there is no tree to stage for a cold run"
-  elif "$here/coldrun.sh" --root "$repo_root" --scope "$scope" --out "$dir/cold run" >"$dir/coldrun.txt" 2>"$dir/coldrun.err"; then
-    cold="$dir/cold run/transcript.md"
-    # A grader with no transcript is a spawn that can only file "not exercised":
-    # measured 2026-08-30 at 237k tokens and four tool calls for that sentence.
-    # An invocation records its exit line, so the count of those IS the answer —
-    # a host with no containment executes nothing and still writes a transcript.
-    invocations="$(grep -c '^- exit: ' "$cold" 2>/dev/null || true)"
-    [ "${invocations:-0}" -gt 0 ] || cold_skipped="the cold run executed nothing — no invocation in $cold"
-    # coldrun.sh keeps its stdout to a few lines precisely so they can land in
-    # the session, and this redirected them into a file nothing reads. That hid
-    # the one line the lead most needs — a host with no containment refuses to
-    # execute, and the refusal's only other surface is a `minor` candidate from
-    # the grader, which a round is entitled to treat as noise. A review that
-    # ran nothing must say so where the person running it will see it.
-    coldout="$(cat "$dir/coldrun.txt")"
+  elif [ "$cold_for" -lt 20 ]; then
+    cold_skipped="no time left for a cold run inside the round's 600 s call (${cold_left}s left)"
   else
-    cold_skipped="coldrun.sh failed — see ${dir}/coldrun.err"
-    echo "round.sh: coldrun.sh failed (${dir}/coldrun.err) — angle X has no transcript to grade" >&2
+    capped_run "$cold_for" "$pf_grace" "$dir/cold.stopped" \
+      "$here/coldrun.sh" --root "$repo_root" --scope "$scope" --out "$dir/cold run" >"$dir/coldrun.txt" 2>"$dir/coldrun.err" || cold_rc=$?
+    if [ -e "$dir/cold.stopped" ]; then
+      cold_skipped="the cold run stopped at its ${cold_for}s cap — no transcript is graded (raise SELF_REVIEW_COLDRUN_TIMEOUT to give it longer)"
+    elif [ "$cold_rc" -eq 0 ]; then
+      cold="$dir/cold run/transcript.md"
+      # A grader with no transcript is a spawn that can only file "not exercised":
+      # measured 2026-08-30 at 237k tokens and four tool calls for that sentence.
+      # An invocation records its exit line, so the count of those IS the answer —
+      # a host with no containment executes nothing and still writes a transcript.
+      invocations="$(grep -c '^- exit: ' "$cold" 2>/dev/null || true)"
+      [ "${invocations:-0}" -gt 0 ] || cold_skipped="the cold run executed nothing — no invocation in $cold"
+      # coldrun.sh keeps its stdout to a few lines precisely so they can land in
+      # the session, and this redirected them into a file nothing reads. That hid
+      # the one line the lead most needs — a host with no containment refuses to
+      # execute, and the refusal's only other surface is a `minor` candidate from
+      # the grader, which a round is entitled to treat as noise. A review that
+      # ran nothing must say so where the person running it will see it.
+      coldout="$(cat "$dir/coldrun.txt")"
+    else
+      cold_skipped="coldrun.sh failed — see ${dir}/coldrun.err"
+      echo "round.sh: coldrun.sh failed (${dir}/coldrun.err) — angle X has no transcript to grade" >&2
+    fi
   fi
 fi
 
@@ -812,13 +893,15 @@ if [ -n "${paths[0]+x}" ] || grep -q '^# TRUNCATED:' "$scope" 2>/dev/null; then 
 
 "$here/brief.mjs" --round "$round" --plan "$dir/tier.json" --intent "$intent" \
   --scope "$scope" ${impact_md:+--impact "$dir/impact.md"} --prior "$dir/prior.md" --ledger "$ledger" \
-  ${cold:+--cold "$cold"} --out "$dir/briefs/"
+  ${cold:+--cold "$cold"} ${words:+--user-words "$words"} --out "$dir/briefs/"
 [ "$replan" -eq 0 ] || trap - EXIT
 
 # The base intent becomes this review's only once the round it briefs exists;
 # moved earlier, a refused round 1 would strand it in a review that never ran.
 if [ "$consume_base_intent" -eq 1 ]; then
   rm "$review_base/intent.md"
+  # The ticket's read of the words must not leak into the next review's ticket.
+  rm -f "$review_base/user-words.md"
   if [ -d "$review_base/ticket" ]; then mv "$review_base/ticket" "$work/ticket"; fi
 fi
 

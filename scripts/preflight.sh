@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # self-review preflight — run the project's own checks before spending reviewers.
 #
-# Usage: preflight.sh [--out <file>] [--tail <n>] [--root <dir>] [path ...]
+# Usage: preflight.sh [--out <file>] [--tail <n>] [--root <dir>] [--deadline <epoch>] [path ...]
 #
 # Detects the checks this project already defines — package.json scripts,
 # pyproject tools, go.mod, Cargo.toml, Makefile targets, an executable
@@ -13,13 +13,17 @@
 # Paths narrow which ecosystems run (only the ones whose file types changed);
 # with no paths, everything detected runs. Checks named in `preflight.skip`
 # (config/defaults.json, overridden by ~/.claude/self-review/config.json) are
-# reported as SKIP and never run. Each check is killed after
-# SELF_REVIEW_PREFLIGHT_TIMEOUT seconds (default 300); the kill reaches the
-# command's own shell, not always its grandchildren.
+# reported as SKIP and never run. Each check is stopped after
+# SELF_REVIEW_PREFLIGHT_TIMEOUT seconds (default 300) — its whole process group,
+# TERM and then KILL after SELF_REVIEW_PREFLIGHT_GRACE seconds (default 5).
+# --deadline is an absolute time (epoch seconds) shared with the caller's other
+# work: each check gets what is left of it, and a check with less than 10 s left
+# is SKIP rather than started.
 #
-# A check is PASS, FAIL, INFRA or SKIP. INFRA is "the command could not be run
-# at all" (exit 126/127) and is counted apart from FAIL on purpose, so that a
-# genuine red still stands out against an environment that is broken.
+# A check is PASS, FAIL, INFRA or SKIP. INFRA is "no verdict on the code": the
+# command could not be run at all (exit 126/127), or it was stopped before it
+# finished. Both are counted apart from FAIL on purpose, so that a genuine red
+# still stands out against an environment that is broken or a suite that is slow.
 #
 # Exit 0 even when checks fail — a failing check is the report, not an error, so
 # the caller reads the report instead of branching on $?. Exit 2 is usage.
@@ -32,9 +36,15 @@ case "$TIMEOUT" in
   ''|*[!0-9]*|0) echo "preflight.sh: SELF_REVIEW_PREFLIGHT_TIMEOUT must be a positive whole number of seconds, not '$TIMEOUT'; using 300" >&2
                  TIMEOUT=300 ;;
 esac
+GRACE=${SELF_REVIEW_PREFLIGHT_GRACE:-5}
+case "$GRACE" in
+  ''|*[!0-9]*|0) echo "preflight.sh: SELF_REVIEW_PREFLIGHT_GRACE must be a positive whole number of seconds, not '$GRACE'; using 5" >&2
+                 GRACE=5 ;;
+esac
 tail_lines=40
 out=""
 root=""
+deadline=""
 paths=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +57,9 @@ while [ $# -gt 0 ]; do
     --root) [ $# -ge 2 ] || { echo "preflight.sh: --root needs a directory" >&2; exit 2; }
             root="$2"; shift 2 ;;
     --root=*) root="${1#--root=}"; shift ;;
+    --deadline) [ $# -ge 2 ] || { echo "preflight.sh: --deadline needs an epoch time" >&2; exit 2; }
+                deadline="$2"; shift 2 ;;
+    --deadline=*) deadline="${1#--deadline=}"; shift ;;
     # Derived, not a line range: the range was '2,21p' and this header grew by
     # four lines, so --help silently stopped printing its last paragraph. The
     # header runs from the shebang to the first `set -`, which is the same form
@@ -59,6 +72,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$tail_lines" in ''|*[!0-9]*) echo "preflight.sh: --tail needs a number" >&2; exit 2 ;; esac
+case "$deadline" in *[!0-9]*) echo "preflight.sh: --deadline needs an epoch time in seconds" >&2; exit 2 ;; esac
 
 if [ -z "$root" ]; then
   root=$(git rev-parse --show-toplevel 2>/dev/null) || root="$PWD"
@@ -171,25 +185,20 @@ fi
 
 is_skipped() { case " $skips " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-# Best-effort time cap: bash 3.2 has no `timeout` binary on macOS, so a watchdog
-# subshell kills the check's shell. `wait` reports 143 for a TERMed child.
+# shellcheck source=lib/capped.sh
+. "$(dirname -- "$0")/lib/capped.sh"
+
+# The project's command under a hard cap; `$3` is created if the cap stopped it.
 run_check() {
-  local cmd="$1" outfile="$2" rc
-  ( cd "$root" && sh -c "$cmd" ) >"$outfile" 2>&1 &
-  local pid=$!
-  ( sleep "$TIMEOUT"; kill -TERM "$pid" ) >/dev/null 2>&1 &
-  local watchdog=$!
-  wait "$pid"; rc=$?
-  kill "$watchdog" >/dev/null 2>&1
-  wait "$watchdog" >/dev/null 2>&1
-  return $rc
+  local cmd="$1" outfile="$2" marker="$3" cap="$4"
+  capped_run "$cap" "$GRACE" "$marker" sh -c 'cd "$1" && exec sh -c "$2"' sh "$root" "$cmd" >"$outfile" 2>&1
 }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX") || { echo "preflight.sh: cannot create temp dir" >&2; exit 2; }
 trap 'rm -rf "$work"' EXIT
 status="$work/status"; details="$work/details"
 : >"$status"; : >"$details"
-ran=0 failed=0 skipped=0 infra=0
+ran=0 failed=0 skipped=0 infra=0 unfinished=0
 
 for kind in format lint types test; do
   has_kind "$kind" || continue
@@ -199,9 +208,37 @@ for kind in format lint types test; do
     skipped=$((skipped + 1))
     continue
   fi
-  run_check "$cmd" "$work/$kind.out"; rc=$?
+  cap=$TIMEOUT
+  if [ -n "$deadline" ]; then
+    left=$((deadline - $(date +%s)))
+    if [ "$left" -lt 10 ]; then
+      printf 'SKIP  %-7s %s   (pre-flight budget spent — re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged)\n' "$kind" "$cmd" >>"$status"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    [ "$left" -ge "$cap" ] || cap=$left
+  fi
+  run_check "$cmd" "$work/$kind.out" "$work/$kind.stopped" "$cap"; rc=$?
   ran=$((ran + 1))
-  if [ "$rc" -eq 0 ]; then
+  if [ -e "$work/$kind.stopped" ]; then
+    # Stopped is not red. A cap that fired says the suite is slower than the
+    # cap, which is a fact about the budget: in 6 of 12 CopilotKit runs the
+    # 300 s cap stopped a `pnpm test` whose tail read 915 passed of 915, and
+    # every one was reported FAIL — wrong every time, which is the signal this
+    # report has learned not to send. A hang the change caused reads the same,
+    # so the line says there is no verdict and the tail is kept below; the lead
+    # reports the suite unverified, an absent signal rather than a false one,
+    # and it blocks `converged` until a re-run gives the check a verdict.
+    # Read from the marker, never from exit 143: a suite that exits 143 by
+    # itself is a red suite.
+    unfinished=$((unfinished + 1))
+    printf 'INFRA %-7s %s   (did not finish in %ss — no verdict on the code; re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged)\n' "$kind" "$cmd" "$cap" >>"$status"
+    {
+      echo
+      echo "--- DID NOT FINISH $kind: last $tail_lines lines of \`$cmd\` ---"
+      tail -n "$tail_lines" "$work/$kind.out"
+    } >>"$details"
+  elif [ "$rc" -eq 0 ]; then
     printf 'PASS  %-7s %s\n' "$kind" "$cmd" >>"$status"
   elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
     # A check that could not START is not a check that failed, and reporting it
@@ -212,16 +249,12 @@ for kind in format lint types test; do
     # found" — the shell's own answer to "did this ever run", which is why they
     # are the whole test. A per-tool error-string list (`ERR_PNPM_…`,
     # `npm ERR! code E…`) would catch more and rot silently, and a check that
-    # rots is the thing being fixed here. A TIMEOUT stays FAIL: a hang can be
-    # real, and a suite that never terminates is a finding.
+    # rots is the thing being fixed here.
     infra=$((infra + 1))
     printf 'INFRA %-7s %s   (exit %s — the command could not be run; the check never started)\n' "$kind" "$cmd" "$rc" >>"$status"
   else
     failed=$((failed + 1))
-    case "$rc" in
-      143|124) printf 'FAIL  %-7s %s   (timeout %ss)\n' "$kind" "$cmd" "$TIMEOUT" >>"$status" ;;
-      *) printf 'FAIL  %-7s %s   (exit %s)\n' "$kind" "$cmd" "$rc" >>"$status" ;;
-    esac
+    printf 'FAIL  %-7s %s   (exit %s)\n' "$kind" "$cmd" "$rc" >>"$status"
     {
       echo
       echo "--- FAIL $kind: last $tail_lines lines of \`$cmd\` ---"
@@ -237,7 +270,7 @@ report="$work/report"
   if [ "$ran" -eq 0 ] && [ "$skipped" -eq 0 ]; then
     echo "# no checks detected — this project defines no formatter, linter, type-checker or test command that preflight recognises"
   else
-    echo "# $ran run, $failed failed, $infra could not start, $skipped skipped"
+    echo "# $ran run, $failed failed, $infra could not start, $unfinished did not finish, $skipped skipped"
     if [ "$ran" -gt 0 ] && [ "$infra" -eq "$ran" ]; then
       echo "# EVERY check failed to start (exit 126/127: a tool not found or not executable where they ran)."
       echo "# Nothing here is a verdict on the code, and the reviewers still need a real one."
@@ -253,6 +286,7 @@ if [ -n "$out" ]; then
   # stdout stays the summary: the failure tails are one Read away in the file.
   sed -n '1,3p' "$report"; cat "$status"
   [ "$failed" -eq 0 ] || echo "# failures quoted in $out"
+  [ "$unfinished" -eq 0 ] || echo "# tails of the checks that did not finish quoted in $out"
 else
   cat "$report"
 fi

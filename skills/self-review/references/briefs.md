@@ -8,7 +8,7 @@ cannot inherit your blind spots), so anything it needs must be in the brief.
 
 ```
 INTENT
-User asked (quote the load-bearing phrases): "<…>"
+Author's reading of the ask: <what you understood the user to want, in one line — round.sh puts the user's own words, verbatim from the transcript, above this block in every brief, so do not quote them here; this line is checked against them>
 Constraints / conventions that apply: <CLAUDE.md rules, framework, perf/security constraints, "no new deps", …>
 Governing documents: <every approved plan, spec or ruling this work implements, each cited as path:from-to plus its heading, e.g. "PLAN.md:40-58 (## M5.A), PLAN.md:12-20 (## Rules)" — the task's section and any general section whose rules it must keep; a file under ~20 lines may be cited whole; a plan that is not a repo file is quoted inline with where it came from — or "none: <what you checked>", e.g. "none: no PLAN.md, no spec under docs/, the ask is the chat">
 Invariant: <the property that must hold when this is done, stated so it can be falsified — "a reviewed repository cannot make its own review weaker", not "the config is validated">
@@ -60,7 +60,7 @@ Send one per angle group with the `subagent_type` the plan's row names — norma
 message so they run in parallel.
 
 `brief.mjs` writes the brief itself; this file does not reproduce it. Its
-sections, in order: the INTENT block · SCOPE (the round's `scope.diff`, plus
+sections, in order: USER'S WORDS (`<work>/user-words.md`) · the INTENT block · SCOPE (the round's `scope.diff`, plus
 where the live files are) · YOUR ANGLE, pasted verbatim from `angles.md` ·
 IMPACT at the row's depth · PRIOR FINDINGS · ALREADY DISMISSED · FIX HISTORY
 (angle `S` only) · STATE FILE · CALL BUDGET · OUTPUT. The sections that depend

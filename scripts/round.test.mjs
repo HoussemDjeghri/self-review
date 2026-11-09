@@ -18,6 +18,9 @@ const FINDINGS = path.join(HERE, "findings.mjs");
 // Every round's `prior`, `engagement` and (from round 2) `converge` call writes
 // under the log dir; the suite must not write into the developer's own memory.
 process.env.SELF_REVIEW_LOG_DIR = mkdtempSync(path.join(tmpdir(), "round-log-"));
+// round.sh reads the user's words from the session transcript; inherited from the
+// session running the suite, it would brief every fixture with that session's prompts.
+delete process.env.CLAUDE_CODE_SESSION_ID;
 
 /** A repo with one committed file and a small uncommitted edit to it. */
 const fixture = ({ workName = "sr" } = {}) => {
@@ -174,13 +177,15 @@ function shadowRound(work, stub) {
     writeFileSync(path.join(shadow, name), body);
     chmodSync(path.join(shadow, name), 0o755);
   }
-  for (const name of ["scope.sh", "tier.mjs", "impact.mjs", "findings.mjs", "brief.mjs", "preflight.sh", "coldrun.sh", "treecheck.sh"]) {
+  for (const name of ["scope.sh", "tier.mjs", "impact.mjs", "findings.mjs", "brief.mjs", "preflight.sh", "coldrun.sh", "treecheck.sh", "user-words.mjs"]) {
     if (stub[name]) continue;
     writeFileSync(path.join(shadow, name), `#!/bin/sh\nexec "${path.join(HERE, name)}" "$@"\n`);
     chmodSync(path.join(shadow, name), 0o755);
   }
   writeFileSync(path.join(shadow, "round.sh"), readFileSync(path.join(HERE, "round.sh"), "utf8"));
-  writeFileSync(path.join(shadow, "lib", "path.sh"), readFileSync(path.join(HERE, "lib", "path.sh"), "utf8"));
+  for (const lib of ["path.sh", "capped.sh"]) {
+    writeFileSync(path.join(shadow, "lib", lib), readFileSync(path.join(HERE, "lib", lib), "utf8"));
+  }
   return path.join(shadow, "round.sh");
 }
 
@@ -503,7 +508,7 @@ test("a failing impact.mjs costs the blast radius, not the round", () => {
   mkdirSync(shadow, { recursive: true });
   writeFileSync(path.join(shadow, "impact.mjs"), "#!/bin/sh\nexit 9\n");
   chmodSync(path.join(shadow, "impact.mjs"), 0o755);
-  for (const name of ["scope.sh", "tier.mjs", "findings.mjs", "brief.mjs", "preflight.sh", "treecheck.sh"]) {
+  for (const name of ["scope.sh", "tier.mjs", "findings.mjs", "brief.mjs", "preflight.sh", "treecheck.sh", "user-words.mjs"]) {
     writeFileSync(path.join(shadow, name), `#!/bin/sh\nexec "${path.join(HERE, name)}" "$@"\n`);
     chmodSync(path.join(shadow, name), 0o755);
   }
@@ -511,7 +516,9 @@ test("a failing impact.mjs costs the blast radius, not the round", () => {
   // shadow dir — a shim that execs the real one lands `here` back in scripts/.
   writeFileSync(path.join(shadow, "round.sh"), readFileSync(path.join(HERE, "round.sh"), "utf8"));
   mkdirSync(path.join(shadow, "lib"), { recursive: true });
-  writeFileSync(path.join(shadow, "lib", "path.sh"), readFileSync(path.join(HERE, "lib", "path.sh"), "utf8"));
+  for (const lib of ["path.sh", "capped.sh"]) {
+    writeFileSync(path.join(shadow, "lib", lib), readFileSync(path.join(HERE, "lib", lib), "utf8"));
+  }
 
   const done = spawnSync("bash", [path.join(shadow, "round.sh"), "--work", work, "--round", "1",
     "--intent", path.join(work, "intent.md"), "--no-preflight"], { cwd: repo, encoding: "utf8" });
@@ -531,12 +538,12 @@ test("a failing pre-flight is reported, not swallowed", () => {
   mkdirSync(path.join(shadow, "lib"), { recursive: true });
   writeFileSync(path.join(shadow, "preflight.sh"), "#!/bin/sh\necho 'crash' >&2\nexit 2\n");
   chmodSync(path.join(shadow, "preflight.sh"), 0o755);
-  for (const name of ["scope.sh", "tier.mjs", "impact.mjs", "findings.mjs", "brief.mjs", "treecheck.sh"]) {
+  for (const name of ["scope.sh", "tier.mjs", "impact.mjs", "findings.mjs", "brief.mjs", "treecheck.sh", "user-words.mjs"]) {
     writeFileSync(path.join(shadow, name), `#!/bin/sh\nexec "${path.join(HERE, name)}" "$@"\n`);
     chmodSync(path.join(shadow, name), 0o755);
   }
   writeFileSync(path.join(shadow, "round.sh"), readFileSync(path.join(HERE, "round.sh"), "utf8"));
-  writeFileSync(path.join(shadow, "lib", "path.sh"), readFileSync(path.join(HERE, "lib", "path.sh"), "utf8"));
+  for (const lib of ["path.sh", "capped.sh"]) writeFileSync(path.join(shadow, "lib", lib), readFileSync(path.join(HERE, "lib", lib), "utf8"));
 
   const done = spawnSync("bash", [path.join(shadow, "round.sh"), "--work", work, "--round", "1",
     "--intent", path.join(work, "intent.md")], { cwd: repo, encoding: "utf8" });
@@ -707,6 +714,128 @@ test("every check failing to start in the copy falls back to the checkout and na
   assert.match(done.stdout, /pre-flight \(from .*\/repo\):/,
     "the fallback reran from the checkout, so the header must say the checkout");
   assert.doesNotMatch(done.stdout, /pre-flight \(from .*cold run/, done.stdout);
+});
+
+// Campaign 2: on a CopilotKit-sized pnpm monorepo round 1 outran the lead's Bash
+// call in 13 of 27 plugin runs (all 12 CopilotKit runs) — staging plus lint plus
+// a `pnpm test` that alone hit its 300 s cap — and in two of them the lead gave
+// up on round.sh and reviewed with one hand-briefed finder. Pre-flight has one
+// budget for the whole round now, and a check it stops is no verdict, not a red.
+// Committed, so the check script is the project's and not part of the change:
+// an untracked executable is in scope, and the cold run would execute it too.
+const commitTestSh = (repo, body) => {
+  writeFileSync(path.join(repo, "test.sh"), body);
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  spawnSync("git", ["add", "test.sh"], { cwd: repo });
+  spawnSync("git", ["commit", "-qm", "checks"], { cwd: repo });
+};
+const slowSuite = (repo, mark) =>
+  commitTestSh(repo, `#!/bin/sh\ntrap '' TERM\n( sleep 15; touch "${mark}" ) &\nsleep 60\n`);
+const budgetEnv = { ...process.env, SELF_REVIEW_PREFLIGHT_BUDGET: "12", SELF_REVIEW_PREFLIGHT_GRACE: "1", SELF_REVIEW_STAGE_TIMEOUT: "2" };
+
+test("a suite slower than the pre-flight budget still leaves a planned round, with no verdict claimed", () => {
+  const { repo, work } = fixture();
+  const mark = path.join(path.dirname(work), "survivor");
+  slowSuite(repo, mark);
+  const started = Date.now();
+  const done = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: budgetEnv });
+  const seconds = (Date.now() - started) / 1000;
+  assert.equal(done.status, 0, done.stderr);
+  assert.ok(seconds < 45, `round 1 took ${seconds}s on a 12 s pre-flight budget`);
+  assert.match(done.stdout, /^Agent \{/m, "the briefs are printed");
+  assert.match(done.stdout, /^INFRA test {4}\.\/test\.sh {3}\(did not finish in \d+s — no verdict on the code; re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged\)/m, done.stdout);
+  assert.doesNotMatch(done.stdout, /^FAIL/m, "a stopped suite is not a red one");
+  assert.doesNotMatch(readFileSync(path.join(work, "round-1", "preflight.txt"), "utf8"), /EVERY check failed to start/);
+  assert.doesNotMatch(done.stderr, /Re-running pre-flight from the checkout/, "a timeout is not a check that could not start");
+  spawnSync("sleep", ["16"]);
+  assert.equal(existsSync(mark), false, "a process the stopped suite started outlived it");
+});
+
+test("staging that does not finish in its cap falls back to the checkout instead of holding the round", () => {
+  const { repo, work } = fixture();
+  commitTestSh(repo, "#!/bin/sh\necho ok\n");
+  const round = shadowRound(work, { "coldrun.sh": `#!/bin/sh\ncase " $* " in *" --stage-only "*) sleep 60 ;; esac\nexec "${path.join(HERE, "coldrun.sh")}" "$@"\n` });
+  const started = Date.now();
+  const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...budgetEnv, SELF_REVIEW_PREFLIGHT_BUDGET: "30" } });
+  const seconds = (Date.now() - started) / 1000;
+  assert.equal(done.status, 0, done.stderr);
+  assert.ok(seconds < 40, `round 1 waited ${seconds}s on a 2 s staging cap`);
+  assert.match(done.stderr, /staging did not finish in 2s .* pre-flight runs from the checkout/, done.stderr);
+  assert.match(done.stdout, /^PASS\s+\S+\s+\.\/test\.sh/m, "the checks still ran, from the checkout");
+});
+
+test("with the budget already spent, checks are skipped by name rather than run past the deadline", () => {
+  const { repo, work } = fixture();
+  commitTestSh(repo, "#!/bin/sh\necho ok\n");
+  const round = shadowRound(work, { "coldrun.sh": `#!/bin/sh\ncase " $* " in *" --stage-only "*) sleep 60 ;; esac\nexec "${path.join(HERE, "coldrun.sh")}" "$@"\n` });
+  const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...budgetEnv, SELF_REVIEW_PREFLIGHT_BUDGET: "3" } });
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^SKIP {2}test {4}\.\/test\.sh {3}\(pre-flight budget spent — re-run pre-flight with a longer SELF_REVIEW_PREFLIGHT_TIMEOUT; blocks converged\)/m, done.stdout);
+  assert.match(done.stdout, /^Agent \{/m);
+});
+
+test("with the budget spent, the re-run from the checkout is not attempted when no check could start in the copy", () => {
+  // preflight.sh itself stops starting checks under 10 s left, so on a spent
+  // budget the real one never writes the all-failed-to-start line; both stubs
+  // stand in for a stage and a pre-flight that finished just inside it.
+  const { repo, work } = fixture();
+  const round = shadowRound(work, {
+    "coldrun.sh": [
+      "#!/bin/sh",
+      `case " $* " in *" --stage-only "*) ;; *) exec "${path.join(HERE, "coldrun.sh")}" "$@" ;; esac`,
+      'while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done',
+      'mkdir -p "$out"; echo "$out"',
+      "",
+    ].join("\n"),
+    "preflight.sh": [
+      "#!/bin/sh",
+      'while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done',
+      "printf '# EVERY check failed to start\\n' > \"$out\"",
+      "",
+    ].join("\n"),
+  });
+  const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...budgetEnv, SELF_REVIEW_PREFLIGHT_BUDGET: "3" } });
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^INFRA staging {2}no check could start in the install copy, and the re-run from the checkout was not attempted/m, done.stdout + done.stderr);
+  assert.equal(existsSync(path.join(work, "round-1", "preflight-stage.txt")), false, "the re-run never moved the copy's report aside");
+});
+
+test("with the budget spent, the artifact-root suite is skipped by name", () => {
+  const { repo, work } = fixture();
+  mkdirSync(path.join(repo, "ship"), { recursive: true });
+  writeFileSync(path.join(repo, "ship", "a.test.mjs"),
+    'import { test } from "node:test";\nimport assert from "node:assert/strict";\ntest("red", () => assert.equal(1, 2));\n');
+  const cfg = path.join(mkdtempSync(path.join(tmpdir(), "round-cfg-")), "config.json");
+  writeFileSync(cfg, JSON.stringify({ preflight: { skip: ["*"], artifactRoot: "ship" } }));
+  const done = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...budgetEnv, SELF_REVIEW_CONFIG: cfg, SELF_REVIEW_PREFLIGHT_BUDGET: "3" } });
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^SKIP artifact-suite {2}pre-flight budget spent/m, done.stdout + done.stderr);
+});
+
+test("a cold run slower than its own cap is stopped, and angle X is dropped rather than graded on a partial run", () => {
+  const { repo, work } = runnableFixture();
+  const round = shadowRound(work, { "coldrun.sh": `#!/bin/sh\ncase " $* " in *" --stage-only "*) ;; *) sleep 60 ;; esac\nexec "${path.join(HERE, "coldrun.sh")}" "$@"\n` });
+  const started = Date.now();
+  const done = spawnSync("bash", [round, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md")],
+    { cwd: repo, encoding: "utf8", env: { ...budgetEnv, SELF_REVIEW_COLDRUN_TIMEOUT: "25" } });
+  const seconds = (Date.now() - started) / 1000;
+  assert.equal(done.status, 0, done.stderr);
+  assert.ok(seconds < 70, `round 1 took ${seconds}s on a 25 s cold-run cap`);
+  assert.match(done.stdout, /cold run: nothing to grade — the cold run stopped at its \d+s cap/, done.stdout + done.stderr);
+  assert.doesNotMatch(done.stdout, /^Agent \{.*self-review-cold-grader/m, "no grader is spawned for a run that was stopped");
+});
+
+test("a budget with a leading zero is read as decimal, not octal", () => {
+  const { repo, work } = fixture();
+  const done = spawnSync("bash", [ROUND, "--work", work, "--round", "1", "--intent", path.join(work, "intent.md"), "--no-preflight"],
+    { cwd: repo, encoding: "utf8", env: { ...process.env, SELF_REVIEW_PREFLIGHT_BUDGET: "08" } });
+  assert.equal(done.status, 0, done.stderr);
+  assert.doesNotMatch(done.stderr, /value too great/);
 });
 
 test("a tool only the checkout has is named as missing from the staged copy", () => {
@@ -1386,4 +1515,50 @@ test("a later round leaves scope.json as round 1 wrote it", () => {
   const done = run(repo, ["--work", work, "--round", "2", "--intent", intent, "--no-preflight"]);
   assert.equal(done.status, 0, done.stderr);
   assert.equal(readFileSync(path.join(work, "scope.json"), "utf8"), before);
+});
+
+// Campaign 2 (ck/a2ui-unknown): the INTENT's "User asked" line was the author's
+// paraphrase in all three runs, and every finder checked the fix against it.
+test("round 1 reads the user's words fresh from the transcript, even after a ticket, and every brief carries them above the INTENT", () => {
+  const { repo, work } = fixture();
+  const config = mkdtempSync(path.join(tmpdir(), "round-cfg-"));
+  const session = "0123abcd-0000-4000-8000-000000000001";
+  mkdirSync(path.join(config, "projects", "p"), { recursive: true });
+  writeFileSync(path.join(config, "projects", "p", `${session}.jsonl`), `${JSON.stringify(
+    { type: "user", uuid: "u-1", timestamp: "2026-11-08T10:00:00Z", message: { role: "user", content: "keep the red line, not the border" } })}\n`);
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SESSION_ID: session };
+  const start = (base) => spawnSync("bash", [ROUND, "--new-review", "--work", base, "--intent", path.join(base, "intent.md"), "--no-preflight"],
+    { cwd: repo, encoding: "utf8", env });
+  const done = start(work);
+  assert.equal(done.status, 0, done.stderr);
+  const review = /^work: (.*)$/m.exec(done.stdout)[1];
+  assert.match(readFileSync(path.join(review, "user-words.md"), "utf8"), /keep the red line, not the border/);
+  const briefs = readdirSync(path.join(review, "round-1", "briefs"));
+  assert.ok(briefs.length > 0);
+  for (const name of briefs) {
+    const text = readFileSync(path.join(review, "round-1", "briefs", name), "utf8");
+    assert.ok(text.indexOf("keep the red line") > -1 && text.indexOf("keep the red line") < text.indexOf("intent"), name);
+  }
+  // A ticket's earlier read is not carried in: round 1 reads the transcript
+  // again, so a correction typed after the ticket still reaches the briefs.
+  // The ticket's file is removed with the base intent all the same.
+  writeFileSync(path.join(work, "intent.md"), "intent\n");
+  writeFileSync(path.join(work, "user-words.md"), "USER'S WORDS (from the ticket)\nthe ticket's copy\n");
+  const second = start(work);
+  assert.equal(second.status, 0, second.stderr);
+  const next = /^work: (.*)$/m.exec(second.stdout)[1];
+  const fresh = readFileSync(path.join(next, "user-words.md"), "utf8");
+  assert.match(fresh, /keep the red line, not the border/);
+  assert.doesNotMatch(fresh, /the ticket's copy/);
+  assert.ok(!existsSync(path.join(work, "user-words.md")), "consumed with the base intent");
+});
+
+test("with no transcript to read, the briefs say the user's words are unavailable rather than leave the field out", () => {
+  const { repo, work } = fixture();
+  const done = spawnSync("bash", [ROUND, "--new-review", "--work", work, "--intent", path.join(work, "intent.md"), "--no-preflight"],
+    { cwd: repo, encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+  const review = /^work: (.*)$/m.exec(done.stdout)[1];
+  const [name] = readdirSync(path.join(review, "round-1", "briefs"));
+  assert.match(readFileSync(path.join(review, "round-1", "briefs", name), "utf8"), /USER'S WORDS: unavailable: no session id/);
 });

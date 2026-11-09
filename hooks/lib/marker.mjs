@@ -31,7 +31,7 @@
  *   reason    not-applicable: no-code-changed | user-declined | scratch-only | other
  *             not-converged:  rounds-cap | stall | oscillation | open-blocker |
  *                             reviewer-failed | budget | user-stopped |
- *                             single-pass | other
+ *                             single-pass | checks-unverified | other
  *                                 required for both, refused on converged. One
  *                                 field whose vocabulary depends on the outcome.
  *                                 Required on not-converged for the reason
@@ -71,7 +71,7 @@ export const NA_REASONS = ["no-code-changed", "user-declined", "scratch-only", "
 // the loop — converge's round count, or the session running out around it.
 // `other` is the way out a closed list needs to stay answerable, and its rate
 // is the signal that the list is wrong, which /self-review:retro reports.
-export const NC_REASONS = ["rounds-cap", "stall", "oscillation", "open-blocker", "reviewer-failed", "budget", "user-stopped", "single-pass", "other"];
+export const NC_REASONS = ["rounds-cap", "stall", "oscillation", "open-blocker", "reviewer-failed", "budget", "user-stopped", "single-pass", "checks-unverified", "other"];
 /** The reason vocabulary an outcome takes, or null when it takes none. */
 export const reasonsFor = (outcome) => (outcome === "not-applicable" ? NA_REASONS : outcome === "not-converged" ? NC_REASONS : null);
 export const COUNTS = ["rounds", "fixed", "dismissed", "open"];

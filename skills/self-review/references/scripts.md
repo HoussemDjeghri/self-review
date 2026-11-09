@@ -162,12 +162,64 @@ which is global to you. Setting it for one project names that subdirectory in
 
 `round.sh` runs pre-flight against a **copy** of the tree at
 `<work>/round-1/cold run – ü/install`, not against the repository — same checks,
-same cost, run from a path that is not the developer's, with an empty HOME.
+same cost, run from a path that is not the developer's, with the developer's own
+HOME (an empty one makes pnpm and its kin repair themselves into the checkout).
+
+**Pre-flight has one budget, so round 1 fits one Bash call.** Staging, every
+check, the re-run from the checkout and the artifact-root suite share
+`SELF_REVIEW_PREFLIGHT_BUDGET` (480 s, counted from when `round.sh` starts),
+leaving the rest of the tool's 600 s ceiling for impact, tier and briefs.
+Staging has its own cap inside it (`SELF_REVIEW_STAGE_TIMEOUT`, 120 s; an
+overrun falls back to the checkout). Each check gets what is left, capped at
+`SELF_REVIEW_PREFLIGHT_TIMEOUT` (300 s), and is stopped as a whole process
+group. Two lines mean **no verdict on the code**, not a red suite:
+`INFRA … (did not finish in Ns …)` — the check was stopped, its tail is in
+`preflight.txt` — and `SKIP … (pre-flight budget spent …)` — it never started.
+Report that check as unverified, never as failing — and it blocks
+`converged`: `findings.mjs converge` withholds the `converged` call (its `next:`
+prints the re-run instead) and `converged.sh --work` refuses it while
+the newest report naming the check (`<work>/round-*/preflight*.txt` or
+`<work>/preflight*.txt`, by mtime) still has no verdict. The Stop gate makes the
+same refusal for a `converged` written as `<work>/CONVERGED.json`. A marker that
+is not in `<work>` is checked by the gate too: the `review` id it carries (the
+script prints it) is resolved against the `work:` paths this session's round.sh
+printed, any `--work` a converged.sh call was given, and the review dirs beside
+them, and one that matches nothing is
+refused; a marker with no id is checked against every open review dir beside it
+or beside those `work:` paths.
+
+The re-run runs every detected check again, not only the
+unverified one (preflight.sh has no per-check selector), so a check that passed
+costs its time a second time. The checks are the ones preflight.sh names:
+round.sh's `artifact-suite` lines use the same words and are not counted (run
+that suite by hand). A check is keyed on its kind, so a re-run that detects a
+different command for it still decides it; and a report is trusted
+by its name and place, not by a signature — the evidence is what preflight.sh
+wrote, so write it only by running preflight.sh. Clear an unverified check with
+the call converge prints — `preflight.sh --out <work>/preflight-rerun.txt` with a
+longer `SELF_REVIEW_PREFLIGHT_TIMEOUT`, in a background Bash call — or end
+`--not-converged --reason checks-unverified`.
+
+The gate holds that line. If any call the session ran wrote, moved or removed a
+`preflight*.txt` in the review's dir or a round dir — Write, Edit, a redirect,
+`tee`, `cp` into it, `mv`, `rm` (a glob included), `sed -i`, `truncate` — or
+removed or moved the round or review dir itself, `converged` is refused for that
+review. Reading one — `cat`, `sed -n`, or `cp` with the report as the source —
+is not a write. The check reads the paths a command names: a write it cannot
+name (an interpreter computing its target, a variable) is not counted, because
+counting it would refuse every review that ran a one-liner; it catches a slip,
+not a forgery by intent. A re-run does not clear this one: the transcript cannot tell a later
+real report from a later forged one, so the review ends `--not-converged
+--reason checks-unverified` or starts again with `round.sh --new-review`. A check in `preflight.skip` and
+one that could not start (`INFRA … exit 127`) do not count. The cold run behind angle X is not in that budget:
+it has its own cap (`SELF_REVIEW_COLDRUN_TIMEOUT`, 90 s by default) clipped so
+it ends 30 s before the 600 s call does; a run stopped by it drops X with the
+reason, never a partial transcript graded.
 
 ## Briefs
 
 `brief.mjs` writes one brief per finder row and prints the `Agent` line that
-spawns it. Each brief carries the intent block, the scope pointer, that row's
+spawns it. Each brief carries the user's words, then the intent block, the scope pointer, that row's
 angle text verbatim from the catalogue, the impact block at its depth, the ≤ 10
 prior findings this repository recorded against these files, the dismissed
 ledger, a state-file path the reviewer appends candidates to as it works (the
@@ -175,6 +227,15 @@ lifeboat §2f salvages), and the call budget — held to `brief.maxTokens`, sayi
 in its own header what it had to trim. Passing the brief as a path costs about
 30 tokens of prompt instead of the ~1,300 an inlined brief costs, on every
 finder of every round.
+
+The user's words are `<work>/user-words.md`, which round 1 writes once per
+review with `user-words.mjs`: every prompt the user typed in the main session
+since the last self-review record, verbatim from the transcript (4 KB a prompt,
+12 KB in all, with what is cut marked and pointed at). They sit above
+the INTENT because the INTENT is the author's reading of them, and a
+paraphrase of the ask was what campaign 2's finders were checked against. When
+the transcript cannot be read the field says `unavailable: <reason>`; it is
+never absent, and the verifier brief carries it too.
 
 ## Findings memory
 
@@ -190,10 +251,12 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 
 - `scripts/round.sh` — **the entry point**: a whole round's setup in one call, the tier ceiling a later round inherits, the round-1 re-plan, the replay of round 1's scope for every later round, and the refusal after `STOP` (§0)
 - `scripts/lib/path.sh` — `abs_path`, shared by `round.sh` and `scope.sh`
+- `scripts/lib/capped.sh` — `capped_run`: runs a command in its own process group under a hard time cap and leaves a marker when it stopped it; shared by `round.sh` and `preflight.sh`
 - `scripts/scope.sh` — scope bundle (diff + untracked files; each path diffed against its own repo, plain text only for paths in none)
 - `scripts/impact.mjs` — blast radius: broken references, tests, callers, docs (§0); writes `impact.md` + `impact.json`
 - `scripts/tier.mjs` — the tier, its reasons, and the round's finder rows (§0); writes `tier.json`
 - `scripts/brief.mjs` — one brief per finder row, held to the token budget, and the `Agent` line for each (§2b); `--verify` does the same for a verifier batch (§2d)
+- `scripts/user-words.mjs` — the user's own prompts for the review, read from the session transcript, for the briefs' USER'S WORDS block (§0); the ticket writes it too
 - `scripts/findings.mjs` — `prior` for the briefs, `record` for the round's verdicts, `converge` for the W rule and the round cap; `record` and `converge` print the verdict and its `next:` call (§2b, §2e, §3)
 - `scripts/preflight.sh` — the project's own checks for the touched ecosystems (§1)
 - `scripts/wait.mjs` — the one-call wait on a round's agents (rule 1); writes `round-N/reports/<name>.json`, each finished finder's or cold-grader's candidate count, for `record`'s `[]` guard
@@ -218,4 +281,6 @@ Everything below lives under `${CLAUDE_PLUGIN_ROOT}`, the installed plugin direc
 - `hooks/tree-guard.mjs` — the PreToolUse hook that contains reviewers, matched on the name an agent runs under
 - `hooks/idle-guard.mjs` — the SubagentStop hook that stops a subagent, once per job, from going idle while background work it started is still running, since nothing wakes it when that work finishes
 - `hooks/lib/hook.mjs` — shared fail-open `runHook()` entry point of the hooks
+- `hooks/lib/preflight-report.mjs` — which pre-flight checks a review has no verdict on (stopped at a cap, or skipped for budget), read by `findings.mjs converge`, `converged.sh --work` and, through `review-evidence.mjs`, the Stop gate, to refuse `converged`
+- `hooks/lib/review-evidence.mjs` — which review a `converged` marker closes (its dir, else its `review` id hashed against the `work:` paths round.sh printed, else every open review dir), and whether that review's pre-flight is unverified or was written by hand; read by the Stop gate
 - `config/defaults.json` — gate exemptions, the hook limits, and the `tier` / `impact` / `brief` / `preflight` rules; override per user in `~/.claude/self-review/config.json`, and per repository from that same user file (`repos.<id>`: the branch-review opt-in and a tier overlay). A repository's own `.self-review.json` is **default closed**: it may only *add* marker words to `tier.riskPaths` and `tier.riskContent`, so a repository can make its own review stricter and nothing else
