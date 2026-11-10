@@ -10,7 +10,7 @@
 //     design is back to asking an agent to guess what is safe to run.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, lstatSync, realpathSync, symlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, lstatSync, statSync, realpathSync, symlinkSync, rmSync, utimesSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
@@ -493,7 +493,8 @@ test("--stage-only copies the tree and runs nothing, with the dependency trees a
   // Linked, not copied — it is not the code under review, and it is the most
   // expensive thing here to duplicate.
   assert.equal(readFileSync(path.join(ship, "node_modules/left-pad/index.js"), "utf8"), "module.exports = 1;\n");
-  assert.ok(lstatSync(path.join(ship, "node_modules")).isSymbolicLink(), "linked, not copied");
+  // The directory itself is real (Q-b, below); what it holds is linked.
+  assert.ok(lstatSync(path.join(ship, "node_modules/left-pad")).isSymbolicLink(), "linked, not copied");
   // The home the caller hands to the checks: present, empty, and not the
   // developer's.
   assert.deepEqual(readdirSync(path.join(out, "home")), []);
@@ -517,8 +518,165 @@ test("--stage-only links a workspace package's own node_modules, not only the ro
   assert.equal(done.status, 0, done.stderr);
   const ship = done.stdout.trim();
   const nested = path.join(ship, "packages/app/node_modules");
-  assert.ok(lstatSync(nested).isSymbolicLink(), "the package's tree is linked too");
+  assert.ok(lstatSync(path.join(nested, "dep")).isSymbolicLink(), "the package's tree is linked too");
   assert.equal(readFileSync(path.join(nested, "dep/index.js"), "utf8"), "module.exports = 2;\n");
-  assert.ok(lstatSync(path.join(ship, "node_modules")).isSymbolicLink());
+  assert.ok(lstatSync(path.join(ship, "node_modules/top")).isSymbolicLink());
+  assert.equal(readFileSync(path.join(ship, "node_modules/top/node_modules/inner/index.js"), "utf8"), "module.exports = 3;\n");
   assert.ok(!existsSync(path.join(ship, "dist")), "an ignored directory is not conjured to hold a link");
+});
+
+// A pnpm workspace in miniature: a root store, a package that reaches one
+// store dependency and one workspace sibling through RELATIVE links (pnpm's
+// own shape), `.bin` shims that are real files, vite's two caches as they sit
+// after an earlier run, and the metadata files pnpm keeps beside them.
+const pnpmWorkspace = () => {
+  const repo = repoWith({
+    "package.json": "{}\n",
+    "packages/a/index.js": "export default 1;\n",
+    "packages/b/index.js": "export default 2;\n",
+    "node_modules/.pnpm/dep@1.0.0/node_modules/dep/index.js": "module.exports = 'store';\n",
+    "node_modules/.modules.yaml": "storeDir: /somewhere\n",
+    "packages/a/node_modules/.bin/tool": "#!/bin/sh\nexec node \"$(dirname \"$0\")/../dep/index.js\"\n",
+    "packages/a/node_modules/.vite/vitest/results.json": "{\"stale\":true}\n",
+    "build/gen/index.js": "module.exports = 'generated';\n",
+  }, { gitignore: "node_modules/\nbuild/\n" });
+  const nm = path.join(repo, "packages/a/node_modules");
+  mkdirSync(path.join(nm, ".vite-temp"));
+  mkdirSync(path.join(nm, "@ws"));
+  symlinkSync("../../../node_modules/.pnpm/dep@1.0.0/node_modules/dep", path.join(nm, "dep"));
+  symlinkSync("../../../b", path.join(nm, "@ws/b"));
+  symlinkSync("../../../build/gen", path.join(nm, "gen"));
+  const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "coldrun-outside-")));
+  writeFileSync(path.join(outside, "index.js"), "module.exports = 'outside';\n");
+  symlinkSync(outside, path.join(nm, "ext"));
+  return { repo, outside };
+};
+
+const stage = (root) => {
+  const out = realpathSync(mkdtempSync(path.join(tmpdir(), "cold stage ")));
+  const done = spawnSync("bash", [COLDRUN, "--root", root, "--out", out, "--stage-only"], { encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+  return done.stdout.trim();
+};
+
+test("Q-b: a workspace link in a staged node_modules resolves to the copy's sibling, not the checkout's", () => {
+  // Measured on CopilotKit 2026-11-09: the whole package node_modules was one
+  // link into the checkout, so pnpm's relative `@scope/sibling -> ../../../sibling`
+  // resolved to the CHECKOUT's sibling — never built — while nx had just built
+  // the copy's. Two packages failed `Failed to resolve entry` on every review.
+  const { repo } = pnpmWorkspace();
+  const ship = stage(repo);
+  const real = realpathSync(repo);
+  const nm = path.join(ship, "packages/a/node_modules");
+
+  assert.ok(lstatSync(nm).isDirectory() && !lstatSync(nm).isSymbolicLink(), "the package's node_modules is a real directory in the copy");
+  assert.equal(realpathSync(path.join(nm, "@ws/b")), path.join(ship, "packages/b"),
+    "the workspace sibling is the copy's own");
+  assert.equal(realpathSync(path.join(nm, "dep")), path.join(real, "node_modules/.pnpm/dep@1.0.0/node_modules/dep"),
+    "a store dependency still comes from the checkout's store — it is not the code under review");
+  assert.equal(readFileSync(path.join(nm, "dep/index.js"), "utf8"), "module.exports = 'store';\n");
+});
+
+test("Q-b: a staged node_modules starts vite's caches empty, and copies its files instead of linking them", () => {
+  // vite writes `.vite-temp` and vitest `.vite/vitest/<hash>/results.json` on
+  // every run: 307 of 310 TRIP entries over 13 CopilotKit reviews. Both dirs
+  // exist in the checkout after any earlier run, so a plain per-entry link would
+  // keep tripping. A plain file is copied — small metadata pnpm rewrites per
+  // install, so a write to it stays in the copy; a link to a file stays a link,
+  // and the tripwire walks its target.
+  const { repo } = pnpmWorkspace();
+  const ship = stage(repo);
+  const nm = path.join(ship, "packages/a/node_modules");
+
+  for (const cache of [".vite", ".vite-temp"]) {
+    const st = lstatSync(path.join(nm, cache));
+    assert.ok(st.isDirectory() && !st.isSymbolicLink(), `${cache} is a real directory in the copy`);
+    assert.deepEqual(readdirSync(path.join(nm, cache)), [], `${cache} starts empty`);
+  }
+  const shim = lstatSync(path.join(nm, ".bin/tool"));
+  assert.ok(shim.isFile(), "a .bin shim is a copy — it runs `$basedir/..`, which must be the copy's node_modules");
+  assert.equal(shim.mode & 0o111, 0o111, "and keeps its execute bits");
+  assert.ok(!lstatSync(path.join(nm, ".bin")).isSymbolicLink());
+  assert.ok(lstatSync(path.join(ship, "node_modules/.modules.yaml")).isFile());
+  assert.ok(lstatSync(path.join(ship, "node_modules/.pnpm")).isSymbolicLink(), "the store is linked, whole");
+});
+
+test("Q-b: a link the copy cannot map keeps today's target, by its physical path", () => {
+  // A target outside the checkout is not the review's business, and an ignored
+  // one the copy never staged has no copy to point at: both stay where they
+  // were. Through a symlinked checkout path, so the comparison is physical.
+  const { repo, outside } = pnpmWorkspace();
+  const alias = path.join(mkdtempSync(path.join(tmpdir(), "coldrun-alias-")), "checkout");
+  symlinkSync(repo, alias);
+  const ship = stage(alias);
+  const nm = path.join(ship, "packages/a/node_modules");
+  const real = realpathSync(repo);
+
+  assert.equal(realpathSync(path.join(nm, "ext")), outside);
+  assert.equal(realpathSync(path.join(nm, "gen")), path.join(real, "build/gen"));
+  assert.equal(realpathSync(path.join(nm, "@ws/b")), path.join(ship, "packages/b"),
+    "mapped through the physical root even when --root was given as a link");
+});
+
+test("Q-b: an npm workspace's root node_modules maps its workspace links too", () => {
+  // npm and yarn keep workspace links only in the ROOT node_modules, so staging
+  // per-entry only where pnpm puts them would leave the hybrid tree there.
+  const repo = repoWith({
+    "package.json": "{}\n",
+    "packages/b/index.js": "export default 2;\n",
+    "node_modules/hoisted/index.js": "module.exports = 'hoisted';\n",
+  }, { gitignore: "node_modules/\n" });
+  mkdirSync(path.join(repo, "node_modules/@ws"));
+  symlinkSync("../../packages/b", path.join(repo, "node_modules/@ws/b"));
+  const ship = stage(repo);
+
+  assert.equal(realpathSync(path.join(ship, "node_modules/@ws/b")), path.join(ship, "packages/b"));
+  assert.ok(lstatSync(path.join(ship, "node_modules/hoisted")).isSymbolicLink());
+  assert.equal(realpathSync(path.join(ship, "node_modules/hoisted")), path.join(realpathSync(repo), "node_modules/hoisted"));
+});
+
+test("Q-b: staging writes nothing in the checkout", () => {
+  const { repo } = pnpmWorkspace();
+  const sentinel = path.join(tmpdir(), `coldrun-sentinel-${process.pid}`);
+  writeFileSync(sentinel, "");
+  const past = new Date(Date.now() - 5000);
+  utimesSync(sentinel, past, past);
+  // Everything in the fixture predates the sentinel, so any later mtime is the stage's.
+  spawnSync("bash", ["-c", 'find "$1" -exec touch -h -t 200001010000 {} +', "_", repo]);
+  stage(repo);
+  const touched = spawnSync("find", [repo, "-newer", sentinel], { encoding: "utf8" }).stdout.trim();
+  assert.equal(touched, "", `the stage wrote into the checkout:\n${touched}`);
+  assert.ok(statSync(sentinel));
+});
+
+test("Q-b: a directory find cannot read does not stop the stage", { skip: process.getuid?.() === 0 }, () => {
+  const { repo } = pnpmWorkspace();
+  const locked = path.join(repo, "locked");
+  mkdirSync(locked);
+  chmodSync(locked, 0);
+  try {
+    const ship = stage(repo);
+    assert.ok(lstatSync(path.join(ship, "packages/a/node_modules/@ws/b")).isSymbolicLink());
+  } finally {
+    chmodSync(locked, 0o755);
+  }
+});
+
+test("Q-b: a link to a file stays a link, re-pointed by its physical path", () => {
+  const repo = repoWith({
+    "package.json": "{}\n",
+    "tools/y.js": "module.exports = 'y';\n",
+    "node_modules/pkg/bin/x.js": "x\n",
+  }, { gitignore: "node_modules/\ntools/\n" });
+  mkdirSync(path.join(repo, "node_modules/.bin"));
+  symlinkSync("../pkg/bin/x.js", path.join(repo, "node_modules/.bin/x"));
+  symlinkSync("../../tools/y.js", path.join(repo, "node_modules/.bin/y"));
+  const ship = stage(repo);
+
+  for (const name of ["x", "y"]) {
+    assert.ok(lstatSync(path.join(ship, "node_modules/.bin", name)).isSymbolicLink(), `.bin/${name} stays a link`);
+  }
+  assert.equal(readFileSync(path.join(ship, "node_modules/.bin/x"), "utf8"), "x\n");
+  assert.equal(realpathSync(path.join(ship, "node_modules/.bin/y")), path.join(realpathSync(repo), "tools/y.js"),
+    "the copy has no tools/, so the link keeps the checkout target");
 });

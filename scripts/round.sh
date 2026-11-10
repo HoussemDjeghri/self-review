@@ -477,12 +477,12 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # preflight.txt, no section, exit 0 — and SKILL.md tells the session to say
   # which script did not run, which it then had no way to know.
   #
-  # The tripwire. `coldrun.sh --stage-only` LINKS the dependency trees rather than
+  # The tripwire. `coldrun.sh --stage-only` LINKS into the dependency trees rather than
   # copying them, so every check pre-flight runs has a live path into the author's
   # real checkout. Inheriting HOME removes the cause we know about; it does not
   # prove there is no other, and the invariant "a review never writes the author's
   # tree" is the one this plugin cannot get wrong quietly. So it is measured, once
-  # per round, with one traversal per linked tree and no per-tool knowledge in it.
+  # per round, with one traversal per watched target and no per-tool knowledge in it.
   #
   # Reported, never fatal: a dependency tree that a check legitimately touched is
   # not a reason to withhold a suite verdict the reviewers need, and the operator
@@ -511,35 +511,41 @@ elif [ "$round" -eq 1 ] && [ "$preflight" -eq 1 ]; then
   # put a false alarm in the one message this block reserves for a defect in the
   # review rather than in the code.
   #
-  # The linked trees are ENUMERATED, not listed: `coldrun.sh` decides what to
+  # The links are ENUMERATED, not listed: `coldrun.sh` decides what to
   # link, and a second copy of its list here would fail open — an ecosystem
   # added there would silently stop being watched. So every symlink in the stage
-  # is a candidate — at any depth, since a workspace package's `node_modules` is
-  # linked too — and the ones watched are those whose physical target is inside
-  # the checkout: the copy also keeps links the repository itself commits, and a
-  # relative one lands pointing back into the stage, where a write is the copy's
-  # own business. A link to a file is never one coldrun made. `find` does not follow
-  # links, so the enumeration never walks into a dependency tree; the trailing
-  # slash below is what makes the second `find` descend into one. Sorted, so
-  # "first:" names the same tree on every filesystem (APFS and ext4 list differently).
+  # is a candidate, at any depth, and the ones watched are those whose physical
+  # target is inside the checkout: the copy also keeps links the repository
+  # itself commits, and a relative one lands pointing back into the stage, where
+  # a write is the copy's own business. Watched by TARGET, once each, and a
+  # target inside another watched one is dropped: a staged node_modules is a
+  # directory of per-entry links (Q-b), so ~600 store links on a pnpm monorepo
+  # would each re-walk a package that the walk of `.pnpm` already covers. The
+  # first link (sorted) names a shared target, so "first:" names the same tree on
+  # every filesystem. Nothing here filters by path or by tool.
   tripped=""; trips=""; trip_count=0
   if [ "$pf_from" != "$repo_root" ]; then
     checkout="$(cd -P "$repo_root" && pwd)"
-    while IFS= read -r link; do
-      [ -n "$link" ] || continue
-      target="$(cd -P "$link" 2>/dev/null && pwd || true)"
-      case "$target" in "$checkout"|"$checkout"/*) ;; *) continue ;; esac
-      hit="$(find "$link/" -newer "$sentinel" -print -quit 2>/dev/null || true)"
+    while IFS= read -r -d '' target && IFS= read -r -d '' link; do
+      [ -n "$target" ] || continue
+      if [ -d "$target" ]; then
+        hit="$(find "$target/" -newer "$sentinel" -print -quit 2>/dev/null || true)"
+      else
+        hit="$(find "$target" -newer "$sentinel" -print -quit 2>/dev/null || true)"
+      fi
+      # The walk root itself is newer when an entry was created or removed
+      # directly in it — pnpm deleting a store package looks like this — and
+      # `-print -quit` cannot say which entry, so the line says what it knows.
+      [ "$hit" != "$target/" ] || hit="an entry was added or removed directly in $target"
       # `if`, not `[ … ] && …`: under `set -e` a false `&&` list is a failing
       # command and would end the round on the ordinary case where nothing wrote.
       if [ -n "$hit" ]; then
-        trips="${trips}TRIP  ${link#"$pf_from"/}    pre-flight wrote into the checkout through the staged link: $hit
+        trips="${trips}TRIP  ${link}    pre-flight wrote into the checkout through the staged link: $hit
 "
         trip_count=$((trip_count + 1))
       fi
-    done <<EOF
-$({ find "$pf_from" -type l 2>/dev/null || true; } | LC_ALL=C sort)
-EOF
+    done < <(node "$here/lib/stage-modules.mjs" watch "$checkout" "$pf_from" \
+      || printf '%s\0%s\0' "$checkout" "(the staged links could not be enumerated, so the whole checkout)")
   fi
   # One line however many links tripped, and every one of them in a file. A
   # monorepo's suite writes the same cache into each package's node_modules
@@ -554,7 +560,7 @@ ${trips%$'\n'}"
     printf '%s' "$trips" >"$dir/tripwire.txt"
     first="${trips%%$'\n'*}"; first="${first#TRIP  }"
     tripped="
-TRIP  $trip_count linked trees    pre-flight wrote into the checkout through the staged links — first: ${first%%    *}: ${first##*staged link: }; all $trip_count in $dir/tripwire.txt"
+TRIP  $trip_count linked targets    pre-flight wrote into the checkout through the staged links — first: ${first%%    *}: ${first##*staged link: }; all $trip_count in $dir/tripwire.txt"
   fi
   rm -f "$sentinel"
   # The verdict lines only — preflight.txt keeps the failure tail, and --out
@@ -582,6 +588,11 @@ INFRA staging  no check could start in the install copy, and the re-run from the
   elif [ "$pf_from" != "$repo_root" ] && grep -q '^# EVERY check failed to start' "$dir/preflight.txt" 2>/dev/null; then
     echo "round.sh: no check could start in the install copy — a tool not found or not executable there (exit 127/126). Re-running pre-flight from the checkout." >&2
     mv "$dir/preflight.txt" "$dir/preflight-stage.txt" 2>/dev/null || true
+    # Its logs too, under the moved report's base name: the checkout re-run
+    # below clears `preflight-<kind>.log` before it writes its own.
+    for kind in format lint types test; do
+      [ ! -e "$dir/preflight-$kind.log" ] || mv "$dir/preflight-$kind.log" "$dir/preflight-stage-$kind.log"
+    done
     # The same pnpm switch as the first run, for the same reason.
     if ! pnpm_config_verify_deps_before_run=false SELF_REVIEW_PREFLIGHT_GRACE="$pf_grace" "$here/preflight.sh" --root "$repo_root" --deadline "$pf_deadline" --out "$dir/preflight.txt" >/dev/null 2>>"$dir/preflight.err"; then
       echo "round.sh: preflight.sh failed from the checkout too (${dir}/preflight.err); say so in the report" >&2
@@ -600,7 +611,7 @@ INFRA staging  no check could start in the install copy, and they do from the ch
     pf_from="$repo_root"
   fi
 
-  pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|INFRA|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
+  pf="$(grep -E '^# [0-9]+ run|^# no checks detected|^(PASS|FAIL|FLAKY|INFRA|SKIP) ' "$dir/preflight.txt" 2>/dev/null || true)"
   # The tripwire's verdict rides with the other verdicts rather than only on
   # stderr: the lead reads this block, and a write into the author's tree is the
   # one line here that is about the REVIEW rather than about the code.
@@ -915,5 +926,5 @@ fi
 # $pf: the artifact-suite verdict is appended to $pf but runs under the work
 # dir, so its FAIL says nothing about the staged path.
 if [ -n "$pf_from" ] && [ -n "${repo_root:-}" ] && [ "$pf_from" != "$repo_root" ] && grep -q '^FAIL ' "$dir/preflight.txt" 2>/dev/null; then
-  echo "  this copy's path holds a space, an en dash and ü on purpose; a check that fails here and passes in the checkout resolved a path unsafely — a percent-encoded URL path (new URL(…).pathname, not fileURLToPath), an unquoted shell variable, or an ASCII-only assumption; rerun that check in the checkout to tell which"
+  echo "  this copy's path holds a space, an en dash and ü on purpose; a check that fails here and passes in the checkout resolved a path unsafely — a percent-encoded URL path (new URL(…).pathname, not fileURLToPath), an unquoted shell variable, or an ASCII-only assumption — or, on a workspace, a test that needs a sibling package's ignored build output (\`dist/\`) prebuilt, which the copy does not have; rerun that check in the checkout to tell which"
 fi

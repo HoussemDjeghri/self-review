@@ -368,17 +368,19 @@ test("the tripwire reports a pre-flight that wrote into the checkout's dependenc
   // the suite writes into that copy, the checkout is untouched, and this test
   // passes on an alarm with no breach behind it.
   writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
-  mkdirSync(path.join(repo, "node_modules"), { recursive: true });
-  writeFileSync(path.join(repo, "node_modules", "marker.txt"), "before\n");
+  // A package directory: the staged node_modules is a real directory of links
+  // (Q-b), so a write must go INTO a linked entry to reach the checkout.
+  mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules", "pkg", "marker.txt"), "before\n");
   writeFileSync(path.join(repo, "test.sh"),
-    '#!/bin/sh\necho "touching the linked tree"\necho after > node_modules/marker.txt\n');
+    '#!/bin/sh\necho "touching the linked tree"\necho after > node_modules/pkg/marker.txt\n');
   chmodSync(path.join(repo, "test.sh"), 0o755);
 
   const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
   assert.equal(done.status, 0, done.stderr);
-  assert.match(done.stdout, /TRIP {2}node_modules {4}pre-flight wrote into the checkout through the staged link:/,
+  assert.match(done.stdout, /TRIP {2}node_modules\/pkg {4}pre-flight wrote into the checkout through the staged link:/,
     `the write must reach the lead's own report, not only stderr:\n${done.stdout}`);
-  assert.equal(readFileSync(path.join(repo, "node_modules", "marker.txt"), "utf8"), "after\n",
+  assert.equal(readFileSync(path.join(repo, "node_modules", "pkg", "marker.txt"), "utf8"), "after\n",
     "the author's own checkout is what was written — the alarm names that mechanism");
 });
 
@@ -392,11 +394,11 @@ test("pre-flight runs with pnpm's pre-run install off, and the tripwire watches 
   // must see those too.
   const { repo, work } = fixture();
   writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
-  mkdirSync(path.join(repo, "packages", "app", "node_modules"), { recursive: true });
+  mkdirSync(path.join(repo, "packages", "app", "node_modules", "dep"), { recursive: true });
   writeFileSync(path.join(repo, "packages", "app", "index.js"), "export default 1;\n");
-  writeFileSync(path.join(repo, "packages", "app", "node_modules", "marker.txt"), "before\n");
+  writeFileSync(path.join(repo, "packages", "app", "node_modules", "dep", "marker.txt"), "before\n");
   writeFileSync(path.join(repo, "test.sh"),
-    '#!/bin/sh\necho "verify: $pnpm_config_verify_deps_before_run"\necho after > packages/app/node_modules/marker.txt\nexit 1\n');
+    '#!/bin/sh\necho "verify: $pnpm_config_verify_deps_before_run"\necho after > packages/app/node_modules/dep/marker.txt\nexit 1\n');
   // Red on purpose: preflight.txt keeps the output tail of a failing check only.
   chmodSync(path.join(repo, "test.sh"), 0o755);
 
@@ -404,7 +406,7 @@ test("pre-flight runs with pnpm's pre-run install off, and the tripwire watches 
   assert.equal(done.status, 0, done.stderr);
   const report = readFileSync(path.join(work, "round-1", "preflight.txt"), "utf8");
   assert.match(report, /^verify: false$/m, report);
-  assert.match(done.stdout, /TRIP {2}packages\/app\/node_modules {4}pre-flight wrote into the checkout/,
+  assert.match(done.stdout, /TRIP {2}packages\/app\/node_modules\/dep {4}pre-flight wrote into the checkout/,
     `a write through a package's link must trip like one through the root's:\n${done.stdout}`);
 });
 
@@ -413,23 +415,129 @@ test("B6: writes through many staged links are one TRIP line, with every link in
   // config from, so one round printed one TRIP line per package — ~85 lines over
   // nine sessions, filtered out with `grep -v` until the filter hit SIGPIPE. The
   // writes are real, so they are still reported; once, not once per package.
+  // (The vite case itself no longer reaches the checkout — Q-b, below — so the
+  // fold is exercised with a write into each package's own linked dependency.)
   const { repo, work } = fixture();
   writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
   for (const pkg of ["a", "b", "c"]) {
-    mkdirSync(path.join(repo, "packages", pkg, "node_modules"), { recursive: true });
+    mkdirSync(path.join(repo, "packages", pkg, "node_modules", "dep"), { recursive: true });
     writeFileSync(path.join(repo, "packages", pkg, "index.js"), "export default 1;\n");
   }
   writeFileSync(path.join(repo, "test.sh"),
-    "#!/bin/sh\nfor p in a b c; do mkdir -p packages/$p/node_modules/.vite-temp; done\n");
+    "#!/bin/sh\nfor p in a b c; do touch packages/$p/node_modules/dep/written; done\n");
   chmodSync(path.join(repo, "test.sh"), 0o755);
 
   const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
   assert.equal(done.status, 0, done.stderr);
   const trips = done.stdout.split("\n").filter((line) => line.startsWith("TRIP"));
   assert.equal(trips.length, 1, done.stdout);
-  assert.match(trips[0], /^TRIP {2}3 linked trees {4}pre-flight wrote into the checkout through the staged links — first: packages\/a\/node_modules: .*; all 3 in .*tripwire\.txt$/);
+  assert.match(trips[0], /^TRIP {2}3 linked targets {4}pre-flight wrote into the checkout through the staged links — first: packages\/a\/node_modules\/dep: .*; all 3 in .*tripwire\.txt$/);
   const listed = readFileSync(path.join(work, "round-1", "tripwire.txt"), "utf8");
-  for (const pkg of ["a", "b", "c"]) assert.match(listed, new RegExp(`^TRIP {2}packages/${pkg}/node_modules {4}`, "m"), listed);
+  for (const pkg of ["a", "b", "c"]) assert.match(listed, new RegExp(`^TRIP {2}packages/${pkg}/node_modules/dep {4}`, "m"), listed);
+});
+
+// pnpm's shape, in miniature: a root store, and two packages that each reach the
+// same store package and one workspace sibling through RELATIVE links.
+const pnpmRepo = (testBody) => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  for (const rel of ["node_modules/.pnpm/dep@1/node_modules/dep", "node_modules/.pnpm/old@1",
+    "packages/a/node_modules/.vite/vitest", "packages/a/node_modules/.vite-temp", "packages/b/node_modules", "packages/lib"]) {
+    mkdirSync(path.join(repo, rel), { recursive: true });
+  }
+  writeFileSync(path.join(repo, "node_modules/.pnpm/dep@1/node_modules/dep/index.js"), "module.exports = 1;\n");
+  writeFileSync(path.join(repo, "packages/a/node_modules/.vite/vitest/results.json"), "{}\n");
+  writeFileSync(path.join(repo, "packages/lib/index.js"), "export default 1;\n");
+  for (const pkg of ["a", "b"]) {
+    writeFileSync(path.join(repo, "packages", pkg, "index.js"), "export default 1;\n");
+    symlinkSync("../../../node_modules/.pnpm/dep@1/node_modules/dep", path.join(repo, "packages", pkg, "node_modules/dep"));
+    symlinkSync("../../lib", path.join(repo, "packages", pkg, "node_modules/lib"));
+  }
+  writeFileSync(path.join(repo, "test.sh"), `#!/bin/sh\n${testBody}\n`);
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  return { repo, work };
+};
+
+test("Q-b: vite's caches and a new top-level entry land in the copy — no TRIP, the checkout untouched", () => {
+  // 307 of 310 TRIP entries over 13 CopilotKit reviews were these two caches,
+  // and every review carried the TRIP. They are staged as real, empty dirs in
+  // the copy, so the write happens there; the wire itself filters nothing.
+  const { repo, work } = pnpmRepo([
+    "echo x > packages/a/node_modules/.vite-temp/vite.config.bundled.mjs",
+    "mkdir -p packages/a/node_modules/.vite/vitest/abc && echo '{}' > packages/a/node_modules/.vite/vitest/abc/results.json",
+    "mkdir packages/b/node_modules/.vite-temp",
+    "echo lib > packages/a/node_modules/lib/built.js",
+  ].join("\n"));
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.doesNotMatch(done.stdout, /TRIP/, done.stdout);
+  assert.deepEqual(readdirSync(path.join(repo, "packages/a/node_modules/.vite-temp")), []);
+  assert.ok(!existsSync(path.join(repo, "packages/b/node_modules/.vite-temp")));
+  assert.ok(!existsSync(path.join(repo, "packages/lib/built.js")),
+    "a write through a workspace link lands in the copy's sibling, not the author's");
+});
+
+test("Q-b: a write inside a store package two packages share is one TRIP, not one per link", () => {
+  const { repo, work } = pnpmRepo("echo y > packages/a/node_modules/dep/written.js");
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stdout);
+  const trips = done.stdout.split("\n").filter((line) => line.startsWith("TRIP"));
+  assert.equal(trips.length, 1, done.stdout);
+  assert.match(trips[0], /^TRIP {2}node_modules\/\.pnpm {4}pre-flight wrote into the checkout through the staged link: .*\/dep(\/written\.js)?$/, trips[0]);
+  assert.equal(readFileSync(path.join(repo, "node_modules/.pnpm/dep@1/node_modules/dep/written.js"), "utf8"), "y\n");
+});
+
+test("Q-b: a package removed from the store still trips, and the line says an entry went", () => {
+  // The case an allowlist could have hidden: a moved directory mtime is all
+  // the wire sees of pnpm deleting a package, and `-print -quit` cannot name it.
+  const { repo, work } = pnpmRepo("rm -rf node_modules/.pnpm/old@1");
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^TRIP {2}node_modules\/\.pnpm {4}pre-flight wrote into the checkout through the staged link: an entry was added or removed directly in .*node_modules\/\.pnpm$/m, done.stdout);
+});
+
+test("Q-b: a write through a link to a file still trips, once", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\ntools/\n");
+  mkdirSync(path.join(repo, "tools"), { recursive: true });
+  mkdirSync(path.join(repo, "node_modules/.bin"), { recursive: true });
+  writeFileSync(path.join(repo, "tools/y.js"), "module.exports = 'y';\n");
+  symlinkSync("../../tools/y.js", path.join(repo, "node_modules/.bin/y"));
+  writeFileSync(path.join(repo, "test.sh"), "#!/bin/sh\necho more >> node_modules/.bin/y\n");
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  const trips = done.stdout.split("\n").filter((line) => line.startsWith("TRIP"));
+  assert.equal(trips.length, 1, done.stdout);
+  assert.match(trips[0], /^TRIP {2}node_modules\/\.bin\/y {4}pre-flight wrote into the checkout through the staged link: .*tools\/y\.js$/, trips[0]);
+});
+
+test("Q-b: a package deleted from the checkout through the copy still trips, npm layout", () => {
+  const { repo, work } = fixture();
+  writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  mkdirSync(path.join(repo, "node_modules/foo"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules/foo/index.js"), "module.exports = 1;\n");
+  writeFileSync(path.join(repo, "test.sh"), '#!/bin/sh\nrm -rf "$(cd node_modules/foo && pwd -P)"\n');
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^TRIP {2}node_modules\/foo {4}pre-flight wrote into the checkout through the staged link: an entry was added or removed directly in .*node_modules$/m, done.stdout);
+  assert.ok(!existsSync(path.join(repo, "node_modules/foo")), "the write was real");
+});
+
+test("Q-a: a test check that fails and then passes reaches the lead as FLAKY, without the path-bug note", () => {
+  // The space / en dash / ü note reads a red check as a path-resolution
+  // signature. A suite that passed on its re-run in the same copy is not one.
+  const { repo, work } = fixture();
+  const counter = path.join(mkdtempSync(path.join(tmpdir(), "round-count-")), "n");
+  writeFileSync(path.join(repo, "test.sh"),
+    `#!/bin/sh\nn=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "${counter}"; [ $n -ge 2 ]\n`);
+  chmodSync(path.join(repo, "test.sh"), 0o755);
+  const done = run(repo, ["--work", work, "--round", "1", "--intent", path.join(work, "intent.md")]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.match(done.stdout, /^FLAKY test {4}\.\/test\.sh {3}\(failed \(exit 1\), passed on re-run/m, done.stdout);
+  assert.doesNotMatch(done.stdout, /this copy's path holds a space/, done.stdout);
+  assert.ok(existsSync(path.join(work, "round-1", "preflight-test.log")), "the whole output sits beside preflight.txt");
 });
 
 test("a symlink the repository itself commits is not a path into the checkout", () => {
@@ -703,6 +811,8 @@ test("every check failing to start in the copy falls back to the checkout and na
   assert.doesNotMatch(done.stderr, /defect in this plugin/, done.stderr);
   assert.ok(existsSync(path.join(work, "round-1", "preflight-stage.txt")),
     "the copy's own report is kept: it is the evidence for whichever cause it was");
+  assert.ok(existsSync(path.join(work, "round-1", "preflight-stage-test.log")),
+    "the copy's test log moves with its report, before the checkout re-run clears preflight-test.log");
   // The checkout could not start them either, so the stage is not the cause.
   assert.match(done.stdout, /INFRA staging {2}no check could start in the install copy or in the checkout .*not a staging defect/, done.stdout);
   // The header names where the verdicts under it came from. Rewriting

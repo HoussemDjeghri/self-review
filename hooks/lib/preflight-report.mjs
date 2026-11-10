@@ -13,7 +13,7 @@
 // The reports are every `preflight*.txt` in the work dir and its round dirs;
 // for each check KIND — keyed on the kind alone, so a later run that detects a
 // different command for it still decides — the NEWEST report giving it PASS, FAIL,
-// did-not-finish or budget-SKIP decides. A could-not-start line (`INFRA …
+// FLAKY, did-not-finish or budget-SKIP decides. A could-not-start line (`INFRA …
 // (exit 126 …)` or `(exit 127 …)`) changes nothing; a newer `(preflight.skip)`
 // for a kind clears every earlier entry of that kind. Only the status block is
 // read: parsing stops at the first `--- ` line, so quoted tails never count.
@@ -25,7 +25,7 @@ import path from "node:path";
 // `SKIP  <kind> <cmd>   (pre-flight budget spent — …)`, as preflight.sh prints
 // them. A check that could not START (`INFRA … (exit 127 …)`) is not counted:
 // it is a tool missing from the shell, which a longer run does not cure.
-const LINE_RE = /^(PASS|FAIL|INFRA|SKIP) +(\S+) +(.*?)(?: {3}\((.*)\))?$/;
+const LINE_RE = /^(PASS|FAIL|FLAKY|INFRA|SKIP) +(\S+) +(.*?)(?: {3}\((.*)\))?$/;
 const UNVERIFIED_RE = /^(did not finish in \d+s|pre-flight budget spent)\b/;
 
 /** A pre-flight report's file name; the gate's tampering check uses the same one. */
@@ -72,7 +72,8 @@ export function unverifiedChecks(work) {
         latest.delete(kind);
         continue;
       }
-      if (verdict === "PASS" || verdict === "FAIL" || UNVERIFIED_RE.test(note)) latest.set(kind, { verdict, kind, cmd, note, report });
+      // FLAKY is a verdict: the suite ran to the end twice (Q-a, preflight.sh).
+      if (verdict === "PASS" || verdict === "FAIL" || verdict === "FLAKY" || UNVERIFIED_RE.test(note)) latest.set(kind, { verdict, kind, cmd, note, report });
     }
   }
   return [...latest.values()]

@@ -138,6 +138,17 @@ failure — `--out` keeps that tail out of your context. It exits 0 even when a
 check fails: the report is the answer. Skip checks per project with
 `preflight.skip` in the config.
 
+A failing **test** check is run once more inside the same budget. Red then green
+is `FLAKY` — the suite is not stable, the first run's failure is quoted, and it
+is **not a pass**: report "tests flaky (failed, then passed on re-run)", never
+"tests pass", and read the first run's failure for whether the change could
+plausibly cause it — if it could, treat it as a FAIL. It does not block
+`converged`. Red twice stays `FAIL (… failed again on re-run)`; a re-run cut off
+by the budget leaves the first FAIL standing. Format, lint and types are not
+re-run. With `--out`, the whole output of every check that did not pass sits
+beside the report as `<report>-<kind>.log` (`round-1/preflight-test.log`) — the
+quoted tail of a monorepo suite is its runner's summary, not the error.
+
 `round.sh` runs it on a staged copy whose path holds a space, an en dash and
 `ü` on purpose, and says so under the verdicts when a check fails there. The
 three usual causes of a failure that the checkout does not reproduce: a
@@ -164,6 +175,15 @@ which is global to you. Setting it for one project names that subdirectory in
 `<work>/round-1/cold run – ü/install`, not against the repository — same checks,
 same cost, run from a path that is not the developer's, with the developer's own
 HOME (an empty one makes pnpm and its kin repair themselves into the checkout).
+Each ignored `node_modules` in the copy is a real directory of links back to the
+checkout's entries, re-pointed into the copy wherever the copy has the target —
+so a workspace sibling is the copy's own, not the checkout's — with vite's
+`.vite` and `.vite-temp` started empty so its per-run caches land in the copy.
+A sibling's ignored build output (`dist/`) is not copied, so a suite that relies
+on it being prebuilt, instead of building it, fails only in the copy — that FAIL
+is the suite testing the checkout's build, not the change.
+A `TRIP` line under the verdicts is a write that still reached the checkout
+through one of those links; with more than one, the whole list is in `round-1/tripwire.txt`.
 
 **Pre-flight has one budget, so round 1 fits one Bash call.** Staging, every
 check, the re-run from the checkout and the artifact-root suite share

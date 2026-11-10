@@ -110,3 +110,13 @@ test("a report that is listed but cannot be read blocks rather than passing", ()
   utimesSync(rerun, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
   assert.deepEqual(unverifiedChecks(work), []);
 });
+
+test("Q-a: FLAKY is a verdict — it clears an earlier unfinished run and never blocks by itself", () => {
+  // A suite that ran to the end twice, red then green, has been given a
+  // verdict: an unstable suite, which the lead reports, not a missing one.
+  const FLAKY = "FLAKY test    pnpm test   (failed (exit 1), passed on re-run — the suite is not stable; first run's failure quoted; not a pass)";
+  assert.deepEqual(unverifiedChecks(review([["round-1/preflight.txt", [FLAKY]]])), []);
+  assert.deepEqual(unverifiedChecks(review([["round-1/preflight.txt", [UNFINISHED]], ["preflight-rerun.txt", [FLAKY]]])), []);
+  assert.equal(unverifiedChecks(review([["round-1/preflight.txt", [FLAKY]], ["preflight-rerun.txt", [UNFINISHED]]])).length, 1,
+    "and a newer unfinished run still blocks over it");
+});

@@ -20,10 +20,14 @@
 # work: each check gets what is left of it, and a check with less than 10 s left
 # is SKIP rather than started.
 #
-# A check is PASS, FAIL, INFRA or SKIP. INFRA is "no verdict on the code": the
-# command could not be run at all (exit 126/127), or it was stopped before it
+# A check is PASS, FAIL, FLAKY, INFRA or SKIP. INFRA is "no verdict on the code":
+# the command could not be run at all (exit 126/127), or it was stopped before it
 # finished. Both are counted apart from FAIL on purpose, so that a genuine red
 # still stands out against an environment that is broken or a suite that is slow.
+# A failing `test` check is run once more, inside the same budget; one that
+# fails and then passes is FLAKY — neither a pass nor a FAIL (Q-a, below).
+# With --out, the whole output of every check that did not pass is kept beside
+# the report as `<report>-<kind>.log`; the report itself quotes only a tail.
 #
 # Exit 0 even when checks fail — a failing check is the report, not an error, so
 # the caller reads the report instead of branching on $?. Exit 2 is usage.
@@ -198,7 +202,21 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX") || { echo "preflight.sh: ca
 trap 'rm -rf "$work"' EXIT
 status="$work/status"; details="$work/details"
 : >"$status"; : >"$details"
-ran=0 failed=0 skipped=0 infra=0 unfinished=0
+ran=0 failed=0 flaky=0 skipped=0 infra=0 unfinished=0
+
+# The whole output of a check that did not pass, beside the report. The tail in
+# the report is the last N lines of the WHOLE run, and on a monorepo suite that
+# is the runner's summary: eight CopilotKit reviews failed react-textarea and
+# none of them kept the error, because it was printed thousands of lines up.
+logs_base=""
+[ -z "$out" ] || logs_base="${out%.txt}"
+# An earlier run's log beside this report would read as this run's.
+[ -z "$logs_base" ] || rm -f -- "$logs_base-format.log" "$logs_base-lint.log" "$logs_base-types.log" "$logs_base-test.log"
+keep_log() {
+  [ -n "$logs_base" ] || return 0
+  mkdir -p "$(dirname -- "$logs_base")" 2>/dev/null || true
+  cp "$1" "$logs_base-$2.log" 2>/dev/null || echo "preflight.sh: could not keep the full log of $2 at $logs_base-$2.log" >&2
+}
 
 for kind in format lint types test; do
   has_kind "$kind" || continue
@@ -238,6 +256,7 @@ for kind in format lint types test; do
       echo "--- DID NOT FINISH $kind: last $tail_lines lines of \`$cmd\` ---"
       tail -n "$tail_lines" "$work/$kind.out"
     } >>"$details"
+    keep_log "$work/$kind.out" "$kind"
   elif [ "$rc" -eq 0 ]; then
     printf 'PASS  %-7s %s\n' "$kind" "$cmd" >>"$status"
   elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
@@ -252,14 +271,57 @@ for kind in format lint types test; do
     # rots is the thing being fixed here.
     infra=$((infra + 1))
     printf 'INFRA %-7s %s   (exit %s — the command could not be run; the check never started)\n' "$kind" "$cmd" "$rc" >>"$status"
+    keep_log "$work/$kind.out" "$kind"
   else
-    failed=$((failed + 1))
-    printf 'FAIL  %-7s %s   (exit %s)\n' "$kind" "$cmd" "$rc" >>"$status"
+    # Q-a (ruled 2026-11-09): a red `test` check is run ONCE more. CopilotKit's
+    # `nx run-many` timed out a different package in 4-8 of 10 runs under nx's
+    # parallel load, so every review carried a FAIL and the lead learned to skip
+    # the section — after which the real red is skipped with the rest. A cached
+    # runner (nx, turbo) replays every task that passed and re-executes only the
+    # failed ones, under far less contention; an uncached one simply runs again.
+    # Nothing here knows which: no runner output is parsed. A deterministic red,
+    # including one only the copy produces, fails both runs and stays FAIL, and
+    # every outcome other than a clean second pass is the first FAIL standing,
+    # so the change fails closed. Format, lint and types are deterministic and
+    # are not re-run. Scoping the run to the change was rejected: it replaces
+    # the project's own command with one built here, and never runs what a
+    # copy-only path bug in an untouched package would break.
+    verdict=FAIL note="exit $rc"
+    cp "$work/$kind.out" "$work/$kind.log"
+    if [ "$kind" = test ]; then
+      recap=$TIMEOUT left=$TIMEOUT
+      if [ -n "$deadline" ]; then
+        left=$((deadline - $(date +%s)))
+        [ "$left" -ge "$recap" ] || recap=$left
+      fi
+      # The same 10 s floor a check gets before it starts at all.
+      if [ -n "$deadline" ] && [ "$left" -lt 10 ]; then
+        note="exit $rc; not re-run: pre-flight budget spent"
+      else
+        run_check "$cmd" "$work/$kind.rerun" "$work/$kind.restopped" "$recap"; rerun_rc=$?
+        { echo; echo "--- re-run of \`$cmd\` (exit $rerun_rc) ---"; cat "$work/$kind.rerun"; } >>"$work/$kind.log"
+        if [ -e "$work/$kind.restopped" ]; then note="exit $rc; re-run did not finish"
+        elif [ "$rerun_rc" -eq 126 ] || [ "$rerun_rc" -eq 127 ]; then note="exit $rc; re-run could not start"
+        elif [ "$rerun_rc" -eq 0 ]; then verdict=FLAKY
+        else note="exit $rc; failed again on re-run"
+        fi
+      fi
+    fi
+    if [ "$verdict" = FLAKY ]; then
+      flaky=$((flaky + 1))
+      printf "FLAKY %-7s %s   (failed (exit %s), passed on re-run — the suite is not stable; first run's failure quoted; not a pass)\n" "$kind" "$cmd" "$rc" >>"$status"
+      header="--- FLAKY $kind: last $tail_lines lines of the first run of \`$cmd\` ---"
+    else
+      failed=$((failed + 1))
+      printf 'FAIL  %-7s %s   (%s)\n' "$kind" "$cmd" "$note" >>"$status"
+      header="--- FAIL $kind: last $tail_lines lines of \`$cmd\` ---"
+    fi
     {
       echo
-      echo "--- FAIL $kind: last $tail_lines lines of \`$cmd\` ---"
+      echo "$header"
       tail -n "$tail_lines" "$work/$kind.out"
     } >>"$details"
+    keep_log "$work/$kind.log" "$kind"
   fi
 done
 
@@ -270,7 +332,7 @@ report="$work/report"
   if [ "$ran" -eq 0 ] && [ "$skipped" -eq 0 ]; then
     echo "# no checks detected — this project defines no formatter, linter, type-checker or test command that preflight recognises"
   else
-    echo "# $ran run, $failed failed, $infra could not start, $unfinished did not finish, $skipped skipped"
+    echo "# $ran run, $failed failed, $flaky flaky, $infra could not start, $unfinished did not finish, $skipped skipped"
     if [ "$ran" -gt 0 ] && [ "$infra" -eq "$ran" ]; then
       echo "# EVERY check failed to start (exit 126/127: a tool not found or not executable where they ran)."
       echo "# Nothing here is a verdict on the code, and the reviewers still need a real one."
@@ -285,8 +347,8 @@ if [ -n "$out" ]; then
   cp "$report" "$out" || { echo "preflight.sh: cannot write $out" >&2; exit 2; }
   # stdout stays the summary: the failure tails are one Read away in the file.
   sed -n '1,3p' "$report"; cat "$status"
-  [ "$failed" -eq 0 ] || echo "# failures quoted in $out"
-  [ "$unfinished" -eq 0 ] || echo "# tails of the checks that did not finish quoted in $out"
+  [ "$failed" -eq 0 ] && [ "$flaky" -eq 0 ] || echo "# failures quoted in $out; whole outputs in $logs_base-<kind>.log"
+  [ "$unfinished" -eq 0 ] || echo "# tails of the checks that did not finish quoted in $out; whole outputs in $logs_base-<kind>.log"
 else
   cat "$report"
 fi

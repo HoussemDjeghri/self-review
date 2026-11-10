@@ -213,9 +213,12 @@ home="$out/home";  mkdir -p "$home"
 # under review, and duplicating one is the most expensive thing here. The link
 # is safe where a link to the ROOT would not be, because Node realpaths
 # `import.meta.url`: a dependency resolving back to the checkout is a dependency
-# either way, while a root that resolved back would defeat the whole test.
+# either way, while a root that resolved back would defeat the whole test. The
+# exception is a dependency that IS the code under review — a workspace sibling —
+# which is why a `node_modules` is staged entry by entry and not linked whole
+# (lib/stage-modules.mjs).
 #
-# `node_modules` is linked wherever it sits, not only at the root: a pnpm
+# `node_modules` is staged wherever it sits, not only at the root: a pnpm
 # workspace keeps one per package, and with only the root's linked every
 # package's own imports failed to resolve — a false FAIL on every monorepo
 # (found in a field run). A package whose
@@ -226,12 +229,15 @@ if [ "$stage_only" -eq 1 ]; then
       ln -sfn "$root/$dep" "$ship/$dep" || die "could not link $dep into the sandbox"
     fi
   done
-  while IFS= read -r -d '' dep; do
-    rel="${dep#"$root"/}"
-    if [ -d "$ship/$(dirname "$rel")" ] && [ ! -e "$ship/$rel" ]; then
-      ln -sfn "$dep" "$ship/$rel" || die "could not link $rel into the sandbox"
-    fi
-  done < <(find "$root" \( -name .git -o -name node_modules \) -prune -name node_modules -print0)
+  # Each `node_modules` is a real directory of per-entry links, not one link:
+  # through one link, pnpm's relative workspace links resolved into the
+  # CHECKOUT's sibling packages, so the copy tested a hybrid tree, and vite's
+  # per-run caches wrote through it into the author's tree. The rule, and why
+  # its one name list lives here and not in the tripwire, is in the helper.
+  # `find`'s own status is ignored (an unreadable directory elsewhere is not a reason to lose the copy); node's is not.
+  { find "$root" \( -name .git -o -name node_modules \) -prune -name node_modules -print0 || true; } \
+    | node "$here/lib/stage-modules.mjs" stage "$root" "$ship" \
+    || die "could not stage the node_modules trees into the sandbox"
   printf '%s\n' "$ship"
   exit 0
 fi

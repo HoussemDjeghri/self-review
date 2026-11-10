@@ -210,7 +210,12 @@ It exits 0 even when a check fails: the report is the answer. An `INFRA … did 
 call it unverified, never failing (`references/scripts.md` → **Pre-flight**). While
 one stands, converge will not print the `converged` call and `converged.sh --work` refuses it: converge's `next:` prints the
 re-run with a longer cap, and a check that still cannot finish ends the review
-`--not-converged --reason checks-unverified`. What it detects,
+`--not-converged --reason checks-unverified`. A `FLAKY test` line (red, then
+green on its one re-run) is not a pass: report the tests as flaky, never as
+passing, and treat it as a FAIL if the change could plausibly cause the
+failure (`round-1/preflight-test.log` holds the first run's whole output,
+then the re-run's; the quoted tail is often only the runner's summary). It
+does not block `converged`. What it detects,
 `preflight.skip`, and `preflight.artifactRoot` (off by default; user-global, so
 it applies to every project) are in `references/scripts.md` → **Pre-flight**; an
 artifact-root `SKIP` (no node tests there) is not a failure of the reviewed

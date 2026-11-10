@@ -51,14 +51,14 @@ test("a package.json script becomes a check, named by kind and run through the p
   const out = run(p);
   assert.match(out, /PASS {2}lint {4}npm run lint/);
   assert.match(out, /PASS {2}test {4}npm test/);
-  assert.match(out, /# 2 run, 0 failed, 0 could not start, 0 did not finish, 0 skipped/);
+  assert.match(out, /# 2 run, 0 failed, 0 flaky, 0 could not start, 0 did not finish, 0 skipped/);
 });
 
 test("a failing check reports its exit code and the tail of its output", () => {
   const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) },
     { npm: 'for i in 1 2 3 4 5 6; do echo "line $i"; done; exit 3' });
   const out = run(p, ["--tail", "2"]);
-  assert.match(out, /FAIL {2}test {4}npm test {3}\(exit 3\)/);
+  assert.match(out, /FAIL {2}test {4}npm test {3}\(exit 3; failed again on re-run\)/);
   assert.match(out, /--- FAIL test: last 2 lines/);
   assert.match(out, /line 5\nline 6/);
   assert.doesNotMatch(out, /line 4/, "the tail is a tail");
@@ -82,7 +82,7 @@ test("a check named in preflight.skip is reported, not run", () => {
   }, { npm: 'echo ran; exit 1' });
   const out = run(p, [], { SELF_REVIEW_CONFIG: path.join(p.root, "config.json") });
   assert.match(out, /SKIP {2}test {4}\(preflight.skip\)/);
-  assert.match(out, /# 1 run, 1 failed, 0 could not start, 0 did not finish, 1 skipped/);
+  assert.match(out, /# 1 run, 1 failed, 0 flaky, 0 could not start, 0 did not finish, 1 skipped/);
   assert.doesNotMatch(out, /FAIL {2}test/, "a skipped check cannot fail");
 });
 
@@ -190,7 +190,7 @@ test("a check whose command cannot be run is INFRA, not FAIL", () => {
     { npm: "exit 127" });
   const out = run(p);
   assert.match(out, /INFRA test {4}npm test {3}\(exit 127 — the command could not be run; the check never started\)/);
-  assert.match(out, /# 1 run, 0 failed, 1 could not start, 0 did not finish, 0 skipped/,
+  assert.match(out, /# 1 run, 0 failed, 0 flaky, 1 could not start, 0 did not finish, 0 skipped/,
     "an environment that is broken must not be counted as a red suite");
   assert.doesNotMatch(out, /^FAIL/m);
 });
@@ -241,14 +241,14 @@ test("a stopped check is counted apart from the ones that could not start, and k
     { npm: 'echo "915 passed so far"; sleep 5' });
   const outFile = path.join(p.root, "report.txt");
   const out = run(p, ["--out", outFile], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "1", SELF_REVIEW_PREFLIGHT_GRACE: "1" });
-  assert.match(out, /# 1 run, 0 failed, 0 could not start, 1 did not finish, 0 skipped/);
+  assert.match(out, /# 1 run, 0 failed, 0 flaky, 0 could not start, 1 did not finish, 0 skipped/);
   assert.doesNotMatch(out, /EVERY check failed to start/, "a slow suite is not a missing tool");
   assert.match(readFileSync(outFile, "utf8"), /--- DID NOT FINISH test[\s\S]*915 passed so far/);
 });
 
 test("a suite that exits 143 by itself is a red suite, not a stopped one", () => {
   const p = project({ "package.json": JSON.stringify({ scripts: { test: "x" } }) }, { npm: "exit 143" });
-  assert.match(run(p), /FAIL {2}test {4}npm test {3}\(exit 143\)/);
+  assert.match(run(p), /FAIL {2}test {4}npm test {3}\(exit 143; failed again on re-run\)/);
 });
 
 test("--deadline gives each check what is left of it, and skips by name what cannot start in time", () => {
@@ -316,4 +316,85 @@ test("B6: the project's own .venv/bin comes first on PATH, ahead of a shim that 
   assert.match(out, /^PASS {2}test {4}pytest -q/m, out);
   // A tool the venv does not hold still resolves where it did before.
   assert.match(out, /^INFRA types {3}mypy/m, out);
+});
+
+// A runner that fails its first call and passes every later one. The count
+// lives outside the project, because the project is the thing being run.
+const flakyStub = (counter, { second = "exit 0" } = {}) =>
+  `n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "${counter}"; echo "run $n"; ` +
+  `[ $n -ge 2 ] || { echo "Test timed out in 5000ms"; exit 1; }; ${second}`;
+const counterFile = () => path.join(mkdtempSync(path.join(tmpdir(), "preflight-count-")), "n");
+const testOnly = () => ({ "package.json": JSON.stringify({ scripts: { test: "x" } }) });
+
+test("Q-a: a test check that fails and then passes on its one re-run is FLAKY — not a pass, not a FAIL", () => {
+  // CopilotKit's suite, run as nx runs it (14 tasks in parallel), timed out a
+  // different package in 4-8 runs of 10 — a FAIL on every review, which the
+  // lead learns to skip. nx replays every passed task from cache on the second
+  // run, so only the failed ones run again, under far less contention.
+  const n = counterFile();
+  const p = project(testOnly(), { npm: flakyStub(n) });
+  const outFile = path.join(p.root, "report.txt");
+  const out = run(p, ["--out", outFile]);
+  assert.match(out, /^FLAKY test {4}npm test {3}\(failed \(exit 1\), passed on re-run — the suite is not stable; first run's failure quoted; not a pass\)$/m);
+  assert.match(out, /# 1 run, 0 failed, 1 flaky, 0 could not start, 0 did not finish, 0 skipped/);
+  assert.doesNotMatch(out, /^PASS/m);
+  const report = readFileSync(outFile, "utf8");
+  assert.match(report, /--- FLAKY test: last 40 lines of the first run of `npm test` ---\nrun 1\nTest timed out in 5000ms/);
+  const log = readFileSync(path.join(p.root, "report-test.log"), "utf8");
+  assert.match(log, /run 1[\s\S]*Test timed out[\s\S]*re-run[\s\S]*run 2/, "both runs kept whole, beside the report");
+});
+
+test("Q-a: a test check that fails twice is FAIL, and says the re-run failed too", () => {
+  const p = project(testOnly(), { npm: 'echo "deterministic red"; exit 1' });
+  const out = run(p);
+  assert.match(out, /^FAIL {2}test {4}npm test {3}\(exit 1; failed again on re-run\)$/m);
+  assert.match(out, /# 1 run, 1 failed, 0 flaky/);
+});
+
+test("Q-a: a re-run that does not finish leaves the first FAIL standing", () => {
+  const n = counterFile();
+  const p = project(testOnly(), { npm: flakyStub(n, { second: "sleep 30" }) });
+  const out = run(p, [], { SELF_REVIEW_PREFLIGHT_TIMEOUT: "2", SELF_REVIEW_PREFLIGHT_GRACE: "1" });
+  assert.match(out, /^FAIL {2}test {4}npm test {3}\(exit 1; re-run did not finish\)$/m);
+});
+
+test("Q-a: with under 10 s of the budget left, a failing test check is not re-run", () => {
+  const n = counterFile();
+  const p = project(testOnly(), { npm: `sleep 3; ${flakyStub(n)}` });
+  const deadline = Math.floor(Date.now() / 1000) + 12;
+  const out = run(p, ["--deadline", String(deadline)]);
+  assert.match(out, /^FAIL {2}test {4}npm test {3}\(exit 1; not re-run: pre-flight budget spent\)$/m);
+  assert.equal(readFileSync(n, "utf8").trim(), "1", "one run, not two");
+});
+
+test("Q-a: only the test check is re-run — a failing lint, or a tool that could not start, runs once", () => {
+  // Formatters, linters and type-checkers are deterministic: a second run is
+  // the same answer at twice the cost. 126/127 is a missing tool.
+  const lintN = counterFile(), testN = counterFile();
+  const p = project({ "package.json": JSON.stringify({ scripts: { lint: "x", test: "x" } }) },
+    { npm: `case "$*" in *lint*) ${flakyStub(lintN)} ;; *) echo $(( $(cat "${testN}" 2>/dev/null || echo 0) + 1 )) > "${testN}"; exit 127 ;; esac` });
+  const outFile = path.join(p.root, "report.txt");
+  const out = run(p, ["--out", outFile]);
+  assert.match(out, /^FAIL {2}lint {4}npm run lint {3}\(exit 1\)$/m);
+  assert.match(out, /^INFRA test/m);
+  assert.equal(readFileSync(lintN, "utf8").trim(), "1");
+  assert.equal(readFileSync(testN, "utf8").trim(), "1");
+  assert.match(readFileSync(path.join(p.root, "report-lint.log"), "utf8"), /Test timed out/,
+    "a failing check's whole output is kept beside the report — the tail lost react-textarea's error eight times");
+  assert.ok(existsSync(path.join(p.root, "report-test.log")), "and an INFRA check's");
+});
+
+test("Q-a: a passing check leaves no log behind", () => {
+  const p = project(testOnly(), { npm: okStub });
+  const outFile = path.join(p.root, "report.txt");
+  run(p, ["--out", outFile]);
+  assert.ok(!existsSync(path.join(p.root, "report-test.log")));
+});
+
+test("Q-a: a passing run removes an earlier run's log beside the report", () => {
+  const p = project(testOnly(), { npm: okStub });
+  const outFile = path.join(p.root, "report.txt");
+  writeFileSync(path.join(p.root, "report-test.log"), "an earlier run's failure\n");
+  run(p, ["--out", outFile]);
+  assert.ok(!existsSync(path.join(p.root, "report-test.log")));
 });
